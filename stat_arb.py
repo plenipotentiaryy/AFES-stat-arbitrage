@@ -1,11 +1,14 @@
 import pandas as pd
-from polygon import RESTClient
+from polygon import StocksClient
 from datetime import datetime
 import time
+import dotenv
 import os
 
+dotenv.load_dotenv()  # Загружаем переменные из .env
+
 # Вставь сюда свой API ключ от Polygon
-API_KEY = "твой_ключ_pk_..."
+API_KEY = os.getenv("API_KEY")
 
 # Наши 12 tech-акций
 tickers = [
@@ -13,12 +16,12 @@ tickers = [
     "INTC", "AVGO", "CRM", "ORCL", "ADBE", "QCOM"
 ]
 
-# Период: 2 года
-start_date = "2024-01-01"
-end_date = "2026-01-01"
+# Период: 30 дней (бесплатный план ограничен)
+start_date = "2026-04-01"
+end_date = "2026-04-28"
 
 # Подключаемся к Polygon
-client = RESTClient(api_key=API_KEY)
+client = StocksClient(api_key=API_KEY)
 
 # Сюда соберём все данные
 all_data = {}
@@ -27,25 +30,55 @@ for ticker in tickers:
     print(f"Скачиваю {ticker}...")
 
     bars = []
-    for bar in client.list_aggs(
-        ticker=ticker,
-        multiplier=15,          # интервал 15
-        timespan="minute",      # минут
-        from_=start_date,
-        to=end_date,
-        limit=50000
-    ):
-        bars.append({
-            "timestamp": pd.to_datetime(bar.timestamp, unit="ms"),
-            "open": bar.open,
-            "high": bar.high,
-            "low": bar.low,
-            "close": bar.close,
-            "volume": bar.volume,
-            "vwap": bar.vwap       # Polygon сразу даёт VWAP!
+    bars = client.get_aggregate_bars(
+        symbol=ticker,
+        from_date=start_date,
+        to_date=end_date,
+        multiplier=15,
+        timespan="minute",
+        limit=50000,
+        full_range=True,
+        warnings=False,
+        run_parallel=False  # последовательная загрузка
+    )
+    
+    # Преобразуем в список словарей
+    data = []
+    for bar in bars:
+        # API может возвращать словарь или объект
+        if isinstance(bar, dict):
+            ts = bar.get("t") or bar.get("timestamp")
+            o = bar.get("o") or bar.get("open")
+            h = bar.get("h") or bar.get("high")
+            l = bar.get("l") or bar.get("low")
+            c = bar.get("c") or bar.get("close")
+            v = bar.get("v") or bar.get("volume")
+            vwap = bar.get("vwap") or bar.get("vwp")
+        else:
+            ts = bar.timestamp
+            o = bar.open
+            h = bar.high
+            l = bar.low
+            c = bar.close
+            v = bar.volume
+            vwap = getattr(bar, 'vwap', None)
+        
+        data.append({
+            "timestamp": pd.to_datetime(ts, unit="ms"),
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": v,
+            "vwap": vwap
         })
 
-    df = pd.DataFrame(bars)
+    # Пропускаем тикер если нет данных
+    if not data:
+        print(f"  {ticker}: нет данных")
+        continue
+
+    df = pd.DataFrame(data)
     df = df.set_index("timestamp")
     all_data[ticker] = df
     print(f"  {ticker}: {len(df)} баров")
