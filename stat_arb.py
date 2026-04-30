@@ -25,8 +25,8 @@ tickers = [
     "ADBE", "QCOM"
 ]
 
-start_date = "2026-04-01"
-end_date = "2026-04-28"
+start_date = "2024-01-01"
+end_date = "2026-01-01"
 all_data = {}
 
 for i, ticker in enumerate(tickers):
