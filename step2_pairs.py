@@ -8,9 +8,21 @@ import statsmodels.api as sm
 # Загружаем данные из Шага 1
 # ============================================
 closes = pd.read_csv("closes_15min.csv", index_col=0, parse_dates=True)
-closes = closes.dropna()  # убираем строки с пропусками
 
-print(f"Загружено: {closes.shape[0]} баров, {closes.shape[1]} тикеров")
+# ============================================
+# Фильтр: Оставляем только основную сессию (RTH)
+# ============================================
+# Переводим в время Нью-Йорка (ET)
+if closes.index.tz is None:
+    closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
+else:
+    closes.index = closes.index.tz_convert("US/Eastern")
+
+# Оставляем только время с 09:30 до 16:00
+closes = closes.between_time("09:30", "16:00")
+
+closes = closes.dropna()  # убираем строки с пропусками
+print(f"Загружено (только основная сессия): {closes.shape[0]} баров, {closes.shape[1]} тикеров")
 print(f"Тикеры: {list(closes.columns)}\n")
 
 # ============================================

@@ -22,9 +22,12 @@ key_cycle = itertools.cycle(API_KEYS)
 
 # Наши 12 tech-акций
 tickers = [
-    "AAPL", "MSFT", "GOOG", "META", "NVDA", 
-    "AMD","INTC", "AVGO", "CRM", "ORCL", 
-    "ADBE", "QCOM"
+    "KO", "PEP",
+    "XOM", "CVX",
+    "JPM", "BAC",
+    "V", "MA",
+    "HD", "LOW",
+    "GOLD", "NEM"
 ]
 
 start_date = "2024-04-01"

@@ -6,6 +6,15 @@ import statsmodels.api as sm
 # Загружаем данные
 # ============================================
 closes = pd.read_csv("closes_15min.csv", index_col=0, parse_dates=True)
+
+# Оставляем только основную сессию (RTH)
+if closes.index.tz is None:
+    closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
+else:
+    closes.index = closes.index.tz_convert("US/Eastern")
+closes = closes.between_time("09:30", "16:00")
+closes = closes.dropna()
+
 pairs = pd.read_csv("pairs_selected.csv")
 
 print("Найденные пары:")
@@ -81,7 +90,7 @@ spread_std = spread.rolling(window=window).std()
 zscore = (spread - spread_mean) / spread_std
 
 # ============================================
-# Сохраняем всё в один файл
+# Сохраняем всё в один файл и фильтруем шум открытия
 # ============================================
 signals = pd.DataFrame({
     f"{t1}_close": closes[t1],
@@ -91,6 +100,10 @@ signals = pd.DataFrame({
     "spread_std": spread_std,
     "zscore": zscore
 }).dropna()
+
+# Убираем первые 30 минут торгов (Opening Noise 09:30-10:00)
+# Торгуем только в стабильной фазе сессии
+signals = signals.between_time("10:00", "16:00")
 
 signals.to_csv("signals.csv")
 
