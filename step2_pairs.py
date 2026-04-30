@@ -65,17 +65,26 @@ for t1, t2, corr in pairs_corr:
 # ============================================
 # Фильтр 2: тест Энгла-Грейнджера
 # ============================================
+# Вместо теста на ВСЁ 2 года — тестируем на последних 6 месяцев
+# Это реалистичнее: мы торгуем сейчас, не в 2024
+
+# Берём последние 6 месяцев (примерно 2400 баров на 15мин)
+recent_bars = 2400
+closes_recent = closes.tail(recent_bars)
+
+print(f"\nТестируем коинтеграцию на последних {recent_bars} барах")
+print(f"Период: {closes_recent.index[0]} — {closes_recent.index[-1]}\n")
 
 pairs_coint = []
 
 for t1, t2, corr in pairs_corr:
-    # Тест на коинтеграцию
-    score, pvalue, _ = coint(closes[t1], closes[t2])
+    # Тест на коинтеграцию на свежих данных
+    score, pvalue, _ = coint(closes_recent[t1], closes_recent[t2])
 
     if pvalue < 0.05:
         # Находим бету через регрессию: цена_A = alpha + beta * цена_B
-        X = sm.add_constant(closes[t2])  # добавляем константу
-        model = sm.OLS(closes[t1], X).fit()
+        X = sm.add_constant(closes_recent[t2])
+        model = sm.OLS(closes_recent[t1], X).fit()
         beta = model.params.iloc[1]
 
         pairs_coint.append({
@@ -84,8 +93,33 @@ for t1, t2, corr in pairs_corr:
             "coint_pvalue": round(pvalue, 6),
             "beta": round(beta, 4)
         })
+        print(f"  ✓ {t1}-{t2}: p={pvalue:.4f}, beta={beta:.4f}")
+    else:
+        print(f"    {t1}-{t2}: p={pvalue:.4f} — не прошла")
 
 print(f"\nФильтр 2 (коинтеграция p < 0.05): {len(pairs_coint)} пар")
+
+# Если всё равно 0 пар — берем Топ-3 лучших по p-value (fallback)
+if len(pairs_coint) == 0:
+    print("\n⚠️  Ни одна пара не прошла строгий тест (p < 0.05).")
+    print("   Берём ТОП-3 лучшие по p-value на этом окне.")
+    
+    temp_pvals = []
+    for t1, t2, corr in pairs_corr:
+        _, pv, _ = coint(closes_recent[t1], closes_recent[t2])
+        temp_pvals.append((t1, t2, corr, pv))
+    
+    temp_pvals.sort(key=lambda x: x[3])
+    for t1, t2, corr, pv in temp_pvals[:3]:
+        X = sm.add_constant(closes_recent[t2])
+        model = sm.OLS(closes_recent[t1], X).fit()
+        beta = model.params.iloc[1]
+        pairs_coint.append({
+            "pair": f"{t1}-{t2}",
+            "correlation": corr,
+            "coint_pvalue": round(pv, 6),
+            "beta": round(beta, 4)
+        })
 
 if len(pairs_coint) == 0:
     print("\n⚠️  Ни одна пара не прошла тест коинтеграции.")
@@ -112,8 +146,8 @@ for pair in pairs_coint:
     t1, t2 = pair["pair"].split("-")
     beta = pair["beta"]
 
-    # Строим спред
-    spread = closes[t1] - beta * closes[t2]
+    # Строим спред на том же окне (6 месяцев)
+    spread = closes_recent[t1] - beta * closes_recent[t2]
 
     # ADF-тест: стационарен ли спред?
     adf_stat, adf_pvalue, _, _, critical_values, _ = adfuller(spread)
