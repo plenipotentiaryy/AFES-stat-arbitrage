@@ -24,17 +24,30 @@ log_returns = np.log(closes / closes.shift(1)).dropna()
 # Матрица корреляций
 corr_matrix = log_returns.corr()
 
-# Собираем все пары с корреляцией > 0.7
-pairs_corr = []
+# Собираем все пары с их корреляцией
+CORR_THRESHOLD = 0.5          # порог корреляции (0.7 слишком жёстко для коротких периодов)
+TOP_N_FALLBACK = 10           # если ни одна пара не прошла — берём топ-N
+
+all_pairs = []
 tickers = list(closes.columns)
 
 for t1, t2 in combinations(tickers, 2):
     corr = corr_matrix.loc[t1, t2]
-    if corr > 0.7:
-        pairs_corr.append((t1, t2, round(corr, 4)))
+    all_pairs.append((t1, t2, round(corr, 4)))
 
-print(f"Фильтр 1 (корреляция > 0.7): {len(pairs_corr)} пар из {len(list(combinations(tickers, 2)))}")
-for t1, t2, corr in sorted(pairs_corr, key=lambda x: -x[2]):
+# Сортируем по убыванию корреляции
+all_pairs.sort(key=lambda x: -x[2])
+
+# Фильтр по порогу
+pairs_corr = [(t1, t2, c) for t1, t2, c in all_pairs if c > CORR_THRESHOLD]
+
+if len(pairs_corr) == 0:
+    print(f"⚠️  Ни одна пара не прошла порог корреляции {CORR_THRESHOLD}.")
+    print(f"   Берём топ-{TOP_N_FALLBACK} пар по корреляции как fallback.")
+    pairs_corr = all_pairs[:TOP_N_FALLBACK]
+
+print(f"\nФильтр 1 (корреляция > {CORR_THRESHOLD}): {len(pairs_corr)} пар из {len(all_pairs)}")
+for t1, t2, corr in pairs_corr:
     print(f"  {t1}-{t2}: корреляция = {corr}")
 
 # ============================================
@@ -61,6 +74,21 @@ for t1, t2, corr in pairs_corr:
         })
 
 print(f"\nФильтр 2 (коинтеграция p < 0.05): {len(pairs_coint)} пар")
+
+if len(pairs_coint) == 0:
+    print("\n⚠️  Ни одна пара не прошла тест коинтеграции.")
+    print("   Возможные причины:")
+    print("   - Слишком короткий период данных (нужно хотя бы 2–3 месяца)")
+    print("   - Акции из одного сектора, но не коинтегрированы на этом интервале")
+    print("   Попробуйте увеличить период в stat_arb.py (start_date).")
+    print("\n   Для диагностики — p-values всех протестированных пар:")
+    for t1, t2, corr in pairs_corr:
+        _, pv, _ = coint(closes[t1], closes[t2])
+        print(f"     {t1}-{t2}: coint p-value = {pv:.4f}")
+    # Сохраняем пустой CSV, чтобы pipeline не падал
+    pd.DataFrame(columns=["pair","correlation","coint_pvalue","beta","adf_pvalue","adf_stat","half_life_bars"]).to_csv("pairs_selected.csv", index=False)
+    print("\nСохранён пустой pairs_selected.csv")
+    exit(0)
 
 # ============================================
 # Фильтр 3: ADF-тест на стационарность спреда
