@@ -1,6 +1,7 @@
 import os
 import itertools
 import pandas as pd
+import time
 from polygon import StocksClient
 from dotenv import load_dotenv
 
@@ -19,6 +20,7 @@ key_cycle = itertools.cycle(API_KEYS)
 
 # --- Rest of your existing logic ---
 
+# Наши 12 tech-акций
 tickers = [
     "AAPL", "MSFT", "GOOG", "META", "NVDA", 
     "AMD","INTC", "AVGO", "CRM", "ORCL", 
@@ -38,6 +40,13 @@ for i, ticker in enumerate(tickers):
 
     print(f"Скачиваю {ticker}...")
 
+    # Добавляем небольшую паузу, чтобы не превысить 5 запросов в минуту (бесплатный тариф)
+    # 60 сек / 5 запросов = 12 секунд. 
+    # Так как у нас 3 ключа, можно было бы быстрее, но для стабильности оставим паузу.
+    if i > 0:
+        print("  Ожидаю 60 секунд (1 минута) для соблюдения лимитов API...")
+        time.sleep(60)
+
     try:
         bars = client.get_aggregate_bars(
             symbol=ticker,
@@ -52,6 +61,25 @@ for i, ticker in enumerate(tickers):
         )
         
         data = []
+        if bars:
+            for bar in bars:
+                if isinstance(bar, dict):
+                    ts, o, h, l, c, v = bar.get("t"), bar.get("o"), bar.get("h"), bar.get("l"), bar.get("c"), bar.get("v")
+                    vwap = bar.get("vwap") or bar.get("vwp")
+                else:
+                    ts, o, h, l, c, v = bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume
+                    vwap = getattr(bar, 'vwap', None)
+                
+                data.append({
+                    "timestamp": pd.to_datetime(ts, unit="ms"),
+                    "open": o, "high": h, "low": l, "close": c, "volume": v, "vwap": vwap
+                })
+
+        if not bars:
+            print(f"  {ticker}: API вернул пустой список (возможно, нет данных или ошибка лимита)")
+            continue
+
+        data = []
         for bar in bars:
             if isinstance(bar, dict):
                 ts, o, h, l, c, v = bar.get("t"), bar.get("o"), bar.get("h"), bar.get("l"), bar.get("c"), bar.get("v")
@@ -65,13 +93,11 @@ for i, ticker in enumerate(tickers):
                 "open": o, "high": h, "low": l, "close": c, "volume": v, "vwap": vwap
             })
 
-        if not data:
-            print(f"  {ticker}: нет данных")
-            continue
-
         df = pd.DataFrame(data).set_index("timestamp")
+        # Удаляем дубликаты индексов, если они есть
+        df = df[~df.index.duplicated(keep='first')]
         all_data[ticker] = df
-        print(f"  {ticker}: {len(df)} баров")
+        print(f"  {ticker}: {len(df)} баров загружено")
         
     except Exception as e:
         print(f"Ошибка при загрузке {ticker}: {e}")
