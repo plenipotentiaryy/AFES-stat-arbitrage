@@ -1,199 +1,108 @@
 import pandas as pd
 import numpy as np
-from itertools import combinations
 from statsmodels.tsa.stattools import coint, adfuller
 import statsmodels.api as sm
+from config import (
+    PAIRS, RECENT_BARS, RTH_START, RTH_END, DATA_DIR,
+)
 
-# ============================================
-# Загружаем данные из Шага 1
-# ============================================
-closes = pd.read_csv("closes_15min.csv", index_col=0, parse_dates=True)
+BETA_MIN = 0.1   # |beta| ниже — одна нога почти не весит, пара бессмысленна
+BETA_MAX = 15.0  # |beta| выше — нереалистичное соотношение позиций
 
-# ============================================
-# Фильтр: Оставляем только основную сессию (RTH)
-# ============================================
-# Переводим в время Нью-Йорка (ET)
-if closes.index.tz is None:
-    closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
-else:
-    closes.index = closes.index.tz_convert("US/Eastern")
 
-# Оставляем только время с 09:30 до 16:00
-closes = closes.between_time("09:30", "16:00")
-
-closes = closes.dropna()  # убираем строки с пропусками
-print(f"Загружено (только основная сессия): {closes.shape[0]} баров, {closes.shape[1]} тикеров")
-print(f"Тикеры: {list(closes.columns)}\n")
-
-# ============================================
-# Фильтр 1: корреляция лог-доходностей
-# ============================================
-
-# Лог-доходности: насколько акция выросла/упала в процентах
-# log(цена_сегодня / цена_вчера)
-log_returns = np.log(closes / closes.shift(1)).dropna()
-
-# Матрица корреляций
-corr_matrix = log_returns.corr()
-
-# Собираем все пары с их корреляцией
-CORR_THRESHOLD = 0.5          # порог корреляции (0.7 слишком жёстко для коротких периодов)
-TOP_N_FALLBACK = 10           # если ни одна пара не прошла — берём топ-N
-
-all_pairs = []
-tickers = list(closes.columns)
-
-for t1, t2 in combinations(tickers, 2):
-    corr = corr_matrix.loc[t1, t2]
-    all_pairs.append((t1, t2, round(corr, 4)))
-
-# Сортируем по убыванию корреляции
-all_pairs.sort(key=lambda x: -x[2])
-
-# Фильтр по порогу
-pairs_corr = [(t1, t2, c) for t1, t2, c in all_pairs if c > CORR_THRESHOLD]
-
-if len(pairs_corr) == 0:
-    print(f"⚠️  Ни одна пара не прошла порог корреляции {CORR_THRESHOLD}.")
-    print(f"   Берём топ-{TOP_N_FALLBACK} пар по корреляции как fallback.")
-    pairs_corr = all_pairs[:TOP_N_FALLBACK]
-
-print(f"\nФильтр 1 (корреляция > {CORR_THRESHOLD}): {len(pairs_corr)} пар из {len(all_pairs)}")
-for t1, t2, corr in pairs_corr:
-    print(f"  {t1}-{t2}: корреляция = {corr}")
-
-# ============================================
-# Фильтр 2: тест Энгла-Грейнджера
-# ============================================
-# Вместо теста на ВСЁ 2 года — тестируем на последних 6 месяцев
-# Это реалистичнее: мы торгуем сейчас, не в 2024
-
-# Берём последние 6 месяцев (примерно 2400 баров на 15мин)
-recent_bars = 2400
-closes_recent = closes.tail(recent_bars)
-
-print(f"\nТестируем коинтеграцию на последних {recent_bars} барах")
-print(f"Период: {closes_recent.index[0]} — {closes_recent.index[-1]}\n")
-
-pairs_coint = []
-
-for t1, t2, corr in pairs_corr:
-    # Тест на коинтеграцию на свежих данных
-    score, pvalue, _ = coint(closes_recent[t1], closes_recent[t2])
-
-    if pvalue < 0.05:
-        # Находим бету через регрессию: цена_A = alpha + beta * цена_B
-        X = sm.add_constant(closes_recent[t2])
-        model = sm.OLS(closes_recent[t1], X).fit()
-        beta = model.params.iloc[1]
-
-        pairs_coint.append({
-            "pair": f"{t1}-{t2}",
-            "correlation": corr,
-            "coint_pvalue": round(pvalue, 6),
-            "beta": round(beta, 4)
-        })
-        print(f"  ✓ {t1}-{t2}: p={pvalue:.4f}, beta={beta:.4f}")
+def load_closes() -> pd.DataFrame:
+    closes = pd.read_csv(DATA_DIR / "closes_15min.csv", index_col=0, parse_dates=True)
+    if closes.index.tz is None:
+        closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
     else:
-        print(f"    {t1}-{t2}: p={pvalue:.4f} — не прошла")
+        closes.index = closes.index.tz_convert("US/Eastern")
+    closes = closes.between_time(RTH_START, RTH_END)
 
-print(f"\nФильтр 2 (коинтеграция p < 0.05): {len(pairs_coint)} пар")
+    min_bars = 1000
+    good = [c for c in closes.columns if closes[c].notna().sum() > min_bars]
+    print(f"Tickers with enough data: {len(good)} / {len(closes.columns)}")
+    return closes[good].dropna()
 
-# Если всё равно 0 пар — берем Топ-3 лучших по p-value (fallback)
-if len(pairs_coint) == 0:
-    print("\n⚠️  Ни одна пара не прошла строгий тест (p < 0.05).")
-    print("   Берём ТОП-3 лучшие по p-value на этом окне.")
-    
-    temp_pvals = []
-    for t1, t2, corr in pairs_corr:
-        _, pv, _ = coint(closes_recent[t1], closes_recent[t2])
-        temp_pvals.append((t1, t2, corr, pv))
-    
-    temp_pvals.sort(key=lambda x: x[3])
-    for t1, t2, corr, pv in temp_pvals[:3]:
-        X = sm.add_constant(closes_recent[t2])
-        model = sm.OLS(closes_recent[t1], X).fit()
-        beta = model.params.iloc[1]
-        pairs_coint.append({
-            "pair": f"{t1}-{t2}",
-            "correlation": corr,
-            "coint_pvalue": round(pv, 6),
-            "beta": round(beta, 4)
-        })
 
-if len(pairs_coint) == 0:
-    print("\n⚠️  Ни одна пара не прошла тест коинтеграции.")
-    print("   Возможные причины:")
-    print("   - Слишком короткий период данных (нужно хотя бы 2–3 месяца)")
-    print("   - Акции из одного сектора, но не коинтегрированы на этом интервале")
-    print("   Попробуйте увеличить период в stat_arb.py (start_date).")
-    print("\n   Для диагностики — p-values всех протестированных пар:")
-    for t1, t2, corr in pairs_corr:
-        _, pv, _ = coint(closes[t1], closes[t2])
-        print(f"     {t1}-{t2}: coint p-value = {pv:.4f}")
-    # Сохраняем пустой CSV, чтобы pipeline не падал
-    pd.DataFrame(columns=["pair","correlation","coint_pvalue","beta","adf_pvalue","adf_stat","half_life_bars"]).to_csv("pairs_selected.csv", index=False)
-    print("\nСохранён пустой pairs_selected.csv")
-    exit(0)
+def compute_half_life(spread: pd.Series) -> float:
+    aligned = pd.concat([spread.diff(), spread.shift(1)], axis=1).dropna()
+    aligned.columns = ["diff", "lag"]
+    theta = sm.OLS(aligned["diff"], sm.add_constant(aligned["lag"])).fit().params["lag"]
+    return -np.log(2) / theta if theta < 0 else float("inf")
 
-# ============================================
-# Фильтр 3: ADF-тест на стационарность спреда
-# ============================================
+
+closes = load_closes()
+print(f"Loaded (RTH only): {closes.shape[0]} bars, {closes.shape[1]} tickers")
+
+closes_recent = closes.tail(RECENT_BARS)
+print(f"\nTesting {len(PAIRS)} predefined pairs on last {RECENT_BARS} bars:")
+print(f"Period: {closes_recent.index[0]} — {closes_recent.index[-1]}\n")
 
 results = []
 
-for pair in pairs_coint:
-    t1, t2 = pair["pair"].split("-")
-    beta = pair["beta"]
+for t1, t2 in PAIRS:
+    # Skip if ticker wasn't downloaded / had no data
+    if t1 not in closes.columns or t2 not in closes.columns:
+        print(f"  SKIP {t1}-{t2}: missing data")
+        continue
 
-    # Строим спред на том же окне (6 месяцев)
+    _, pvalue, _ = coint(closes_recent[t1], closes_recent[t2])
+
+    if pvalue >= 0.05:
+        print(f"  FAIL {t1}-{t2}: coint p={pvalue:.4f}")
+        continue
+
+    beta = sm.OLS(closes_recent[t1], sm.add_constant(closes_recent[t2])).fit().params.iloc[1]
+
+    if not (BETA_MIN <= abs(beta) <= BETA_MAX):
+        print(f"  SKIP {t1}-{t2}: beta={beta:.4f} outside [{BETA_MIN}, {BETA_MAX}]")
+        continue
+
+    if beta < 0:
+        print(f"  SKIP {t1}-{t2}: beta={beta:.4f} is negative (stocks move opposite)")
+        continue
+
     spread = closes_recent[t1] - beta * closes_recent[t2]
+    adf_stat, adf_pvalue, *_ = adfuller(spread)
+    half_life = compute_half_life(spread)
 
-    # ADF-тест: стационарен ли спред?
-    adf_stat, adf_pvalue, _, _, critical_values, _ = adfuller(spread)
-
-    # Half-life: за сколько баров спред возвращается к среднему
-    spread_lag = spread.shift(1).dropna()
-    spread_diff = spread.diff().dropna()
-    aligned = pd.concat([spread_diff, spread_lag], axis=1).dropna()
-    aligned.columns = ["diff", "lag"]
-    hl_model = sm.OLS(aligned["diff"], sm.add_constant(aligned["lag"])).fit()
-    theta = hl_model.params["lag"]
-    half_life = -np.log(2) / theta if theta < 0 else float("inf")
+    # Log-return correlation (sanity: should be positive)
+    log_ret = np.log(closes_recent / closes_recent.shift(1)).dropna()
+    corr = round(log_ret[t1].corr(log_ret[t2]), 4)
 
     results.append({
-        "pair": pair["pair"],
-        "correlation": pair["correlation"],
-        "coint_pvalue": pair["coint_pvalue"],
-        "beta": beta,
-        "adf_pvalue": round(adf_pvalue, 6),
-        "adf_stat": round(adf_stat, 4),
-        "half_life_bars": round(half_life, 1)
+        "pair":          f"{t1}-{t2}",
+        "correlation":   corr,
+        "coint_pvalue":  round(pvalue, 6),
+        "beta":          round(beta, 4),
+        "adf_pvalue":    round(adf_pvalue, 6),
+        "adf_stat":      round(adf_stat, 4),
+        "half_life_bars": round(half_life, 1),
     })
+    print(f"  PASS {t1}-{t2}: coint p={pvalue:.4f}, beta={beta:.4f}, "
+          f"half-life={half_life:.0f} bars, corr={corr}")
 
-# ============================================
-# Итоговая таблица
-# ============================================
+if not results:
+    print("\nNo pairs passed all filters.")
+    pd.DataFrame(columns=["pair","correlation","coint_pvalue","beta",
+                           "adf_pvalue","adf_stat","half_life_bars"]
+                 ).to_csv(DATA_DIR / "pairs_selected.csv", index=False)
+    raise SystemExit(0)
 
-df_results = pd.DataFrame(results)
-df_results = df_results.sort_values("coint_pvalue")
+df_results = pd.DataFrame(results).sort_values("coint_pvalue")
 
-print("\n" + "=" * 80)
-print("ИТОГОВАЯ ТАБЛИЦА ПАР")
-print("=" * 80)
+print("\n" + "=" * 75)
 print(df_results.to_string(index=False))
+print("=" * 75)
 
-# Сохраняем
-df_results.to_csv("pairs_selected.csv", index=False)
-print(f"\nСохранено в pairs_selected.csv")
+df_results.to_csv(DATA_DIR / "pairs_selected.csv", index=False)
+print(f"\nSaved {len(df_results)} pairs to {DATA_DIR / 'pairs_selected.csv'}")
 
-# Рекомендация
-good_pairs = df_results[
+good = df_results[
     (df_results["adf_pvalue"] < 0.05) &
-    (df_results["half_life_bars"] > 5) &
-    (df_results["half_life_bars"] < 500)
+    (df_results["half_life_bars"].between(5, 500))
 ]
-
-print(f"\nРекомендованные пары (ADF p < 0.05, half-life 5-500 баров):")
-for _, row in good_pairs.iterrows():
-    print(f"  {row['pair']}: beta={row['beta']}, half-life={row['half_life_bars']} баров, coint p={row['coint_pvalue']}")
+print(f"\nRecommended pairs (ADF p<0.05, half-life 5-500 bars): {len(good)}")
+for _, row in good.iterrows():
+    print(f"  {row['pair']}: beta={row['beta']}, "
+          f"half-life={row['half_life_bars']} bars, coint p={row['coint_pvalue']}")
