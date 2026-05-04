@@ -1,3 +1,13 @@
 .venv
 .env
+output/
+data/
+__pycache__/
+.DS_Store
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
 *.csv
+data
+layer1
