@@ -4,5 +4,7 @@ pandas
 polygon
 python-dotenv
 scikit-learn
+scipy
 statsmodels
 hmmlearn
+yfinance
