@@ -2,21 +2,23 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from config import (
+    CLOSES_FILE,
     COST_PER_SIDE, BORROW_RATE_ANNUAL, PAIR_MAX_LOSS,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
     DATA_DIR, OUTPUT_DIR,
 )
 
 # ── Strategy parameters (overriding config defaults) ─────────────────────────
-ENTRY_Z = 3.0   # enter only on very strong signals
-EXIT_Z  = 0.3   # exit before full mean reversion
-STOP_Z  = 3.7   # tight stop (0.7z room from entry)
+ENTRY_Z = 3.2   # optimal from sniper grid (Sharpe 4.20, WR 83.9%)
+EXIT_Z  = -0.2  # exit slightly past mean reversion
+STOP_Z  = 4.4   # wide stop — prevents premature exits
 
-BARS_PER_TRADING_DAY = 26
+from config import BARS_PER_DAY
+BARS_PER_TRADING_DAY = BARS_PER_DAY
 
 
 def load_closes() -> pd.DataFrame:
-    closes = pd.read_csv(DATA_DIR / "closes_15min.csv", index_col=0, parse_dates=True)
+    closes = pd.read_csv(DATA_DIR / CLOSES_FILE, index_col=0, parse_dates=True)
     if closes.index.tz is None:
         closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
     else:

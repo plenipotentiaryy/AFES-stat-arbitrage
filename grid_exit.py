@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from config import (
+    CLOSES_FILE,
     ENTRY_Z, STOP_Z,
     COST_PER_SIDE, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
@@ -9,11 +10,12 @@ from config import (
 )
 
 EXIT_Z_GRID = [0.5, 0.3, 0.1, 0.0, -0.1, -0.2, -0.3]
-BARS_PER_TRADING_DAY = 26
+from config import BARS_PER_DAY
+BARS_PER_TRADING_DAY = BARS_PER_DAY
 
 
 def load_closes() -> pd.DataFrame:
-    closes = pd.read_csv(DATA_DIR / "closes_15min.csv", index_col=0, parse_dates=True)
+    closes = pd.read_csv(DATA_DIR / CLOSES_FILE, index_col=0, parse_dates=True)
     if closes.index.tz is None:
         closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
     else:

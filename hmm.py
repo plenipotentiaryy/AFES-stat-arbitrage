@@ -6,20 +6,29 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from hmmlearn.hmm import GaussianHMM
 from config import (
+    CLOSES_FILE,
     ENTRY_Z, ENTRY_Z_VOLATILE, STOP_Z,
     COST_PER_SIDE, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
+    BARS_PER_DAY,
     DATA_DIR, OUTPUT_DIR,
 )
 
-VOL_WINDOW   = 20   # bars for rolling features (~5h at 15-min)
-N_SEEDS      = 10   # HMM restarts — pick best log-likelihood
-EXIT_Z_CMP   = 0.0  # exit threshold used in the comparison backtest
-BARS_PER_DAY = 26
+VOL_WINDOW = 20   # bars for rolling features
+N_SEEDS    = 10   # HMM restarts — pick best log-likelihood
+EXIT_Z_CMP = 0.0  # exit threshold used in the comparison backtest
 
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-closes = pd.read_csv(DATA_DIR / "closes_15min.csv", index_col=0, parse_dates=True)
+def _data_file():
+    p = DATA_DIR / CLOSES_FILE
+    if not p.exists():
+        fb = DATA_DIR / "closes_15min.csv"
+        if fb.exists():
+            return fb
+        raise FileNotFoundError(f"No data: {CLOSES_FILE}")
+    return p
+closes = pd.read_csv(_data_file(), index_col=0, parse_dates=True)
 if closes.index.tz is None:
     closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
 else:
@@ -236,4 +245,4 @@ plt.suptitle("Per-pair HMM Regime Detection", fontsize=13, fontweight="bold")
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "regimes_pairs.png", dpi=150)
 print(f"Chart saved to {OUTPUT_DIR / 'regimes_pairs.png'}")
-plt.show()
+# plt.show()
