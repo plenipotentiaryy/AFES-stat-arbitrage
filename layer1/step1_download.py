@@ -65,9 +65,9 @@ tickers = [
     "KO", "PEP",
     "XOM", "CVX",
     "JPM", "BAC",
-    "V", "MA",
-    "HD", "LOW",
-    "GOLD", "NEM"
+    "GOOGL", "MSFT",
+    "WMT", "TGT",
+    "GLD", "SLV"
 ]
 
 start_date = "2024-01-01"
@@ -106,9 +106,9 @@ if all_data:
     vwaps = pd.DataFrame({t: all_data[t]["vwap"] for t in all_data})
 
     # Сохраняем в CSV чтобы не скачивать каждый раз
-    closes.to_csv("closes_15min.csv")
-    volumes.to_csv("volumes_15min.csv")
-    vwaps.to_csv("vwaps_15min.csv")
+    closes.to_csv("data/closes_15min.csv")
+    volumes.to_csv("data/volumes_15min.csv")
+    vwaps.to_csv("data/vwaps_15min.csv")
 
     # Проверяем
     print("\n Результат ")

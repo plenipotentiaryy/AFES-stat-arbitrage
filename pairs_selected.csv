@@ -1,1 +1,4 @@
 pair,correlation,coint_pvalue,beta,adf_pvalue,adf_stat,half_life_bars
+BAC-JPM,0.7149,0.419552,0.1399,0.202884,-2.2093,283.6
+XOM-CVX,0.7431,0.727962,0.1666,0.492398,-1.5825,470.6
+PEP-KO,0.6349,0.846973,1.5152,0.656103,-1.2401,1209.0
