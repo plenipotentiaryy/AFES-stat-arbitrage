@@ -9,10 +9,7 @@ PIPELINE = [
         "step": 1,
         "name": "Download data",
         "variants": [
-            ("a", "download.py",            "Full download: Yahoo 10yr daily + Polygon 15min audit"),
-            ("b", "download_incremental.py","Incremental backfill — skips already-downloaded tickers"),
-            ("c", "download_redownload.py", "Re-download tickers with gaps"),
-            ("d", "download_retry.py",      "Retry failed / incomplete tickers"),
+            ("a", "step1a_download.py", "Download: Yahoo 10yr daily + Alpha Vantage 15min (resumable)"),
         ],
         "required": False,
     },
@@ -20,7 +17,7 @@ PIPELINE = [
         "step": 2,
         "name": "Find cointegrated pairs",
         "variants": [
-            ("a", "pairs.py", "Rolling 90d Engle-Granger + Johansen info on 161 sector pairs"),
+            ("a", "step2a_pairs.py", "Rolling 90d Engle-Granger + Johansen info on 161 sector pairs"),
         ],
         "required": True,
     },
@@ -28,12 +25,16 @@ PIPELINE = [
         "step": 3,
         "name": "Filters + Position Sizing  (run before backtest)",
         "variants": [
-            ("a", "hmm.py",       "Layer 1 — HMM regime detection (per-pair, 2 states)"),
-            ("b", "kmeans.py",    "Layer 2 — K-Means macro regime (Trend / Sideways / Panic)"),
-            ("c", "iv.py",        "Layer 3 — Implied Volatility (Black-Scholes + VIX)"),
-            ("d", "montecarlo.py","Layer 4 — OU Monte Carlo (VaR, CVaR, mc_confidence)"),
-            ("e", "sizing.py",    "Layer 5 — Dynamic sizing (combine all layers)"),
-            ("f", "grid.py",      "Layer 6 — Per-pair grid (train→test optimal params)"),
+            ("a", "step3a_hmm.py",              "Layer 1 — HMM regime detection (per-pair, 2 states)"),
+            ("b", "step3b_kmeans.py",            "Layer 2 — K-Means macro regime (Trend / Sideways / Panic)"),
+            ("c", "step3c_iv.py",                "Layer 3 — Implied Volatility (Black-Scholes + VIX)"),
+            ("d", "step3d_montecarlo.py",        "Layer 4 — OU Monte Carlo (VaR, CVaR, mc_confidence)"),
+            ("e", "step3e_sizing.py",            "Layer 5 — Dynamic sizing (combine all layers)"),
+            ("f", "step3f_grid.py",              "Layer 6 — Per-pair grid (train→test optimal params)"),
+            ("g", "step3g_regime_profiler.py",   "Layer 7 — RCDP regime-conditioned Z-score profiling"),
+            ("h", "step3h_z_profiler.py",        "Layer 8 — Z-Bounce Density Profiler (EV-optimal entry)"),
+            ("i", "step3i_profiler.py",          "Layer 9 — Z-Bounce Profiler legacy (R:R=1.3 scan)"),
+            ("j", "step3j_wfo.py",               "Layer 10— Walk-Forward Optimization (Gatev 12m/6m/6m)"),
         ],
         "required": False,
     },
@@ -41,8 +42,8 @@ PIPELINE = [
         "step": 4,
         "name": "Backtest",
         "variants": [
-            ("a", "backtest.py",        "Standard   — Kalman spread, rolling coint, K-Means gate"),
-            ("b", "backtest_strict.py", "Strict/Sniper  entry=3.2  exit=-0.2  stop=4.4"),
+            ("a", "step4a_backtest.py",          "Standard   — Kalman spread, rolling coint, K-Means gate"),
+            ("b", "step4b_backtest_strict.py",   "Strict/Sniper  entry=3.2  exit=-0.2  stop=4.4"),
         ],
         "required": True,
     },
@@ -50,17 +51,18 @@ PIPELINE = [
         "step": 5,
         "name": "Analysis",
         "variants": [
-            ("a", "grid_exit.py",      "EXIT_Z grid search"),
-            ("b", "grid_sniper.py",    "Sniper grid — 84 combos (entry × exit × stop)"),
-            ("c", "bootstrap_mc.py",   "Bootstrap Monte Carlo — resampling of actual trades"),
-            ("d", "dashboard.py",      "Visual dashboard — all metrics on one chart"),
-            ("e", "stress.py",         "Stress test — walk-forward + VIX regimes + trade today?"),
+            ("a", "step5a_grid_exit.py",    "EXIT_Z grid search"),
+            ("b", "step5b_grid_sniper.py",  "Sniper grid — 84 combos (entry × exit × stop)"),
+            ("c", "step5c_bootstrap.py",    "Bootstrap Monte Carlo — resampling of actual trades"),
+            ("d", "step5d_dashboard.py",    "Visual dashboard — all metrics on one chart"),
+            ("e", "step5e_stress.py",       "Stress test — walk-forward + VIX regimes + trade today?"),
+            ("f", "step5f_debug_plot.py",   "Z-score debug plots — entry/exit markers per pair"),
         ],
         "required": False,
     },
 ]
 
-DEFAULT_ALL = ["1a", "2a", "3a", "3b", "3c", "3d", "3e", "3f", "4a", "5d"]
+DEFAULT_ALL = ["1a", "2a", "3a", "3b", "3c", "3d", "3e", "3f", "3g", "4a", "5d"]
 
 # ── UI helpers ────────────────────────────────────────────────────────────────
 W = 58
@@ -200,11 +202,11 @@ def main():
             print(f"  Optional step {step_num}{variant} failed — continuing.")
 
     # Always regenerate dashboard at the end if trades exist
-    dashboard_was_run = any(resolve_script(s, v)[0] == "dashboard.py" for s, v in selected)
+    dashboard_was_run = any(resolve_script(s, v)[0] == "step5d_dashboard.py" for s, v in selected)
     if not dashboard_was_run:
         from pathlib import Path
         if Path("data/trades.csv").exists():
-            run_step("dashboard.py", "Visual dashboard — all metrics on one chart")
+            run_step("step5d_dashboard.py", "Visual dashboard — all metrics on one chart")
 
     print(f"\n{'█'*W}")
     print(f"  DONE")
