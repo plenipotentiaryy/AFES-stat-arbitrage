@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from config import (
     CLOSES_FILE,
-    COST_PER_SIDE, BORROW_RATE_ANNUAL, PAIR_MAX_LOSS,
+    COST_TAKER, BORROW_RATE_ANNUAL, PAIR_MAX_LOSS,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
     DATA_DIR, OUTPUT_DIR,
 )
@@ -59,7 +59,7 @@ def backtest_pair(df, t1, t2, beta) -> pd.DataFrame:
             if exit_signal or stop_signal:
                 gross_pnl      = position * (spread_now - entry_spread)
                 notional       = entry_t1 + beta * entry_t2
-                tx_cost        = 2 * notional * COST_PER_SIDE
+                tx_cost        = 2 * notional * COST_TAKER
                 holding_days   = (i - entry_bar) / BARS_PER_TRADING_DAY
                 short_notional = (beta * entry_t2) if position == 1 else entry_t1
                 borrow_cost    = short_notional * BORROW_RATE_ANNUAL * holding_days / 252

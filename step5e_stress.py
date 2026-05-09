@@ -17,11 +17,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import itertools
 from config import (
+    COST_MAKER, COST_TAKER, CIRCUIT_BREAKER_Z,
     CLOSES_FILE, ENTRY_Z, EXIT_Z, STOP_Z, ENTRY_Z_VOLATILE,
-    COST_PER_SIDE, BORROW_RATE_ANNUAL,
+    BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START,
     BARS_PER_DAY, DATA_DIR, OUTPUT_DIR,
+    HURST_ENTRY_WINDOW,
 )
+from filters import HurstFilter
+from step3j_wfo import check_coint_johansen, compute_half_life
 
 WINDOW_MONTHS  = 6    # walk-forward window size
 STEP_MONTHS    = 2    # how far each window advances
@@ -34,11 +38,26 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+def load_daily() -> pd.DataFrame:
+    path = DATA_DIR / "closes_daily.csv"
+    if not path.exists(): return None
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert("US/Eastern")
+    else:
+        df.index = df.index.tz_convert("US/Eastern")
+    return df
+
 def load_closes() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
         path = DATA_DIR / "closes_15min.csv"
     df = pd.read_csv(path, index_col=0, parse_dates=True)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True)
+    
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC").tz_convert("US/Eastern")
     else:
@@ -59,25 +78,37 @@ def load_vix_daily() -> pd.Series | None:
 # ── Backtest engine (lean, no sizing) ────────────────────────────────────────
 
 def run_backtest(df: pd.DataFrame, t1: str, t2: str, beta: float,
-                 entry_z: float, exit_z: float, stop_z: float) -> list[dict]:
+                 entry_z: float, exit_z: float, stop_z: float,
+                 hurst_filter: HurstFilter = None,
+                 spread_daily: pd.Series = None) -> list[dict]:
     t1c, t2c = f"{t1}_close", f"{t2}_close"
-    pos = entry_spread = entry_t1 = entry_t2 = 0.0
+    pos = entry_spread = entry_t1 = entry_t2 = entry_sma = entry_std = 0.0
     entry_bar = 0
     trades = []
+    pair_blocked = False
 
     for i in range(len(df)):
+        if pair_blocked: continue
         z  = df["zscore"].iloc[i]
         s  = df["spread"].iloc[i]
         p1 = df[t1c].iloc[i]
         p2 = df[t2c].iloc[i]
+        
+        z_active = z
+        if pos != 0 and entry_std > 0:
+            z_active = (s - entry_sma) / entry_std
 
         if pos != 0:
-            ex = (pos == 1 and z >= exit_z)  or (pos == -1 and z <= -exit_z)
-            st = (pos == 1 and z <= -stop_z) or (pos == -1 and z >= stop_z)
-            if ex or st:
+            ex = (pos == 1 and z_active >= exit_z)  or (pos == -1 and z_active <= -exit_z)
+            st = (pos == 1 and z_active <= -stop_z) or (pos == -1 and z_active >= stop_z)
+            cb = abs(z_active) >= CIRCUIT_BREAKER_Z
+            if ex or st or cb:
+                if cb:
+                    pair_blocked = True
+                    st = True
                 gross      = pos * (s - entry_spread)
                 notional   = entry_t1 + beta * entry_t2
-                tx         = 2 * notional * COST_PER_SIDE
+                tx         = notional * COST_MAKER + notional * (COST_MAKER if ex and not cb else COST_TAKER)
                 hold_days  = (i - entry_bar) / BARS_PER_DAY
                 borrow     = (beta * entry_t2 if pos == 1 else entry_t1) * BORROW_RATE_ANNUAL * hold_days / 252
                 trades.append({
@@ -92,7 +123,20 @@ def run_backtest(df: pd.DataFrame, t1: str, t2: str, beta: float,
             if z < -entry_z: pos = 1
             elif z > entry_z: pos = -1
             if pos != 0:
+                # ── Hurst drift guard ─────────────────────────────
+                if hurst_filter is not None and spread_daily is not None:
+                    ts = df.index[i]
+                    d_prev = (ts - pd.Timedelta(days=1)).normalize()
+                    h_tail_daily = spread_daily.loc[:d_prev].tail(HURST_ENTRY_WINDOW - 1)
+                    h_tail = pd.concat([h_tail_daily, pd.Series({ts: df["spread"].iloc[i]})])
+                    
+                    h_blocked, _ = hurst_filter.should_block(h_tail, ts)
+                    if h_blocked:
+                        pos = 0
+                        continue
                 entry_spread = s; entry_t1 = p1; entry_t2 = p2; entry_bar = i
+                entry_sma = df["spread_mean"].iloc[i]
+                entry_std = df["spread_std"].iloc[i]
 
     return trades
 
@@ -101,11 +145,14 @@ def build_signals(closes: pd.DataFrame, t1: str, t2: str,
                   beta: float, half_life: float) -> pd.DataFrame:
     spread = closes[t1] - beta * closes[t2]
     window = max(20, min(int(half_life), 200))
-    zscore = (spread - spread.rolling(window).mean()) / spread.rolling(window).std()
+    spread_mean = spread.rolling(window).mean()
+    spread_std = spread.rolling(window).std()
+    zscore = (spread - spread_mean) / spread_std
     return pd.DataFrame({
         f"{t1}_close": closes[t1],
         f"{t2}_close": closes[t2],
         "spread": spread, "zscore": zscore,
+        "spread_mean": spread_mean, "spread_std": spread_std
     }).dropna().between_time(SIGNAL_START, RTH_END)
 
 
@@ -125,6 +172,7 @@ def metrics(trades: list[dict], days: float) -> dict:
 # ── Load data ─────────────────────────────────────────────────────────────────
 
 closes_all = load_closes()
+daily_all = load_daily()
 pairs      = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 vix_daily  = load_vix_daily()
 
@@ -135,41 +183,55 @@ print(f"Stress test  |  {len(pairs)} pairs  |  "
       f"{closes_all.index[0].date()} → {closes_all.index[-1].date()}")
 print(f"VIX data:    {'available' if vix_daily is not None else 'not found'}\n")
 
-# Build signals per pair once (full dataset)
-pair_signals: dict = {}
-for _, row in pairs.iterrows():
-    t1, t2    = row["pair"].split("-")
-    beta      = float(row.get("beta_daily", row["beta"]) or row["beta"])
-    half_life = float(row["half_life_bars"])
-    if t1 not in closes_all.columns or t2 not in closes_all.columns:
-        continue
-    df_sig = build_signals(closes_all, t1, t2, beta, half_life)
-    pair_signals[row["pair"]] = (df_sig, t1, t2, beta, float(row["beta"]))
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 1. WALK-FORWARD TEST
-# ═══════════════════════════════════════════════════════════════════════
-
 print("=" * 70)
-print("WALK-FORWARD TEST  (rolling windows)")
+print("WALK-FORWARD TEST  (Dynamic Beta)")
 print("=" * 70)
 
 wf_rows = []
 
-for pair_name, (df_sig, t1, t2, beta, _) in pair_signals.items():
-    start = df_sig.index[0]
-    end   = df_sig.index[-1]
+for _, row in pairs.iterrows():
+    pair_name = row["pair"]
+    t1, t2    = pair_name.split("-")
+    if t1 not in closes_all.columns or t2 not in closes_all.columns:
+        continue
+        
+    start = closes_all.index[0]
+    end   = closes_all.index[-1]
     w     = pd.DateOffset(months=WINDOW_MONTHS)
     step  = pd.DateOffset(months=STEP_MONTHS)
     cur   = start
 
     windows = []
+    hf = HurstFilter()
+    
     while cur + w <= end + pd.DateOffset(days=1):
-        win_end  = cur + w
-        win_df   = df_sig[(df_sig.index >= cur) & (df_sig.index < win_end)]
+        win_end = cur + w
+        
+        # Dynamic beta calculation over trailing 3 years
+        train_start = cur - pd.DateOffset(years=3)
+        daily_train = daily_all[(daily_all.index >= train_start) & (daily_all.index < cur)]
+        
+        dyn_beta = float(row.get("beta_daily", row["beta"]))
+        dyn_hl = float(row["half_life_bars"])
+        
+        if len(daily_train) >= 100:
+            is_coint, b = check_coint_johansen(daily_train, t1, t2, crit_level=0.90)
+            if is_coint and b is not None and b > 0:
+                dyn_beta = b
+                spread_train = daily_train[t1] - dyn_beta * daily_train[t2]
+                hl = compute_half_life(spread_train) * BARS_PER_DAY
+                if 20 <= hl <= 500:
+                    dyn_hl = hl
+
+        # Build signals for the whole history (fast enough) to get correct rolling Z
+        df_sig = build_signals(closes_all, t1, t2, dyn_beta, dyn_hl)
+        win_df = df_sig[(df_sig.index >= cur) & (df_sig.index < win_end)]
+        
         if len(win_df) > 200:
-            windows.append((cur.date(), (win_end - pd.Timedelta(days=1)).date(), win_df))
+            # Daily spread using dynamic beta for Hurst
+            spread_daily = (daily_all[t1] - dyn_beta * daily_all[t2]).dropna()
+            windows.append((cur.date(), (win_end - pd.Timedelta(days=1)).date(), win_df, dyn_beta, spread_daily))
+            
         cur += step
 
     if not windows:
@@ -179,9 +241,9 @@ for pair_name, (df_sig, t1, t2, beta, _) in pair_signals.items():
     print(f"  {'Window':<24} {'Trades':>7} {'WR':>6} {'Sharpe':>8} {'P&L':>10}")
     print(f"  {'─'*58}")
 
-    for w_start, w_end, win_df in windows:
+    for w_start, w_end, win_df, dyn_beta, spread_daily in windows:
         days_w = (pd.Timestamp(w_end) - pd.Timestamp(w_start)).days
-        trades = run_backtest(win_df, t1, t2, beta, ENTRY_Z, EXIT_Z, STOP_Z)
+        trades = run_backtest(win_df, t1, t2, dyn_beta, ENTRY_Z, EXIT_Z, STOP_Z, hf, spread_daily)
         m      = metrics(trades, days_w)
         flag   = "  ◄ GOOD" if m["sharpe"] > 1 else ("  ✗ BAD" if m["sharpe"] < -1 else "")
         print(f"  {str(w_start)} → {str(w_end)}  "
@@ -195,9 +257,10 @@ wf_df.to_csv(DATA_DIR / "stress_walkforward.csv", index=False)
 
 # Walk-forward chart
 if not wf_df.empty:
-    fig, axes = plt.subplots(len(pair_signals), 1,
-                             figsize=(13, 4 * len(pair_signals)), squeeze=False)
-    for ax_row, (pair_name, _) in zip(axes, pair_signals.items()):
+    fig, axes = plt.subplots(len(pairs), 1,
+                             figsize=(13, 4 * len(pairs)), squeeze=False)
+    for ax_row, (_, row) in zip(axes, pairs.iterrows()):
+        pair_name = row["pair"]
         ax  = ax_row[0]
         sub = wf_df[wf_df["pair"] == pair_name].reset_index(drop=True)
         if sub.empty:
@@ -249,7 +312,15 @@ if vix_daily is not None:
 
     regime_labels = ["calm", "normal", "elevated"]
 
-    for pair_name, (df_sig, t1, t2, beta, _) in pair_signals.items():
+    for _, row in pairs.iterrows():
+        pair_name = row["pair"]
+        t1, t2 = pair_name.split("-")
+        beta = float(row.get("beta_daily", row["beta"]))
+        half_life = float(row["half_life_bars"])
+        if t1 not in closes_all.columns or t2 not in closes_all.columns:
+            continue
+        df_sig = build_signals(closes_all, t1, t2, beta, half_life)
+        spread_daily = (daily_all[t1] - beta * daily_all[t2]).dropna()
         print(f"\n  {pair_name}")
         print(f"  {'Regime':<12} {'Trades':>7} {'WR':>6} {'Sharpe':>8} {'P&L':>10} {'VIX range'}")
         print(f"  {'─'*58}")
@@ -260,7 +331,8 @@ if vix_daily is not None:
                 print(f"  {regime:<12}  (not enough data)")
                 continue
             days = (sub.index[-1] - sub.index[0]).days
-            tr   = run_backtest(sub, t1, t2, beta, ENTRY_Z, EXIT_Z, STOP_Z)
+            hf   = HurstFilter()
+            tr   = run_backtest(sub, t1, t2, beta, ENTRY_Z, EXIT_Z, STOP_Z, hf)
             m    = metrics(tr, days)
             vix_range = {"calm": f"< {VIX_LOW}",
                          "normal": f"{VIX_LOW}–{VIX_HIGH}",
@@ -302,7 +374,7 @@ if vix_daily is not None and len(vix_daily) > 0:
 # Walk-forward consistency score: fraction of windows with Sharpe > 0
 wf_consistency: dict[str, float] = {}
 if not wf_df.empty:
-    for pair_name in pair_signals:
+    for pair_name in pairs["pair"]:
         sub = wf_df[wf_df["pair"] == pair_name]
         if len(sub) > 0:
             wf_consistency[pair_name] = float((sub["sharpe"] > 0).mean())

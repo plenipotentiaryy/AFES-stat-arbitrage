@@ -22,15 +22,17 @@ import yfinance as yf
 from config import (
     PAIRS, TICKERS, RECENT_BARS, TRAIN_RATIO, RTH_START, RTH_END, DATA_DIR,
     HURST_MAX, CORR_MIN, RECENT_CORR_DAYS, RECENT_CORR_MIN,
-    BARS_PER_DAY, CLOSES_FILE, DAILY_START, COST_PER_SIDE,
-    COINT_WINDOW_DAYS,
+    BARS_PER_DAY, CLOSES_FILE, DAILY_START, COST_TAKER,
+    COINT_WINDOW_DAYS, HALF_LIFE_MAX_BARS,
 )
 
 BETA_MIN = 0.1
 BETA_MAX = 15.0
 MIN_PAIR_OVERLAP = 500
 DAILY_CACHE = DATA_DIR / "closes_daily.csv"
-DAILY_COINT_P = 0.15       # rolling-window cointegration p-value threshold (primary filter)
+DAILY_COINT_P  = 0.35      # EG p-value pre-screen (permissive — Johansen is primary)
+TRAIN_COINT_WINDOW = 500   # days of training-period daily data for initial pair selection
+JOH_OR_EG_PASS = True      # pair passes if EITHER Johansen OR EG confirms (not both required)
 DAILY_CACHE_MAX_AGE = 7    # re-download daily cache if older than this many days
 
 # Max fraction of one spread-sigma that transaction costs may consume per trade.
@@ -58,7 +60,7 @@ def load_daily_closes() -> pd.DataFrame:
     return closes
 
 
-# ── Intraday (Polygon) ────────────────────────────────────────────────────────
+# ── Intraday (Alpha Vantage) ──────────────────────────────────────────────────
 
 def _load_raw() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
@@ -69,10 +71,7 @@ def _load_raw() -> pd.DataFrame:
         else:
             raise FileNotFoundError(f"No data file: {CLOSES_FILE}")
     df = pd.read_csv(path, index_col=0, parse_dates=True)
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC").tz_convert("US/Eastern")
-    else:
-        df.index = df.index.tz_convert("US/Eastern")
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert("US/Eastern")
     return df.between_time(RTH_START, RTH_END)
 
 
@@ -114,7 +113,8 @@ def johansen_info(df2: pd.DataFrame) -> tuple[float, float, bool]:
 
 def hurst_exponent(series: np.ndarray, max_lag: int = 200) -> float:
     lags = range(2, min(max_lag, len(series) // 4))
-    tau  = [np.std(series[lag:] - series[:-lag]) for lag in lags]
+    # Use RMS instead of std to preserve structural drift
+    tau  = [np.sqrt(np.mean((series[lag:] - series[:-lag])**2)) for lag in lags]
     return float(np.polyfit(np.log(lags), np.log(tau), 1)[0])
 
 
@@ -178,21 +178,34 @@ for t1, t2 in PAIRS:
         print(f"  SKIP {label}: only {len(pc_d)} daily bars (need {COINT_WINDOW_DAYS})")
         continue
 
-    # Use only the most recent COINT_WINDOW_DAYS bars — current macro regime
-    pc_window = pc_d.tail(COINT_WINDOW_DAYS)
+    # Use TRAINING portion of daily data for initial selection.
+    # split_date is timezone-aware; daily index may be naive — normalise.
+    split_naive = split_date.tz_localize(None) if split_date.tzinfo else split_date
+    if pc_d.index.tz is not None:
+        pc_d_train = pc_d[pc_d.index <= split_date]
+    else:
+        pc_d_train = pc_d[pc_d.index <= split_naive]
+
+    # Use up to TRAIN_COINT_WINDOW days from the training period end
+    pc_window = pc_d_train.tail(TRAIN_COINT_WINDOW) if len(pc_d_train) >= COINT_WINDOW_DAYS \
+                else pc_d.tail(COINT_WINDOW_DAYS)
+
     _, pvalue_daily, _ = coint(pc_window[t1], pc_window[t2])
-    if pvalue_daily >= DAILY_COINT_P:
-        print(f"  FAIL {label}: rolling{COINT_WINDOW_DAYS}d_coint p={pvalue_daily:.4f} >= {DAILY_COINT_P}")
+    eg_pass = pvalue_daily < DAILY_COINT_P
+
+    # Johansen — primary criterion for 20-year datasets
+    joh_trace, joh_eigen, joh_coint = johansen_info(pc_window)
+
+    # Require EITHER Johansen OR EG to confirm cointegration
+    if not (eg_pass or joh_coint):
+        print(f"  FAIL {label}: EG p={pvalue_daily:.4f} AND Johansen t={joh_trace:.1f} — both fail")
         continue
 
-    # Daily beta — OLS on rolling window
+    # Daily beta — OLS on training window
     beta_daily = float(sm.OLS(pc_window[t1], sm.add_constant(pc_window[t2])).fit().params.iloc[1])
     if beta_daily < 0 or not (BETA_MIN <= abs(beta_daily) <= BETA_MAX):
         print(f"  SKIP {label}: beta_daily={beta_daily:.4f} outside valid range")
         continue
-
-    # Johansen test (info only — not a filter)
-    joh_trace, joh_eigen, joh_coint = johansen_info(pc_window)
 
     # ── Intraday spread metrics (computed with beta_daily for consistency) ────
     pc = closes_coint[[t1, t2]].dropna()
@@ -209,7 +222,7 @@ for t1, t2 in PAIRS:
     # ── Cost viability ────────────────────────────────────────────────────────
     avg_notional  = float(pc[t1].mean() + beta_daily * pc[t2].mean())
     sigma_spread  = float(spread.std())
-    cost_fraction = (2 * COST_PER_SIDE * avg_notional) / max(sigma_spread, 1e-8)
+    cost_fraction = (2 * COST_TAKER * avg_notional) / max(sigma_spread, 1e-8)
     if cost_fraction > MAX_COST_FRACTION:
         print(f"  SKIP {label}: cost_fraction={cost_fraction:.1%} > {MAX_COST_FRACTION:.0%} "
               f"(notional=${avg_notional:.0f}, σ_spread=${sigma_spread:.2f})")
@@ -218,6 +231,11 @@ for t1, t2 in PAIRS:
     # ── Hurst filter ──────────────────────────────────────────────────────────
     if hurst >= HURST_MAX:
         print(f"  FAIL {label}: Hurst={hurst:.3f} >= {HURST_MAX}")
+        continue
+
+    # ── Half-life filter: too slow = spread won't revert before stop is hit ──
+    if half_life > HALF_LIFE_MAX_BARS:
+        print(f"  FAIL {label}: HL={half_life:.0f}b > {HALF_LIFE_MAX_BARS} (too slow)")
         continue
 
     # ── Correlation filter ────────────────────────────────────────────────────
@@ -229,9 +247,8 @@ for t1, t2 in PAIRS:
     pc_recent   = closes[[t1, t2]].dropna().tail(RECENT_CORR_DAYS * BARS_PER_DAY)
     log_ret_rec = np.log(pc_recent / pc_recent.shift(1)).dropna()
     recent_corr = round(float(log_ret_rec[t1].corr(log_ret_rec[t2])), 4)
-    if recent_corr < RECENT_CORR_MIN:
-        print(f"  FAIL {label}: recent_corr_120d={recent_corr:.3f} < {RECENT_CORR_MIN}")
-        continue
+    # recent_corr kept as info — not a blocking filter for historical backtest
+    # (backtest's CointegrationFilter handles dynamic breaks at runtime)
 
     # ── INFO: intraday cointegration (not a filter) ──────────────────────────
     _, pvalue_intraday, _ = coint(pc[t1], pc[t2])

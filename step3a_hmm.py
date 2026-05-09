@@ -28,11 +28,9 @@ def _data_file():
             return fb
         raise FileNotFoundError(f"No data: {CLOSES_FILE}")
     return p
-closes = pd.read_csv(_data_file(), index_col=0, parse_dates=True)
-if closes.index.tz is None:
-    closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
-else:
-    closes.index = closes.index.tz_convert("US/Eastern")
+closes = pd.read_csv(_data_file(), index_col=0)
+closes.index = pd.to_datetime(closes.index, utc=True)
+closes.index = closes.index.tz_convert("US/Eastern")
 closes = closes.between_time(RTH_START, RTH_END)
 
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
@@ -246,3 +244,43 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "regimes_pairs.png", dpi=150)
 print(f"Chart saved to {OUTPUT_DIR / 'regimes_pairs.png'}")
 # plt.show()
+
+
+# ── Global macro HMM on SPY ───────────────────────────────────────────────────
+# Trained on SPY daily returns — single market-wide panic signal.
+# When global_hmm = 1, sizing.py cuts ALL pair sizes by HMM_PANIC_MULT (÷3).
+
+import yfinance as yf
+
+print("\nFitting global macro HMM on SPY daily returns (full history) …")
+_spy_raw = yf.download("SPY", start="2005-01-01", interval="1d", progress=False)
+_spy     = _spy_raw["Close"].squeeze().dropna()
+_spy.index = pd.to_datetime(_spy.index).tz_localize(None)
+
+_spy_ret = _spy.pct_change()
+_spy_features = pd.DataFrame({
+    "vol":     _spy_ret.rolling(20).std(),
+    "ret":     _spy_ret.rolling(20).mean(),
+    "abs_chg": _spy_ret.abs().rolling(20).mean(),
+}).dropna()
+
+_X_spy = _spy_features.values
+_global_model = fit_hmm(_X_spy)
+
+if _global_model is not None:
+    _states  = _global_model.predict(_X_spy)
+    _vol0    = _X_spy[_states == 0, 0].mean()
+    _vol1    = _X_spy[_states == 1, 0].mean()
+    _panic_s = 0 if _vol0 > _vol1 else 1
+    _labels  = (_states == _panic_s).astype(int)
+
+    global_hmm_regime = pd.Series(_labels, index=_spy_features.index, name="global_hmm")
+    global_hmm_regime.index = pd.to_datetime(global_hmm_regime.index).tz_localize(None)
+    global_hmm_regime.to_csv(DATA_DIR / "global_hmm_regime.csv", header=True)
+
+    n_panic = _labels.sum()
+    pct     = n_panic / len(_labels) * 100
+    print(f"  SPY bars: {len(_labels)}  panic days: {n_panic} ({pct:.0f}%)")
+    print(f"  Saved {DATA_DIR / 'global_hmm_regime.csv'}")
+else:
+    print("  Global HMM did not converge — skipped")

@@ -5,7 +5,7 @@ import statsmodels.api as sm
 from config import (
     CLOSES_FILE,
     ENTRY_Z, EXIT_Z, STOP_Z,
-    COST_PER_SIDE, BORROW_RATE_ANNUAL,
+    COST_TAKER, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, RECENT_BARS,
     BARS_PER_DAY,
     DATA_DIR, OUTPUT_DIR,
@@ -104,7 +104,7 @@ def compute_pnl(paths, mu, sigma, beta,
 
     # Apply transaction costs
     notional    = abs(entry_level) * (1 + beta)
-    tx_cost     = 2 * notional * COST_PER_SIDE
+    tx_cost     = 2 * notional * COST_TAKER
     holding_days = exit_bar / BARS_PER_DAY
     borrow_cost  = notional * 0.5 * BORROW_RATE_ANNUAL * holding_days / 252
 
