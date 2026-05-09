@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from config import (
-    REGIME_MULT_NORMAL, REGIME_MULT_VOLATILE,
+    REGIME_MULT_NORMAL, REGIME_MULT_VOLATILE, HMM_PANIC_MULT,
     IV_MULT_MAX, IV_MULT_MIN, IV_LOOKBACK,
     MIN_POSITION_SIZE,
     DATA_DIR, OUTPUT_DIR,
@@ -26,15 +26,27 @@ def load_regimes() -> pd.DataFrame | None:
     return df   # wide: timestamp × pair, values 0/1
 
 
-def load_iv() -> pd.Series | None:
+def load_iv() -> tuple[pd.Series | None, pd.Series | None]:
     path = DATA_DIR / "iv_filter.csv"
     if not path.exists():
         print("  iv_filter.csv not found — iv_mult = 1.0 for all days")
-        return None
-    df  = pd.read_csv(path, index_col=0, parse_dates=True)
+        return None, None
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df.index = pd.to_datetime(df.index).tz_localize(None)
     vix = df["vix"].dropna()
-    vix.index = pd.to_datetime(vix.index).tz_localize(None)
-    return vix
+    macro_alert = df["macro_alert"].reindex(df.index).fillna(0).astype(int) \
+        if "macro_alert" in df.columns else pd.Series(0, index=df.index)
+    return vix, macro_alert
+
+
+def load_global_hmm() -> pd.Series | None:
+    path = DATA_DIR / "global_hmm_regime.csv"
+    if not path.exists():
+        print("  global_hmm_regime.csv not found — global HMM panic mult = 1.0")
+        return None
+    s = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0]
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    return s.rename("global_hmm")
 
 
 def load_mc_confidence() -> dict[str, float]:
@@ -77,24 +89,52 @@ def iv_multiplier(iv_mult_series: pd.Series, date) -> float:
         return IV_MULT_MAX
 
 
+def global_hmm_multiplier(global_hmm: pd.Series | None, date) -> float:
+    if global_hmm is None or global_hmm.empty:
+        return 1.0
+    key = pd.Timestamp(date).normalize().tz_localize(None)
+    try:
+        val = global_hmm.asof(key)
+        return HMM_PANIC_MULT if (not pd.isna(val) and int(val) == 1) else 1.0
+    except Exception:
+        return 1.0
+
+
+def macro_alert_active(macro_alert: pd.Series | None, date) -> bool:
+    if macro_alert is None or macro_alert.empty:
+        return False
+    key = pd.Timestamp(date).normalize().tz_localize(None)
+    try:
+        return bool(macro_alert.asof(key))
+    except Exception:
+        return False
+
+
 def mc_confidence(mc_conf: dict, pair: str) -> float:
     return mc_conf.get(pair, 1.0)
 
 
-def position_size(pair: str, ts, regimes, iv_mult_s, mc_conf: dict) -> float:
-    r = regime_multiplier(regimes, pair, ts)
-    i = iv_multiplier(iv_mult_s, ts.date() if hasattr(ts, "date") else ts)
-    m = mc_confidence(mc_conf, pair)
-    return r * i * m
+def position_size(pair: str, ts, regimes, iv_mult_s, mc_conf: dict,
+                  macro_alert_s: pd.Series | None = None,
+                  global_hmm_s: pd.Series | None = None) -> float:
+    date = ts.date() if hasattr(ts, "date") else ts
+    if macro_alert_active(macro_alert_s, date):
+        return 0.0   # block new entries during macro panic (VIX9D backwardation)
+    r = regime_multiplier(regimes, pair, ts)      # per-pair HMM (0.3 in volatile)
+    g = global_hmm_multiplier(global_hmm_s, date) # global SPY HMM (0.333 in panic)
+    i = iv_multiplier(iv_mult_s, date)            # VIX percentile (0.5–1.0)
+    m = mc_confidence(mc_conf, pair)              # OU Monte Carlo win rate
+    return r * g * i * m
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────
 print("Loading data sources...\n")
 
-regimes    = load_regimes()
-vix        = load_iv()
-mc_conf    = load_mc_confidence()
-iv_mult_s  = iv_multiplier_series(vix)
+regimes        = load_regimes()
+vix, macro_alert_s = load_iv()
+global_hmm_s   = load_global_hmm()
+mc_conf        = load_mc_confidence()
+iv_mult_s      = iv_multiplier_series(vix)
 
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 pair_names = list(pairs["pair"])
@@ -113,7 +153,7 @@ sizes = {}
 for pair in pair_names:
     col = []
     for ts in timestamps:
-        col.append(position_size(pair, ts, regimes, iv_mult_s, mc_conf))
+        col.append(position_size(pair, ts, regimes, iv_mult_s, mc_conf, macro_alert_s, global_hmm_s))
     sizes[pair] = col
 
 df_sizes = pd.DataFrame(sizes, index=timestamps)
@@ -138,10 +178,15 @@ for pair in pair_names:
 
     # Decompose a single bar (latest)
     latest = timestamps[-1]
-    r = regime_multiplier(regimes, pair, latest)
-    i = iv_multiplier(iv_mult_s, latest.date() if hasattr(latest, "date") else latest)
+    r    = regime_multiplier(regimes, pair, latest)
+    i    = iv_multiplier(iv_mult_s, latest.date() if hasattr(latest, "date") else latest)
+    date_latest = latest.date() if hasattr(latest, "date") else latest
+    alert = macro_alert_active(macro_alert_s, date_latest)
+    g     = global_hmm_multiplier(global_hmm_s, date_latest)
     print(f"    Latest (current):")
-    print(f"      regime_mult={r:.1f}  iv_mult={i:.2f}  mc_conf={mc:.2f}  → size={r*i*mc:.2f}")
+    print(f"      regime_mult={r:.1f}  global_hmm={g:.3f}  iv_mult={i:.2f}  "
+          f"mc_conf={mc:.2f}  macro_alert={'BLOCK' if alert else 'ok'}"
+          f"  → size={0.0 if alert else r*g*i*mc:.2f}")
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 df_sizes.to_csv(DATA_DIR / "position_sizes.csv")

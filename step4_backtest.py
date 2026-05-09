@@ -2,18 +2,15 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import coint
 from config import (
     ENTRY_Z, EXIT_Z, STOP_Z, ENTRY_Z_VOLATILE,
     COST_PER_SIDE, BORROW_RATE_ANNUAL, PAIR_MAX_LOSS,
     IV_SIZE_NORM, MIN_POSITION_SIZE, TRAIN_RATIO,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
     DATA_DIR, OUTPUT_DIR,
-    BARS_PER_DAY, CLOSES_FILE, KALMAN_DELTA,
-    COINT_WINDOW_DAYS, COINT_BREAK_P, COINT_RECHECK_DAYS,
+    BARS_PER_DAY, CLOSES_FILE,
 )
-from kalman import kalman_hedge
-from sizing import (
+from step9_sizing import (
     load_regimes, load_iv, load_mc_confidence,
     iv_multiplier_series, position_size,
 )
@@ -57,71 +54,22 @@ def load_closes() -> pd.DataFrame:
     return closes.dropna()
 
 
-def build_signals(closes, t1, t2, beta, half_life,
-                  delta: float = KALMAN_DELTA) -> pd.DataFrame:
-    """Kalman-filter spread signals.
+def build_signals(closes, t1, t2, beta, half_life) -> pd.DataFrame:
+    """Fixed-beta spread signals (no Kalman).
 
-    The hedge ratio β is updated bar-by-bar via a Kalman filter, so it adapts
-    continuously to shifting correlations (e.g. Trump tweets, macro shocks) rather
-    than being fixed to an OLS estimate from months ago.  beta_daily is used only
-    as the initial value; the filter takes over from bar 1.
-    Spread = Kalman innovation = p1 - (α_t + β_t·p2), already ~zero-mean.
+    Uses beta_daily (8-year OLS) for a stable hedge ratio across the full
+    intraday dataset.  Rolling z-score adapts to local spread dynamics.
     """
-    _, beta_arr, innov, _ = kalman_hedge(
-        closes[t1].values, closes[t2].values,
-        delta=delta, beta_init=float(beta),
-    )
-    spread = pd.Series(innov,    index=closes.index, name="spread")
-    beta_s = pd.Series(beta_arr, index=closes.index, name="beta")
+    spread = closes[t1] - beta * closes[t2]
     window = max(20, min(int(half_life), 200))
-    spread_std = spread.rolling(window=window).std()
-    zscore = spread / spread_std   # innovations are already ~zero-mean
+    zscore = (spread - spread.rolling(window).mean()) / spread.rolling(window).std()
     return pd.DataFrame({
         f"{t1}_close": closes[t1],
         f"{t2}_close": closes[t2],
         "spread":      spread,
-        "beta":        beta_s,
-        "spread_std":  spread_std,
+        "beta":        beta,
         "zscore":      zscore,
     }).dropna().between_time(SIGNAL_START, RTH_END)
-
-
-def compute_rolling_coint_validity(daily: pd.DataFrame, t1: str, t2: str,
-                                   window: int = COINT_WINDOW_DAYS,
-                                   p_thresh: float = COINT_BREAK_P,
-                                   step: int = COINT_RECHECK_DAYS) -> pd.Series:
-    """
-    Pre-compute a daily boolean Series: True = pair cointegrated, False = broken.
-    Sampled every `step` days (default 5) and forward-filled — avoids running
-    EG on every single trading day (5x faster).
-    """
-    pc = daily[[t1, t2]].dropna()
-    if len(pc) < window:
-        return pd.Series(dtype=bool)
-    sampled = {}
-    for i in range(window, len(pc) + 1, step):
-        chunk = pc.iloc[i - window:i]
-        try:
-            _, pval, _ = coint(chunk[t1], chunk[t2])
-            sampled[pc.index[i - 1]] = pval < p_thresh
-        except Exception:
-            sampled[pc.index[i - 1]] = False
-    if not sampled:
-        return pd.Series(dtype=bool)
-    s = pd.Series(sampled)
-    # forward-fill so every calendar day has a value
-    return s.reindex(pc.index).ffill().fillna(True).rename(f"{t1}-{t2}")
-
-
-def load_kmeans_regime() -> pd.Series | None:
-    """Load daily K-Means macro regime labels (0=Trend, 1=Sideways, 2=Panic)."""
-    path = DATA_DIR / "kmeans_regimes.csv"
-    if not path.exists():
-        return None
-    s = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0]
-    if s.index.tz is None:
-        s.index = s.index.tz_localize("UTC")
-    return s
 
 
 def ou_params_from_spread(spread: pd.Series) -> tuple[float, float]:
@@ -149,9 +97,9 @@ def optimal_thresholds(theta: float, sigma_roll: float, notional: float,
     c_z   = 2 * COST_PER_SIDE * notional / max(sigma_roll, 1e-8)
     sig_z = np.sqrt(2 * theta)
 
-    entry_grid = np.arange(1.5, 3.75, 0.25)  # [1.5 … 3.5]  (8 values)
-    exit_grid  = np.arange(-0.3, 1.05, 0.1)  # [-0.3 … 1.0] fine step for exit-past-zero
-    stop_grid  = np.arange(3.0,  5.5,  0.5)  # [3.0 … 5.0]  (5 values)
+    entry_grid = np.arange(1.0, 4.0,  0.5)   # [1.0 … 3.5]
+    exit_grid  = np.arange(-0.5, 2.0, 0.5)   # [-0.5 … 1.5]  (exit level in z)
+    stop_grid  = np.arange(2.5,  6.5, 0.5)   # [2.5 … 6.0]
 
     best_rate = -np.inf
     best      = (float(ENTRY_Z), float(EXIT_Z), float(STOP_Z))
@@ -197,90 +145,19 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                   sizing_args: dict | None = None,
                   entry_z: float = ENTRY_Z,
                   exit_thresh: float = EXIT_Z,
-                  stop_thresh: float = STOP_Z,
-                  coint_valid: pd.Series | None = None,
-                  kmeans_regime: pd.Series | None = None,
-                  oos_start: pd.Timestamp | None = None) -> pd.DataFrame:
-    """
-    oos_start     : first timestamp of the OOS period — entries are blocked before
-                    this date, but Kalman filter has already warmed up on full history.
-    coint_valid   : daily boolean Series (Phase 1) — force-close + suspend entry
-                    when rolling 90-day cointegration breaks.
-    kmeans_regime : daily int Series (Phase 4) — 0=Trend, 1=Sideways, 2=Panic.
-                    New entries only in Sideways; force-close in Panic.
-    """
+                  stop_thresh: float = STOP_Z) -> pd.DataFrame:
     t1_col, t2_col = f"{t1}_close", f"{t2}_close"
     position = 0
     entry_spread = entry_t1 = entry_t2 = entry_beta = 0.0
     entry_bar = 0
     cumulative_pnl = 0.0
     trades = []
-    suspended = False   # True when rolling coint has broken
-
-    # Pre-build date-keyed dicts for O(1) lookups in the hot loop
-    _coint_dict: dict = {}
-    if coint_valid is not None and len(coint_valid) > 0:
-        cv = coint_valid.copy()
-        if cv.index.tz is not None:
-            cv.index = cv.index.tz_localize(None) if False else cv.index
-        _coint_dict = {ts.date(): bool(v) for ts, v in cv.items()}
-
-    _kmeans_dict: dict = {}
-    if kmeans_regime is not None and len(kmeans_regime) > 0:
-        kr = kmeans_regime.copy()
-        _kmeans_dict = {ts.date(): int(v) for ts, v in kr.items()}
 
     for i in range(len(df)):
-        ts         = df.index[i]
-        day        = ts
         z          = df["zscore"].iloc[i]
         spread_now = df["spread"].iloc[i]
         t1_price   = df[t1_col].iloc[i]
         t2_price   = df[t2_col].iloc[i]
-
-        # ── Phase 1: rolling cointegration validity check ─────────────────
-        if _coint_dict:
-            coint_ok = _coint_dict.get(day.date(), True)
-            if not coint_ok and not suspended:
-                suspended = True
-            elif coint_ok and suspended:
-                suspended = False
-
-        # ── Phase 4: K-Means macro regime gate ───────────────────────────
-        macro_regime = _kmeans_dict.get(day.date(), 1)
-
-        # Force-close all positions in Panic regime (2) or coint break
-        force_close = (macro_regime == 2) or suspended
-        if position != 0 and force_close:
-            gross_pnl      = position * (spread_now - entry_spread)
-            notional       = entry_t1 + abs(entry_beta) * entry_t2
-            tx_cost        = 2 * notional * COST_PER_SIDE
-            holding_days   = (i - entry_bar) / BARS_PER_TRADING_DAY
-            short_notional = (abs(entry_beta) * entry_t2) if position == 1 else entry_t1
-            borrow_cost    = short_notional * BORROW_RATE_ANNUAL * holding_days / 252
-            size           = IV_SIZE_NORM
-            net_pnl        = (gross_pnl - tx_cost - borrow_cost) * size
-            cumulative_pnl += net_pnl
-            reason = "PANIC" if macro_regime == 2 else "COINT_BREAK"
-            trades.append({
-                "pair":         f"{t1}-{t2}",
-                "entry_time":   df.index[entry_bar],
-                "exit_time":    ts,
-                "direction":    "LONG" if position == 1 else "SHORT",
-                "holding_bars": i - entry_bar,
-                "gross_pnl":    round(gross_pnl, 4),
-                "tx_cost":      round(tx_cost, 4),
-                "borrow_cost":  round(borrow_cost, 4),
-                "net_pnl":      round(net_pnl, 4),
-                "cum_pnl":      round(cumulative_pnl, 4),
-                "exit_reason":  reason,
-                "entry_z":      round(df["zscore"].iloc[entry_bar], 2),
-                "exit_z":       round(z, 2),
-            })
-            position = 0
-            if cumulative_pnl < PAIR_MAX_LOSS:
-                break
-            continue
 
         if position != 0:
             exit_signal = (position == 1 and z >= exit_thresh) or (position == -1 and z <= -exit_thresh)
@@ -288,10 +165,10 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
 
             if exit_signal or stop_signal:
                 gross_pnl      = position * (spread_now - entry_spread)
-                notional       = entry_t1 + abs(entry_beta) * entry_t2
+                notional       = entry_t1 + entry_beta * entry_t2
                 tx_cost        = 2 * notional * COST_PER_SIDE
                 holding_days   = (i - entry_bar) / BARS_PER_TRADING_DAY
-                short_notional = (abs(entry_beta) * entry_t2) if position == 1 else entry_t1
+                short_notional = (entry_beta * entry_t2) if position == 1 else entry_t1
                 borrow_cost    = short_notional * BORROW_RATE_ANNUAL * holding_days / 252
                 if sizing_args:
                     size = position_size(
@@ -308,7 +185,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 trades.append({
                     "pair":         f"{t1}-{t2}",
                     "entry_time":   df.index[entry_bar],
-                    "exit_time":    ts,
+                    "exit_time":    df.index[i],
                     "direction":    "LONG" if position == 1 else "SHORT",
                     "holding_bars": i - entry_bar,
                     "gross_pnl":    round(gross_pnl, 4),
@@ -322,44 +199,33 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 })
                 position = 0
 
+                # ── Auto-disable if pair is consistently losing ───────────
                 if cumulative_pnl < PAIR_MAX_LOSS:
                     break
 
         if position == 0:
-            # Block new entries before OOS start (Kalman warmup period)
-            if oos_start is not None and ts < oos_start:
-                continue
-
-            # Block new entries when coint broken or macro not sideways
-            if suspended or (macro_regime != 1 and kmeans_regime is not None):
-                continue
-
+            # Skip entry if dynamic sizing deems position too small
             if sizing_args:
-                sz = position_size(pair_name, ts,
+                sz = position_size(pair_name, df.index[i],
                                    sizing_args["regimes"],
                                    sizing_args["iv_mult_s"],
                                    sizing_args["mc_conf"])
                 if sz < MIN_POSITION_SIZE:
                     continue
 
-            is_volatile = regime_dict.get(ts, 0) == 1 if regime_dict else False
+            is_volatile = regime_dict.get(df.index[i], 0) == 1 if regime_dict else False
+            # Add a fixed buffer in volatile regime rather than multiplying MC-optimised entry_z
             threshold   = entry_z + (ENTRY_Z_VOLATILE - ENTRY_Z) if is_volatile else entry_z
             if z < -threshold:
                 position = 1
             elif z > threshold:
                 position = -1
             if position != 0:
-                # Execute at NEXT bar — signal fires on close of bar i,
-                # fill happens on bar i+1 (realistic: ~15 min later).
-                next_i = i + 1
-                if next_i >= len(df):
-                    position = 0   # no next bar, skip
-                    continue
-                entry_spread = df["spread"].iloc[next_i]
-                entry_t1     = df[t1_col].iloc[next_i]
-                entry_t2     = df[t2_col].iloc[next_i]
-                entry_beta   = df["beta"].iloc[next_i]
-                entry_bar    = next_i
+                entry_spread = spread_now
+                entry_t1     = t1_price
+                entry_t2     = t2_price
+                entry_beta   = df["beta"].iloc[i]
+                entry_bar    = i
 
     return pd.DataFrame(trades)
 
@@ -367,37 +233,6 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
 # ── Load ─────────────────────────────────────────────────────────────────────
 closes = load_closes()
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
-
-# Phase 1: load daily data for rolling cointegration validity
-_daily_cache = DATA_DIR / "closes_daily.csv"
-_daily: pd.DataFrame | None = None
-if _daily_cache.exists():
-    _daily = pd.read_csv(_daily_cache, index_col=0, parse_dates=True)
-    _daily.index = pd.to_datetime(_daily.index, utc=True)
-    print(f"Daily cache loaded for rolling coint check  ({len(_daily)} days)")
-else:
-    print("No closes_daily.csv — rolling coint check disabled (run step0_download.py)")
-
-# Pre-compute rolling cointegration validity per pair
-_coint_valid: dict[str, pd.Series] = {}
-if _daily is not None:
-    print("Computing rolling cointegration validity …", end=" ", flush=True)
-    for _, _row in pairs.iterrows():
-        _t1, _t2 = _row["pair"].split("-")
-        if _t1 in _daily.columns and _t2 in _daily.columns:
-            _coint_valid[_row["pair"]] = compute_rolling_coint_validity(_daily, _t1, _t2)
-    print(f"{len(_coint_valid)} pairs")
-
-# Phase 4: load K-Means macro regime
-_kmeans_regime = load_kmeans_regime()
-if _kmeans_regime is not None:
-    sideways_pct = (_kmeans_regime == 1).mean() * 100
-    panic_pct    = (_kmeans_regime == 2).mean() * 100
-    print(f"K-Means regimes loaded  "
-          f"(Sideways {sideways_pct:.0f}%  Panic {panic_pct:.0f}%  "
-          f"Trend {100-sideways_pct-panic_pct:.0f}%)")
-else:
-    print("No kmeans_regimes.csv — K-Means gate disabled (run step5_kmeans.py)")
 
 # Full history for Kalman warmup (train + test, no date split)
 # Load dynamic sizing components (step5 + step7 + step8 → step9)
@@ -460,20 +295,8 @@ else:
     print("No optimal_params.csv — will use OU Monte Carlo per pair  "
           "(run step 6e first for better results)")
 
-# OOS start date — read from pairs_selected.csv (set by pairs.py via TRAIN_RATIO)
-# Kalman warms up on full history; trading begins only from this date.
-_oos_start: pd.Timestamp | None = None
-if "test_start_date" in pairs.columns:
-    _oos_start = pd.Timestamp(pairs["test_start_date"].iloc[0]).tz_localize("US/Eastern")
-    print(f"OOS start: {_oos_start.date()}  (Kalman warms up on full history before this)")
-else:
-    print("WARNING: test_start_date not in pairs_selected.csv — running on full period (in-sample!)")
-
 print(f"Trading {len(pairs)} pairs | {closes.shape[0]} bars per ticker")
-print(f"Full data: {closes.index[0]} — {closes.index[-1]}")
-if _oos_start:
-    oos_bars = (closes.index >= _oos_start).sum()
-    print(f"OOS bars: {oos_bars} / {len(closes.index)}  ({oos_bars/len(closes.index)*100:.0f}% of total)")
+print(f"Period: {closes.index[0]} — {closes.index[-1]}")
 print(f"Pair max loss cutoff: {PAIR_MAX_LOSS}\n")
 
 # ── Run backtest per pair ─────────────────────────────────────────────────────
@@ -504,18 +327,14 @@ for _, row in pairs.iterrows():
     print(f"  {row['pair']:12s}  [{src}]  "
           f"entry={opt_entry}  exit={opt_exit:+.1f}  stop={opt_stop}")
 
-    pair_regime  = regime_data.get(row["pair"])
-    coint_series = _coint_valid.get(row["pair"])
+    pair_regime = regime_data.get(row["pair"])
     trades = backtest_pair(df_sig, t1, t2, beta,
                            pair_name=row["pair"],
                            regime_dict=pair_regime,
                            sizing_args=sizing_args,
                            entry_z=opt_entry,
                            exit_thresh=opt_exit,
-                           stop_thresh=opt_stop,
-                           coint_valid=coint_series,
-                           kmeans_regime=_kmeans_regime,
-                           oos_start=_oos_start)
+                           stop_thresh=opt_stop)
 
     if trades.empty:
         print(f"  {row['pair']:12s}  0 trades")
@@ -542,8 +361,6 @@ pnl             = df_trades["net_pnl"]
 winning         = df_trades[pnl > 0]
 losing          = df_trades[pnl <= 0]
 stops           = df_trades[df_trades["exit_reason"] == "STOP"]
-coint_breaks    = df_trades[df_trades["exit_reason"] == "COINT_BREAK"]
-panic_exits     = df_trades[df_trades["exit_reason"] == "PANIC"]
 cumulative      = pnl.cumsum()
 max_drawdown    = (cumulative - cumulative.cummax()).min()
 days_total      = pd.to_datetime(df_trades["exit_time"].iloc[-1]) - pd.to_datetime(df_trades["exit_time"].iloc[0])
@@ -559,8 +376,6 @@ print(f"{'='*60}")
 print(f"Trades:        {len(df_trades)}  ({trades_per_year:.0f}/yr)")
 print(f"Win rate:      {len(winning)/len(df_trades)*100:.1f}%")
 print(f"Stops:         {len(stops)}")
-print(f"Coint breaks:  {len(coint_breaks)}")
-print(f"Panic exits:   {len(panic_exits)}")
 print(f"Gross P&L:     {df_trades['gross_pnl'].sum():+.4f}")
 print(f"Costs:         {(df_trades['tx_cost']+df_trades['borrow_cost']).sum():.4f}")
 print(f"Net P&L:       {pnl.sum():+.4f}")
@@ -619,8 +434,7 @@ print("OUT-OF-SAMPLE COMPARISON")
 print(f"{'='*60}")
 test_period = (pd.to_datetime(df_trades['exit_time'].iloc[-1])
                - pd.to_datetime(df_trades['exit_time'].iloc[0])).days
-_oos_display = _oos_start.date() if _oos_start else closes.index[0].date()
-print(f"Test period:       {_oos_display} → {closes.index[-1].date()} "
+print(f"Test period:       {closes.index[0].date()} → {closes.index[-1].date()} "
       f"({test_period} days)")
 print(f"Strategy  Sharpe:  {sharpe:.2f}")
 print(f"Strategy  Net P&L: {pnl.sum():+.4f} (spread units)")
