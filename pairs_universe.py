@@ -3,7 +3,8 @@ pairs_universe.py — Auto-discovery of cointegrated pairs from the S&P 500.
 
 Funnel (cheap → expensive):
   Layer 1: Same GICS sub-industry (Wikipedia)    ~125k → ~3,000 pairs
-  Layer 2: Correlation matrix > 0.30             ~3k   →   ~500 pairs  (garbage filter only)
+  Layer 1b: RMT + MST market graph                ~3k   →   sparse graph candidates
+  Layer 2: Correlation matrix > 0.30             graph →   ~500 pairs  (garbage filter only)
   Layer 2b: SSD pre-filter (Gatev et al. 2006)  ~500  →   ~350 pairs  (discard most divergent)
   Layer 3: Individual ADF pre-screen (I(1))      ~350  →   ~200 pairs
   Layer 4: Johansen cointegration test           ~200  →    ~40 pairs
@@ -32,6 +33,7 @@ import ssl
 import urllib.request
 from io import StringIO
 import yfinance as yf
+from scipy.sparse.csgraph import minimum_spanning_tree
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 import statsmodels.api as sm
@@ -47,6 +49,12 @@ BETA_MIN     = 0.10   # Layer 5: min OLS beta
 BETA_MAX     = 15.0   # Layer 5: max OLS beta
 HURST_MAX    = 0.50   # Layer 5: spread must be mean-reverting
 MIN_OBS      = 252    # minimum daily bars per ticker (1 year)
+
+RMT_GRAPH_ENABLED = True
+RMT_GRAPH_WINDOW = COINT_WINDOW_DAYS
+RMT_SIGNAL_EIGEN_RATIO = 1.0
+RMT_TOP_K_NEIGHBORS = 3
+RMT_FALLBACK_MIN_KEEP_RATIO = 0.20
 
 # ── File paths ────────────────────────────────────────────────────────────────
 SP500_CACHE  = DATA_DIR / "sp500_sectors.csv"
@@ -134,6 +142,116 @@ def layer1_sector(symbols: list[str], sector_df: pd.DataFrame) -> list[tuple]:
     print(f"\nLayer 1 (same sub-industry): {len(pairs):,} pairs "
           f"across {len(groups)} sub-industries")
     return pairs
+
+
+# ── Layer 1b: RMT-cleaned market graph ───────────────────────────────────────
+
+def _rmt_clean_correlation(returns: pd.DataFrame,
+                           signal_eigen_ratio: float = RMT_SIGNAL_EIGEN_RATIO) -> pd.DataFrame:
+    """
+    Clean a return correlation matrix with the Marchenko-Pastur noise boundary.
+
+    Eigenvalues below the adjusted noise boundary are replaced by their average.
+    The result is projected back to a valid correlation-like matrix before graph
+    construction.
+    """
+    clean_returns = (
+        returns
+        .apply(pd.to_numeric, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(axis=1, thresh=max(30, int(len(returns) * 0.80)))
+    )
+    clean_returns = clean_returns.fillna(0.0)
+    if clean_returns.shape[0] < 2 or clean_returns.shape[1] < 2:
+        raise ValueError("not enough complete return history for RMT graph")
+
+    corr = clean_returns.corr().to_numpy(dtype=float)
+    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    corr = 0.5 * (corr + corr.T)
+    np.fill_diagonal(corr, 1.0)
+
+    n_obs, n_assets = clean_returns.shape
+    q = n_assets / n_obs
+    lambda_plus = (1.0 + np.sqrt(q)) ** 2
+    signal_cutoff = lambda_plus * max(float(signal_eigen_ratio), 1.0)
+
+    eigvals, eigvecs = np.linalg.eigh(corr)
+    noise_mask = eigvals <= signal_cutoff
+    cleaned = eigvals.copy()
+    if noise_mask.any():
+        cleaned[noise_mask] = eigvals[noise_mask].mean()
+
+    clean_corr = eigvecs @ np.diag(cleaned) @ eigvecs.T
+    clean_corr = 0.5 * (clean_corr + clean_corr.T)
+
+    diag = np.sqrt(np.clip(np.diag(clean_corr), 1e-12, None))
+    clean_corr = clean_corr / np.outer(diag, diag)
+    clean_corr = np.clip(0.5 * (clean_corr + clean_corr.T), -0.999999, 0.999999)
+    np.fill_diagonal(clean_corr, 1.0)
+
+    return pd.DataFrame(clean_corr, index=clean_returns.columns, columns=clean_returns.columns)
+
+
+def layer1b_rmt_mst_graph(pairs: list[tuple],
+                          closes: pd.DataFrame,
+                          window: int = RMT_GRAPH_WINDOW,
+                          top_k: int = RMT_TOP_K_NEIGHBORS) -> list[tuple]:
+    """
+    Keep same-sub-industry pairs that are adjacent in the RMT-cleaned market graph.
+
+    Pure MST keeps only N-1 edges and can be too sparse for pair trading, so the
+    candidate graph is MST plus each ticker's top-k nearest neighbors under the
+    Mantegna distance d=sqrt(2*(1-rho_clean)).
+    """
+    if not RMT_GRAPH_ENABLED or not pairs:
+        return pairs
+
+    recent = closes.tail(window)
+    log_ret = np.log(recent / recent.shift(1)).dropna(how="all")
+    allowed = {tuple(sorted((t1, t2))): sub for t1, t2, sub in pairs}
+    needed = sorted({ticker for edge in allowed for ticker in edge})
+    available = [ticker for ticker in needed if ticker in log_ret.columns]
+    if len(available) < 3:
+        return pairs
+
+    try:
+        clean_corr = _rmt_clean_correlation(log_ret[available])
+    except ValueError:
+        return pairs
+
+    symbols = clean_corr.columns.tolist()
+    corr_arr = clean_corr.to_numpy(dtype=float)
+    dist = np.sqrt(np.clip(2.0 * (1.0 - corr_arr), 0.0, None))
+    np.fill_diagonal(dist, 0.0)
+
+    graph_edges: set[tuple[str, str]] = set()
+
+    mst = minimum_spanning_tree(dist).tocoo()
+    for i, j in zip(mst.row, mst.col):
+        graph_edges.add(tuple(sorted((symbols[int(i)], symbols[int(j)]))))
+
+    if top_k > 0:
+        for i, sym in enumerate(symbols):
+            order = np.argsort(dist[i])
+            added = 0
+            for j in order:
+                if i == j:
+                    continue
+                graph_edges.add(tuple(sorted((sym, symbols[int(j)]))))
+                added += 1
+                if added >= top_k:
+                    break
+
+    passed = [(a, b, allowed[(a, b)]) for a, b in sorted(graph_edges) if (a, b) in allowed]
+    min_keep = int(len(pairs) * RMT_FALLBACK_MIN_KEEP_RATIO)
+    if len(passed) < max(1, min_keep):
+        print(f"Layer 1b (RMT+MST): {len(passed):,} pairs too sparse; "
+              f"fallback to sector candidates ({len(pairs):,})")
+        return pairs
+
+    print(f"Layer 1b (RMT+MST+kNN): {len(passed):,} pairs remain "
+          f"(from {len(pairs):,}; top_k={top_k})")
+    return passed
 
 
 # ── Layer 2: vectorized correlation matrix ────────────────────────────────────
@@ -358,6 +476,9 @@ def main():
 
     # Layer 1: same sub-industry
     pairs1 = layer1_sector(good, sector_df)
+
+    # Layer 1b: RMT-cleaned market graph (MST + top-k nearest neighbors)
+    pairs1 = layer1b_rmt_mst_graph(pairs1, closes)
 
     # Layer 2: correlation
     pairs2 = layer2_correlation(pairs1, closes)

@@ -18,6 +18,13 @@ VOL_WINDOW = 20   # bars for rolling features
 N_SEEDS    = 10   # HMM restarts — pick best log-likelihood
 EXIT_Z_CMP = 0.0  # exit threshold used in the comparison backtest
 
+# ── Leak-free training parameters ─────────────────────────────────────────────
+# Per-pair HMM:   fit on bars BEFORE test_start_date, predict on test/OOS bars.
+# Global SPY HMM: expanding-window refit on past-only daily data.
+PER_PAIR_TRAIN_BARS    = 7000   # ~3 months of train-only intraday bars
+GLOBAL_MIN_TRAIN_DAYS  = 252    # 1y of SPY daily data for first global fit
+GLOBAL_REFIT_EVERY     = 30     # refit cadence in trading days
+
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 def _data_file():
@@ -35,6 +42,14 @@ closes = closes.between_time(RTH_START, RTH_END)
 
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 print(f"Pairs: {len(pairs)}\n")
+
+# Test start date — pairs_selected.csv contains this column from step2a.
+# Per-pair HMM trains strictly on bars BEFORE this date (no future leak).
+if "test_start_date" not in pairs.columns:
+    raise SystemExit("pairs_selected.csv lacks 'test_start_date' — re-run step2a")
+TEST_START = pd.Timestamp(pairs["test_start_date"].iloc[0]).tz_localize("US/Eastern")
+print(f"Train cutoff for per-pair HMM: bars < {TEST_START.date()}")
+print(f"Predicting on bars >= {TEST_START.date()}  (OOS labels only)\n")
 
 
 def fit_hmm(X: np.ndarray) -> GaussianHMM | None:
@@ -61,7 +76,9 @@ def build_features(spread: pd.Series) -> pd.DataFrame:
     }).dropna()
 
 
-# ── Fit HMM per pair ──────────────────────────────────────────────────────────
+# ── Fit HMM per pair (leak-free) ──────────────────────────────────────────────
+# Train on bars strictly BEFORE TEST_START; predict on bars >= TEST_START.
+# regimes.csv covers the OOS window only — backtest queries dates beyond.
 all_regimes: dict[str, pd.Series] = {}
 
 for _, row in pairs.iterrows():
@@ -72,38 +89,42 @@ for _, row in pairs.iterrows():
         print(f"  SKIP {row['pair']}: missing ticker")
         continue
 
-    spread   = (closes[t1] - beta * closes[t2]).dropna().tail(RECENT_BARS)
-    features = build_features(spread)
+    spread_full = (closes[t1] - beta * closes[t2]).dropna()
+    feat_full   = build_features(spread_full)   # rolling features look back only
 
-    if len(features) < 100:
-        print(f"  SKIP {row['pair']}: too few bars ({len(features)})")
+    feat_train = feat_full[feat_full.index < TEST_START].tail(PER_PAIR_TRAIN_BARS)
+    feat_test  = feat_full[feat_full.index >= TEST_START]
+
+    if len(feat_train) < 200 or len(feat_test) < 50:
+        print(f"  SKIP {row['pair']}: insufficient features "
+              f"(train={len(feat_train)}, test={len(feat_test)})")
         continue
 
-    X     = features.values
-    model = fit_hmm(X)
+    X_train = feat_train.values
+    model   = fit_hmm(X_train)
     if model is None:
-        print(f"  SKIP {row['pair']}: HMM did not converge")
+        print(f"  SKIP {row['pair']}: HMM did not converge on train")
         continue
 
-    states = model.predict(X)
-
-    # Volatile = state with higher mean realized vol
-    vol0, vol1 = X[states == 0, 0].mean(), X[states == 1, 0].mean()
+    # Identify volatile state from TRAIN only (no future leak)
+    states_train = model.predict(X_train)
+    vol0 = X_train[states_train == 0, 0].mean()
+    vol1 = X_train[states_train == 1, 0].mean()
     volatile_state = 0 if vol0 > vol1 else 1
 
-    labels = (states == volatile_state).astype(int)   # 1 = volatile, 0 = normal
-    regime_series = pd.Series(labels, index=features.index, name=row["pair"])
+    # Predict on TEST bars using the train-fitted HMM
+    X_test = feat_test.values
+    states_test = model.predict(X_test)
+    labels_test = (states_test == volatile_state).astype(int)
+
+    regime_series = pd.Series(labels_test, index=feat_test.index, name=row["pair"])
     all_regimes[row["pair"]] = regime_series
 
-    n_vol  = labels.sum()
-    n_calm = len(labels) - n_vol
-    ratio  = X[labels == 1, 0].mean() / X[labels == 0, 0].mean()
-
-    print(f"  {row['pair']}:")
-    print(f"    Normal   {n_calm:5d} bars ({n_calm/len(labels)*100:.0f}%)")
-    print(f"    Volatile {n_vol:5d} bars ({n_vol/len(labels)*100:.0f}%)")
-    print(f"    Vol ratio volatile/normal: {ratio:.1f}x\n")
-
+    n_vol  = int(labels_test.sum())
+    n_calm = len(labels_test) - n_vol
+    print(f"  {row['pair']:12s}  train={len(X_train)}  test={len(X_test)}  "
+          f"Volatile {n_vol} ({n_vol/len(labels_test)*100:.0f}%)  "
+          f"Normal {n_calm} ({n_calm/len(labels_test)*100:.0f}%)")
 
 # ── Save regimes (wide format: timestamp × pair) ──────────────────────────────
 if all_regimes:
@@ -252,7 +273,8 @@ print(f"Chart saved to {OUTPUT_DIR / 'regimes_pairs.png'}")
 
 import yfinance as yf
 
-print("\nFitting global macro HMM on SPY daily returns (full history) …")
+print(f"\nFitting global macro HMM on SPY (walk-forward, "
+      f"min_train={GLOBAL_MIN_TRAIN_DAYS}d, refit_every={GLOBAL_REFIT_EVERY}d) …")
 _spy_raw = yf.download("SPY", start="2005-01-01", interval="1d", progress=False)
 _spy     = _spy_raw["Close"].squeeze().dropna()
 _spy.index = pd.to_datetime(_spy.index).tz_localize(None)
@@ -265,22 +287,48 @@ _spy_features = pd.DataFrame({
 }).dropna()
 
 _X_spy = _spy_features.values
-_global_model = fit_hmm(_X_spy)
 
-if _global_model is not None:
-    _states  = _global_model.predict(_X_spy)
-    _vol0    = _X_spy[_states == 0, 0].mean()
-    _vol1    = _X_spy[_states == 1, 0].mean()
-    _panic_s = 0 if _vol0 > _vol1 else 1
-    _labels  = (_states == _panic_s).astype(int)
+if len(_X_spy) < GLOBAL_MIN_TRAIN_DAYS + GLOBAL_REFIT_EVERY:
+    print(f"  Insufficient SPY history ({len(_X_spy)} days) — global HMM skipped")
+else:
+    # Walk-forward: fit on past-only, label next REFIT_EVERY days.
+    _wf_labels = np.full(len(_X_spy), -1, dtype=int)
+    _n_refits  = 0
+    _n_panic   = 0
 
-    global_hmm_regime = pd.Series(_labels, index=_spy_features.index, name="global_hmm")
+    for _i in range(GLOBAL_MIN_TRAIN_DAYS, len(_X_spy), GLOBAL_REFIT_EVERY):
+        _X_train = _X_spy[:_i]
+        _model_t = fit_hmm(_X_train)
+        if _model_t is None:
+            continue
+
+        # Determine panic state from TRAIN labels only
+        _states_train = _model_t.predict(_X_train)
+        _vol0 = _X_train[_states_train == 0, 0].mean()
+        _vol1 = _X_train[_states_train == 1, 0].mean()
+        _panic_s = 0 if _vol0 > _vol1 else 1
+
+        # Predict next REFIT_EVERY bars
+        _end = min(_i + GLOBAL_REFIT_EVERY, len(_X_spy))
+        _states_test = _model_t.predict(_X_spy[_i:_end])
+        _labels_test = (_states_test == _panic_s).astype(int)
+        _wf_labels[_i:_end] = _labels_test
+        _n_panic += int(_labels_test.sum())
+        _n_refits += 1
+
+    # Keep only labeled rows
+    _mask = _wf_labels >= 0
+    global_hmm_regime = pd.Series(
+        _wf_labels[_mask],
+        index=_spy_features.index[_mask],
+        name="global_hmm",
+    )
     global_hmm_regime.index = pd.to_datetime(global_hmm_regime.index).tz_localize(None)
     global_hmm_regime.to_csv(DATA_DIR / "global_hmm_regime.csv", header=True)
 
-    n_panic = _labels.sum()
-    pct     = n_panic / len(_labels) * 100
-    print(f"  SPY bars: {len(_labels)}  panic days: {n_panic} ({pct:.0f}%)")
+    _n = len(global_hmm_regime)
+    print(f"  Refits: {_n_refits}  Labeled days: {_n}  "
+          f"Panic days: {_n_panic} ({_n_panic/max(_n,1)*100:.0f}%)")
+    print(f"  First labeled day: {global_hmm_regime.index[0].date()}")
+    print(f"  Last  labeled day: {global_hmm_regime.index[-1].date()}")
     print(f"  Saved {DATA_DIR / 'global_hmm_regime.csv'}")
-else:
-    print("  Global HMM did not converge — skipped")
