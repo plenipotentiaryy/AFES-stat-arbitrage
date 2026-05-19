@@ -187,7 +187,9 @@ def merge_to_csv(tickers: list[str], rebuild: bool = False) -> None:
         frames = []
         for f in files:
             try:
-                frames.append(pd.read_csv(f, parse_dates=["timestamp"]))
+                tmp = pd.read_csv(f)
+                tmp["timestamp"] = pd.to_datetime(tmp["timestamp"])
+                frames.append(tmp)
             except Exception as e:
                 log.warning(f"  Bad slice {f.name}: {e}")
 
@@ -195,6 +197,7 @@ def merge_to_csv(tickers: list[str], rebuild: bool = False) -> None:
             continue
 
         df = (pd.concat(frames, ignore_index=True)
+                .assign(timestamp=lambda x: pd.to_datetime(x["timestamp"]))
                 .drop_duplicates("timestamp")
                 .sort_values("timestamp")
                 .set_index("timestamp"))

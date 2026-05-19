@@ -380,7 +380,45 @@ for _, row in pairs.iterrows():
         continue
 
     all_pair_train_results[pair_name] = df_train
-    best_train = df_train.iloc[0]
+
+    # ── Parameter Plateau: pick robust point, not argmax ─────────────────────
+    # For each combo, score = Sharpe × min_ratio_of_neighbors.
+    # A pair (e, x, s) with neighbors having Sharpe 0.9× of own = robust plateau.
+    # A pair whose neighbors have 0.2× = isolated peak = overfit.
+    plateau_scores = []
+    g = df_train.set_index(["entry_z", "exit_z", "stop_z"])["sharpe"].to_dict()
+    ez_grid = sorted(df_train["entry_z"].unique())
+    xz_grid = sorted(df_train["exit_z"].unique())
+    sz_grid = sorted(df_train["stop_z"].unique())
+    def _next(grid, v, step):
+        idx = grid.index(v) + step
+        return grid[idx] if 0 <= idx < len(grid) else None
+    for _, r in df_train.iterrows():
+        own = r["sharpe"]
+        if own <= 0:
+            plateau_scores.append(-1e9); continue
+        neighbors = []
+        for de in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                for ds in [-1, 0, 1]:
+                    if de == dx == ds == 0: continue
+                    ez = _next(ez_grid, r["entry_z"], de)
+                    xz = _next(xz_grid, r["exit_z"],  dx)
+                    sz = _next(sz_grid, r["stop_z"],  ds)
+                    if ez is None or xz is None or sz is None: continue
+                    n_sh = g.get((ez, xz, sz))
+                    if n_sh is not None: neighbors.append(n_sh)
+        if not neighbors:
+            plateau_scores.append(own); continue
+        # Plateau score: own Sharpe weighted by neighborhood stability.
+        # Penalty for cliff (any neighbor < 50% of own) is harsh.
+        n_arr = np.array(neighbors)
+        stability = (n_arr >= 0.5 * own).mean()   # fraction of neighbors near own
+        median_neigh = np.median(n_arr)
+        score = own * (0.5 + 0.5 * stability) * (median_neigh / max(own, 0.01))
+        plateau_scores.append(score)
+    df_train["plateau_score"] = plateau_scores
+    best_train = df_train.loc[df_train["plateau_score"].idxmax()]
 
     # ── Validate best params on TEST — single-combo Numba pass ───────────────
     best_combo = [(float(best_train["entry_z"]),
@@ -393,9 +431,10 @@ for _, row in pairs.iterrows():
     else:
         test_m = df_test_best.iloc[0].to_dict()
 
-    print(f"  TRAIN best → entry={best_train['entry_z']}  "
+    argmax_train = df_train.iloc[df_train["sharpe"].argmax()]
+    print(f"  TRAIN plateau → entry={best_train['entry_z']}  "
           f"exit={best_train['exit_z']:+.1f}  stop={best_train['stop_z']}  "
-          f"Sh={best_train['sharpe']:.2f}  "
+          f"Sh={best_train['sharpe']:.2f}  (argmax was Sh={argmax_train['sharpe']:.2f})  "
           f"│  TEST Sh={test_m['sharpe']:.2f}  WR={test_m['win_rate']:.0f}%")
 
     all_best.append({
