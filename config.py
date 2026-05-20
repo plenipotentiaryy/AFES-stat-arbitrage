@@ -450,6 +450,7 @@ COST_MAKER      = COST_COMMISSION                           # 0.03%
 # Taker: Market orders for stop-loss and macro panics
 COST_TAKER      = COST_COMMISSION + COST_SPREAD + COST_SLIPPAGE  # 0.07%
 COST_PER_SIDE   = COST_TAKER   # backward-compat alias used by step3a_hmm
+COST_PANIC_MULTIPLIER = 3.0    # multiplier for taker costs during HMM/K-Means Panic
 
 # ── Idiosyncratic Circuit Breaker ────────────────────────────────────────────
 CIRCUIT_BREAKER_Z = 4.5  # Max Z-score before immediate hard-stop and pair block

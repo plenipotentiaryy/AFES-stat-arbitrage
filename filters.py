@@ -248,6 +248,72 @@ class HurstFilter:
         return blocked, h
 
 
+# ── BreakVelocityDetector ─────────────────────────────────────────────────────
+
+class BreakVelocityDetector:
+    """
+    Structural Break Velocity Layer (Criticality 10 upgrade).
+    Detects early-stage structural breaks before Hurst/Cointegration filters react.
+    
+    Indicators:
+    1. Kalman Innovation Shock: r_t = (nu_t^2) / E[nu^2]_rolling
+    2. Half-Life Ratio: HL_now / HL_median_rolling
+    3. CUSUM (Cumulative Sum): Detects cumulative mean drift.
+    """
+
+    def __init__(self, 
+                 window_fast: int = 20, 
+                 window_slow: int = 120,
+                 threshold: float = 4.5):
+        self.window_fast = window_fast
+        self.window_slow = window_slow
+        self.threshold   = threshold
+        
+        # CUSUM params
+        self.k_cusum = 0.5   # Slack parameter (0.5 sigma)
+        self.h_cusum = 5.0   # CUSUM threshold (5 sigma)
+        self.s_pos = 0.0
+        self.s_neg = 0.0
+
+    def update_cusum(self, z_score: float):
+        """Standard CUSUM algorithm for mean drift detection."""
+        self.s_pos = max(0, self.s_pos + z_score - self.k_cusum)
+        self.s_neg = min(0, self.s_neg + z_score + self.k_cusum)
+        return max(self.s_pos, abs(self.s_neg))
+
+    def get_break_score(self, 
+                        nu_t: float, 
+                        rolling_var_nu: float,
+                        hl_t: float, 
+                        hl_median: float,
+                        d_beta_dt: float,
+                        z_t: float) -> tuple[float, bool]:
+        """
+        Computes composite Break Score (Bt).
+        Returns: (score, is_broken)
+        """
+        # 1. Innovation Shock (log scale to dampen outliers)
+        innovation_shock = (nu_t**2) / max(rolling_var_nu, 1e-9)
+        s1 = np.log1p(innovation_shock)
+        
+        # 2. HL Explosion ratio
+        hl_ratio = hl_t / max(hl_median, 1e-9)
+        s2 = np.log1p(max(0, hl_ratio - 1))
+        
+        # 3. CUSUM drift
+        cusum_val = self.update_cusum(z_t)
+        s3 = cusum_val / self.h_cusum
+        
+        # 4. Beta Instability
+        s4 = abs(d_beta_dt) * 100.0  # Scale beta velocity
+        
+        # Composite score: Bt = w1*s1 + w2*s2 + w3*s3 + w4*s4
+        bt = 0.3 * s1 + 0.3 * s2 + 0.3 * s3 + 0.1 * s4
+        
+        is_broken = bt > self.threshold or cusum_val > self.h_cusum
+        return float(bt), bool(is_broken)
+
+
 # ── Helper ────────────────────────────────────────────────────────────────────
 
 def _to_date(ts) -> _date:

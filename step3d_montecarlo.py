@@ -21,19 +21,20 @@ def estimate_ou(spread: pd.Series) -> dict:
     """
     Fit OU process: dX = θ(μ - X)dt + σdW
     Using discrete OLS: ΔX = a + b·X_lag + ε
-    → θ = -b, μ = -a/b, σ = std(ε)
+    → θ = -b, μ = a / θ, σ = std(ε)
     """
-    dx   = spread.diff().dropna()
+    dx    = spread.diff().dropna()
     x_lag = spread.shift(1).dropna()
     aligned = pd.concat([dx, x_lag], axis=1).dropna()
     aligned.columns = ["dx", "x_lag"]
 
+    # Add constant for intercept estimation
     model = sm.OLS(aligned["dx"], sm.add_constant(aligned["x_lag"])).fit()
     a, b  = model.params.iloc[0], model.params.iloc[1]
     sigma = model.resid.std()
 
     theta     = -b                            # mean reversion speed (per bar)
-    mu        = -a / b if b != 0 else spread.mean()
+    mu        = a / theta if theta > 0 else spread.mean()
     half_life = np.log(2) / theta if theta > 0 else float("inf")
 
     return {"theta": theta, "mu": mu, "sigma": sigma,

@@ -116,6 +116,49 @@ class MarginSpiralDetector:
             )
         return result
 
+    def calculate_p_mc(self, 
+                       weights: np.ndarray, 
+                       equity: float, 
+                       maint_margin: float,
+                       covariance: np.ndarray,
+                       horizon_days: float = 1.0,
+                       n_sims: int = 1000) -> float:
+        """
+        Calculates the Probability of Margin Call (P_MC) using First-Passage simulation.
+        Assumes panic regime transition (shocked vol and correlation).
+        """
+        stressed_cov = self._stress_covariance(covariance)
+        w = weights
+        
+        # Portfolio drift (conservative 0.0 in panic)
+        mu = 0.0
+        
+        # Portfolio volatility in panic
+        sigma_p = np.sqrt(max(float(w @ stressed_cov @ w), EPS))
+        
+        # Distance to margin call (Buffer)
+        barrier = equity - maint_margin
+        if barrier <= 0: return 1.0
+        
+        # Standard Brownian Bridge / First Passage for a single day
+        # We simulate the minimum equity during the day
+        # Using the reflection principle for GBM:
+        # P(min E < maint) = P(E_T < maint) + ... simplified:
+        # For a driftless Wiener process, P(max |W| > b) is known
+        
+        # Monte Carlo for more complex path-dependent overshoot
+        dt = 1/252 # daily step
+        paths = np.random.normal(mu * dt, sigma_p * np.sqrt(dt), size=(n_sims, 1))
+        # This is a very simplified 1-step, let's use more steps for intraday
+        n_steps = 10 
+        dt_step = dt / n_steps
+        shocks = np.random.normal(0, sigma_p * np.sqrt(dt_step), size=(n_sims, n_steps))
+        daily_paths = np.cumsum(shocks, axis=1)
+        min_vals = np.min(daily_paths, axis=1)
+        
+        p_mc = (min_vals < -barrier).mean()
+        return float(p_mc)
+
     def _stress_covariance(self, covariance: np.ndarray) -> np.ndarray:
         vols = np.sqrt(np.clip(np.diag(covariance), EPS, None))
         inv_outer = np.outer(vols, vols)
