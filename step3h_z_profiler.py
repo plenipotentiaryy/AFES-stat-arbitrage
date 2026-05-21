@@ -172,8 +172,6 @@ def profile_z_bounces(z_series: pd.Series,
 
 def load_closes() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     closes = pd.read_csv(path, index_col=0)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     return closes.between_time(RTH_START, RTH_END)

@@ -336,7 +336,6 @@ PAIRS = [
     ("MTD", "SWK"),
     ("PNC", "SNA"),
     ("BAC", "EMR"),
-    ("TFC", "USB"),
     ("COF", "WFC"),
     ("MCO", "V"),
     ("A", "GEHC"),
@@ -414,13 +413,8 @@ RTH_START = "09:30"
 RTH_END = "16:00"
 SIGNAL_START = "09:30"  # Opened up to catch Price Discovery (Morning Gaps)
 
-<<<<<<< HEAD
 BAR_MINUTES  = 5                              # 5-min bars
 BARS_PER_DAY = int(6.5 * 60 / BAR_MINUTES)   
-=======
-BAR_MINUTES  = 5                              # 5-min bars from Alpha Vantage
-BARS_PER_DAY = int(6.5 * 60 / BAR_MINUTES)   # 78 for 5-min
->>>>>>> 110e51785e1106ee77e83e548ce1411f21656e6f
 
 CLOSES_FILE  = f"closes_{BAR_MINUTES}min.csv"
 VOLUMES_FILE = f"volumes_{BAR_MINUTES}min.csv"

@@ -123,9 +123,6 @@ def var_cvar(pnl: np.ndarray, alpha=0.05) -> tuple[float, float]:
 def _data_file():
     p = DATA_DIR / CLOSES_FILE
     if not p.exists():
-        fb = DATA_DIR / "closes_15min.csv"
-        if fb.exists():
-            return fb
         raise FileNotFoundError(f"No data: {CLOSES_FILE}")
     return p
 closes = pd.read_csv(_data_file(), index_col=0)

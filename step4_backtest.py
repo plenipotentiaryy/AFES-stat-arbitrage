@@ -21,9 +21,6 @@ BARS_PER_TRADING_DAY = BARS_PER_DAY
 def _data_path() -> str:
     p = DATA_DIR / CLOSES_FILE
     if not p.exists():
-        fallback = DATA_DIR / "closes_15min.csv"
-        if fallback.exists():
-            return str(fallback)
         raise FileNotFoundError(f"No data file: {CLOSES_FILE}")
     return str(p)
 

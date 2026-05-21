@@ -6,21 +6,20 @@ from config import (
     STOP_Z as DEFAULT_STOP_Z,
     COST_PER_SIDE, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
-    DATA_DIR, OUTPUT_DIR,
+    DATA_DIR, OUTPUT_DIR, CLOSES_FILE, BARS_PER_DAY,
 )
 
 ENTRY_Z_GRID = [3.5, 3.3, 3.2, 3.0]
 EXIT_Z_GRID  = [0.3, 0.2, 0.1, 0.0, -0.1, -0.2, -0.3]
 STOP_Z_GRID  = [3.8, 4.2, 4.4]
 
-BARS_PER_DAY = 26
 COMBOS       = list(itertools.product(ENTRY_Z_GRID, EXIT_Z_GRID, STOP_Z_GRID))
 print(f"Sniper grid: {len(ENTRY_Z_GRID)} entry × {len(EXIT_Z_GRID)} exit × "
       f"{len(STOP_Z_GRID)} stop = {len(COMBOS)} combinations\n")
 
 
 def load_closes() -> pd.DataFrame:
-    closes = pd.read_csv(DATA_DIR / "closes_15min.csv", index_col=0, parse_dates=True)
+    closes = pd.read_csv(DATA_DIR / CLOSES_FILE, index_col=0, parse_dates=True)
     if closes.index.tz is None:
         closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
     else:

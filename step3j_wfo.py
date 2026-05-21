@@ -40,7 +40,7 @@ import statsmodels.api as sm
 from config import (
     TAIL_HEDGE_DRAG_ANNUAL, TAIL_HEDGE_PAYOUT_MULT, INITIAL_CAPITAL,
     COST_MAKER, COST_TAKER, CIRCUIT_BREAKER_Z,
-    CLOSES_FILE, BORROW_RATE_ANNUAL,
+    CLOSES_FILE, VOLUMES_FILE, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START,
     BARS_PER_DAY, DATA_DIR, OUTPUT_DIR,
     WFO_TRAIN_MONTHS, WFO_TEST_MONTHS, WFO_STEP_MONTHS, WFO_MIN_TRADES,
@@ -412,13 +412,11 @@ def _trades_to_daily_pnl(trades: list, dates: pd.DatetimeIndex) -> pd.Series:
 
 def load_closes():
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     closes = pd.read_csv(path, index_col=0)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     closes = closes.between_time(RTH_START, RTH_END)
-    
-    vol_path = DATA_DIR / "volumes_15min.csv"
+
+    vol_path = DATA_DIR / VOLUMES_FILE
     volumes = None
     if vol_path.exists():
         volumes = pd.read_csv(vol_path, index_col=0)

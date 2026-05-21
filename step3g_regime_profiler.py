@@ -198,8 +198,6 @@ def load_data():
     """Load closes, regimes, and pairs metadata."""
     # Closes
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     closes = pd.read_csv(path, index_col=0, parse_dates=True)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     closes = closes.between_time(RTH_START, RTH_END)
