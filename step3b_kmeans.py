@@ -1,5 +1,5 @@
 """
-step5_kmeans.py — K-Means macro regime detection.
+step3b_kmeans.py — K-Means macro regime detection.
 
 Downloads SPY + ^VIX daily data and classifies each trading day into one of
 three market regimes using K-Means clustering on realized-vol features:

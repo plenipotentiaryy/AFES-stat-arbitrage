@@ -359,8 +359,8 @@ RTH_START = "09:30"
 RTH_END = "16:00"
 SIGNAL_START = "09:30"  # Opened up to catch Price Discovery (Morning Gaps)
 
-BAR_MINUTES  = 15                             # 15-min bars from Alpha Vantage
-BARS_PER_DAY = int(6.5 * 60 / BAR_MINUTES)   # 26 for 15-min
+BAR_MINUTES  = 5                              # 5-min bars
+BARS_PER_DAY = int(6.5 * 60 / BAR_MINUTES)   
 
 CLOSES_FILE  = f"closes_{BAR_MINUTES}min.csv"
 VOLUMES_FILE = f"volumes_{BAR_MINUTES}min.csv"
