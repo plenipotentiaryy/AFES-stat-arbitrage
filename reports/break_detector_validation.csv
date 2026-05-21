@@ -1,0 +1,11 @@
+test,variant,metric,value
+detection_lag,hurst,bars_after_break,24.0
+detection_lag,break_score,bars_after_break,0.0
+detection_lag,head_start,bars,24.0
+false_positive_rate,stationary_ou,average_run_length_bars,501.0
+pnl_impact,hurst_only,max_drawdown,-11.87842900906469
+pnl_impact,hurst_only,calmar_ratio,44.09964860789081
+pnl_impact,hurst_plus_break_gate,max_drawdown,-8.46406774508364
+pnl_impact,hurst_plus_break_gate,calmar_ratio,41.48046252443417
+pnl_impact,hurst_plus_break_gate,abort_triggers,1.0
+pnl_impact,hurst_plus_break_gate,avg_pnl_saved_per_abort,0.0

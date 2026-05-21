@@ -21,19 +21,20 @@ def estimate_ou(spread: pd.Series) -> dict:
     """
     Fit OU process: dX = θ(μ - X)dt + σdW
     Using discrete OLS: ΔX = a + b·X_lag + ε
-    → θ = -b, μ = -a/b, σ = std(ε)
+    → θ = -b, μ = a / θ, σ = std(ε)
     """
-    dx   = spread.diff().dropna()
+    dx    = spread.diff().dropna()
     x_lag = spread.shift(1).dropna()
     aligned = pd.concat([dx, x_lag], axis=1).dropna()
     aligned.columns = ["dx", "x_lag"]
 
+    # Add constant for intercept estimation
     model = sm.OLS(aligned["dx"], sm.add_constant(aligned["x_lag"])).fit()
     a, b  = model.params.iloc[0], model.params.iloc[1]
     sigma = model.resid.std()
 
     theta     = -b                            # mean reversion speed (per bar)
-    mu        = -a / b if b != 0 else spread.mean()
+    mu        = a / theta if theta > 0 else spread.mean()
     half_life = np.log(2) / theta if theta > 0 else float("inf")
 
     return {"theta": theta, "mu": mu, "sigma": sigma,
@@ -127,12 +128,9 @@ def _data_file():
             return fb
         raise FileNotFoundError(f"No data: {CLOSES_FILE}")
     return p
-closes = pd.read_csv(_data_file(), index_col=0, parse_dates=True)
-if closes.index.tz is None:
-    closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
-else:
-    closes.index = closes.index.tz_convert("US/Eastern")
-closes = closes.between_time(RTH_START, RTH_END).dropna().tail(RECENT_BARS)
+closes = pd.read_csv(_data_file(), index_col=0)
+closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
+closes = closes.between_time(RTH_START, RTH_END).tail(RECENT_BARS)
 
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 if pairs.empty:
@@ -141,8 +139,19 @@ if pairs.empty:
 np.random.seed(42)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-print(f"OU Monte Carlo  |  {N_SIMS:,} simulations per trade")
-print(f"Strategy: entry={ENTRY_Z}  exit={EXIT_Z:+.1f}  stop={STOP_Z}\n")
+# Load per-pair optimized parameters if available
+_opt_params: dict[str, tuple[float, float, float]] = {}
+_opt_path = DATA_DIR / "optimal_params.csv"
+if _opt_path.exists():
+    _opt_df = pd.read_csv(_opt_path)
+    for _, _r in _opt_df.iterrows():
+        _opt_params[_r["pair"]] = (float(_r["entry_z"]), float(_r["exit_z"]), float(_r["stop_z"]))
+    print(f"Per-pair params loaded from optimal_params.csv ({len(_opt_params)} pairs)")
+else:
+    print("No optimal_params.csv — using global defaults for all pairs")
+
+print(f"\nOU Monte Carlo  |  {N_SIMS:,} simulations per trade")
+print(f"Global defaults: entry={ENTRY_Z}  exit={EXIT_Z:+.1f}  stop={STOP_Z}\n")
 
 summary_rows = []
 
@@ -151,10 +160,18 @@ for _, row in pairs.iterrows():
     beta   = row["beta"]
     hl_bars = int(row["half_life_bars"])
 
+    # Per-pair params (fall back to global defaults)
+    pair_entry, pair_exit, pair_stop = _opt_params.get(
+        row["pair"], (ENTRY_Z, EXIT_Z, STOP_Z)
+    )
+
     if t1 not in closes.columns or t2 not in closes.columns:
         continue
 
     spread = (closes[t1] - beta * closes[t2]).dropna()
+    if len(spread) < 10:
+        print(f"  SKIP {row['pair']}: insufficient data ({len(spread)} bars)")
+        continue
     ou     = estimate_ou(spread)
     theta, mu, sigma = ou["theta"], ou["mu"], ou["sigma"]
     half_life = ou["half_life"]
@@ -164,21 +181,22 @@ for _, row in pairs.iterrows():
         continue
     horizon = max(int(half_life * 2), 50)
 
+    src = "opt" if row["pair"] in _opt_params else "default"
     print(f"{'─'*55}")
-    print(f"  {row['pair']}   β={beta:.4f}")
+    print(f"  {row['pair']}   β={beta:.4f}  [{src}: entry={pair_entry}  exit={pair_exit:+.1f}  stop={pair_stop}]")
     print(f"  OU params:  θ={theta:.5f}  μ={mu:.4f}  σ={sigma:.4f}")
     print(f"  Half-life:  {half_life:.0f} bars ({half_life/BARS_PER_DAY:.1f} days)")
     print(f"  Horizon:    {horizon} bars ({horizon/BARS_PER_DAY:.1f} days)")
     print(f"  R²:         {ou['r2']:.4f}")
 
-    # Entry levels in spread units
-    entry_level_long  = mu - ENTRY_Z * sigma
-    exit_level_long   = mu - EXIT_Z  * sigma   # EXIT_Z can be negative → exit past mean
-    stop_level_long   = mu - STOP_Z  * sigma
+    # Entry levels in spread units (per-pair thresholds)
+    entry_level_long  = mu - pair_entry * sigma
+    exit_level_long   = mu - pair_exit  * sigma
+    stop_level_long   = mu - pair_stop  * sigma
 
-    entry_level_short = mu + ENTRY_Z * sigma
-    exit_level_short  = mu + EXIT_Z  * sigma
-    stop_level_short  = mu + STOP_Z  * sigma
+    entry_level_short = mu + pair_entry * sigma
+    exit_level_short  = mu + pair_exit  * sigma
+    stop_level_short  = mu + pair_stop  * sigma
 
     all_pnl = []
     all_exit_bars = []
@@ -225,6 +243,10 @@ for _, row in pairs.iterrows():
         "pair":      row["pair"],
         "theta":     round(theta, 5),
         "half_life": round(half_life, 0),
+        "entry_z":   pair_entry,
+        "exit_z":    pair_exit,
+        "stop_z":    pair_stop,
+        "params_src": src,
         "win_rate":  round(win_rate, 1),
         "mean_pnl":  round(mean_pnl, 4),
         "VaR_5":     round(v5, 4),
