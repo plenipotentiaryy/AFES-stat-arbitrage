@@ -213,8 +213,6 @@ def run_grid_numba(df: pd.DataFrame, t1: str, t2: str,
 def load_closes_split() -> tuple[pd.DataFrame, pd.DataFrame, float]:
     """Returns (train_closes, test_closes, days_train)."""
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     closes = pd.read_csv(path, index_col=0, parse_dates=True)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     closes = closes.between_time(RTH_START, RTH_END)

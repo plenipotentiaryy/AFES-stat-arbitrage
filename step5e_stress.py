@@ -52,8 +52,6 @@ def load_daily() -> pd.DataFrame:
 
 def load_closes() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     df = pd.read_csv(path, index_col=0, parse_dates=True)
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)

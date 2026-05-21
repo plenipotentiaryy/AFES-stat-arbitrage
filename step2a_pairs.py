@@ -65,11 +65,7 @@ def load_daily_closes() -> pd.DataFrame:
 def _load_raw() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
-        fallback = DATA_DIR / "closes_15min.csv"
-        if fallback.exists():
-            path = fallback
-        else:
-            raise FileNotFoundError(f"No data file: {CLOSES_FILE}")
+        raise FileNotFoundError(f"No data file: {CLOSES_FILE}")
     df = pd.read_csv(path, index_col=0, parse_dates=True)
     df.index = pd.to_datetime(df.index, utc=True).tz_convert("US/Eastern")
     return df.between_time(RTH_START, RTH_END)
