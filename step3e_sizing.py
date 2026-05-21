@@ -91,7 +91,8 @@ def iv_multiplier(iv_mult_series: pd.Series, date) -> float:
         return IV_MULT_MAX
     key = pd.Timestamp(date).normalize().tz_localize(None)
     try:
-        return float(iv_mult_series.asof(key))
+        v = float(iv_mult_series.asof(key))
+        return v if not np.isnan(v) else IV_MULT_MAX
     except Exception:
         return IV_MULT_MAX
 

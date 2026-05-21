@@ -431,7 +431,7 @@ COINT_TOP_N = 3
 ENTRY_Z = 2.0
 EXIT_Z = 0.0
 STOP_Z = 3.5
-ENTRY_Z_VOLATILE = 2.8   # stricter threshold when HMM detects volatile regime
+ENTRY_Z_VOLATILE = 2.0   # stricter threshold when HMM detects volatile regime
 
 # ── Regime-Conditioned Profiling (RCDP) ─────────────────────────────────────
 # Wider grids for per-regime grid search (regime_profiler.py)
@@ -528,7 +528,7 @@ REGIME_MULT_VOLATILE = 0.3   # reduced size in volatile regime (per-pair HMM)
 HMM_PANIC_MULT       = 0.333 # global macro HMM panic: cut ALL sizes by 3
 IV_MULT_MAX          = 1.0   # full size when IV is at its lowest
 IV_MULT_MIN          = 0.5   # half size when IV is at its highest
-MIN_POSITION_SIZE    = 0.15  # skip trade entirely if combined size below this
+MIN_POSITION_SIZE    = 0.10  # skip trade entirely if combined size below this
 
 INITIAL_CAPITAL = 10_000        # starting portfolio balance in USD
 ALLOCATION_METHOD = "riskparity"   # "equal" | "sharpe" | "markowitz" | "riskparity"
