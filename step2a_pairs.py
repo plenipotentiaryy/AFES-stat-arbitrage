@@ -30,7 +30,7 @@ BETA_MIN = 0.1
 BETA_MAX = 15.0
 MIN_PAIR_OVERLAP = 500
 DAILY_CACHE = DATA_DIR / "closes_daily.csv"
-DAILY_COINT_P  = 0.35      # EG p-value pre-screen (permissive — Johansen is primary)
+DAILY_COINT_P  = 0.50      # EG p-value pre-screen (permissive — Johansen is primary)
 TRAIN_COINT_WINDOW = 500   # days of training-period daily data for initial pair selection
 JOH_OR_EG_PASS = True      # pair passes if EITHER Johansen OR EG confirms (not both required)
 DAILY_CACHE_MAX_AGE = 7    # re-download daily cache if older than this many days
@@ -285,33 +285,29 @@ for t1, t2 in PAIRS:
 
 # ── Results ───────────────────────────────────────────────────────────────────
 
-if not results:
-    print("\nNo pairs passed all filters.")
-    pd.DataFrame(columns=["pair", "correlation", "recent_corr_120d",
-                           "coint_pvalue", "coint_pvalue_daily",
-                           "beta", "beta_daily", "adf_pvalue", "adf_stat",
-                           "half_life_bars", "hurst",
-                           "johansen_trace", "johansen_eigen", "johansen_coint",
-                           "coint_window_days", "test_start_date"]
-                 ).to_csv(DATA_DIR / "pairs_selected.csv", index=False)
-    raise SystemExit(0)
+# ── Universe Consolidation (Top 10 most robust pairs) ─────────────────────────
+# HL <= 15 days (15 * BARS_PER_DAY)
+hl_limit = 15 * BARS_PER_DAY
+df_final = pd.DataFrame(results)
+df_final = df_final[df_final["half_life_bars"] <= hl_limit]
 
-df = pd.DataFrame(results).sort_values("coint_pvalue_daily")
+# Sort by EG daily p-value (primary robustness) and then by Half-Life speed
+df_final = df_final.sort_values(["coint_pvalue_daily", "half_life_bars"])
+
+# Pick top 20
+df_top = df_final.head(20)
+
+if df_top.empty:
+    print("\nNo pairs passed the strict consolidation filters (HL <= 15d).")
+    # Fallback: just take top 20 by daily coint regardless of HL
+    df_top = pd.DataFrame(results).sort_values("coint_pvalue_daily").head(20)
+
 print("\n" + "=" * 120)
-print(df[["pair", "correlation", "recent_corr_120d", "coint_pvalue_daily",
-          "johansen_coint", "johansen_trace", "beta_daily", "half_life_bars", "hurst"]
+print("CONSOLIDATED UNIVERSE (Top 20 Robust Pairs)")
+print("-" * 120)
+print(df_top[["pair", "correlation", "coint_pvalue_daily", "johansen_coint", "beta_daily", "half_life_bars", "hurst"]
         ].to_string(index=False))
 print("=" * 120)
-joh_both = df["johansen_coint"].sum()
-print(f"\nPairs confirmed by both EG + Johansen: {joh_both}/{len(df)}")
 
-df.to_csv(DATA_DIR / "pairs_selected.csv", index=False)
-print(f"\nSaved {len(df)} pairs  (test starts {results[0]['test_start_date']})")
-
-good = df[df["half_life_bars"].between(5, 500)]
-print(f"\nRecommended (HL 5–500 bars): {len(good)}")
-for _, row in good.iterrows():
-    print(f"  {row['pair']}: beta_daily={row['beta_daily']}  "
-          f"HL={row['half_life_bars']} bars  "
-          f"daily_coint={row['coint_pvalue_daily']:.4f}  "
-          f"[intraday_coint={row['coint_pvalue']:.4f}]")
+df_top.to_csv(DATA_DIR / "pairs_selected.csv", index=False)
+print(f"\nSaved {len(df_top)} consolidated pairs to {DATA_DIR / 'pairs_selected.csv'}")

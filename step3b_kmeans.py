@@ -27,6 +27,10 @@ from config import DATA_DIR, OUTPUT_DIR, DAILY_START, KMEANS_N_CLUSTERS, KMEANS_
 REGIME_NAMES = {0: "Trend", 1: "Sideways", 2: "Panic"}
 FEATURE_TICKERS = ["SPY", "^VIX"]
 
+# ── Walk-forward (leak-free) refit parameters ─────────────────────────────────
+MIN_TRAIN_DAYS = 252   # 1 year of trading data for first cluster fit
+REFIT_EVERY    = 30    # refit cadence in trading days
+
 
 # ── Download macro data ───────────────────────────────────────────────────────
 
@@ -110,16 +114,62 @@ print(f"Loaded {len(macro)} trading days  "
 features = build_features(macro, window=KMEANS_VOL_WINDOW)
 print(f"Feature matrix: {features.shape}  (window={KMEANS_VOL_WINDOW}d)")
 
-scaler = StandardScaler()
-X = scaler.fit_transform(features.values)
+if len(features) < MIN_TRAIN_DAYS + REFIT_EVERY:
+    raise SystemExit(f"Need at least {MIN_TRAIN_DAYS + REFIT_EVERY} days; "
+                     f"got {len(features)}")
 
-print(f"\nFitting K-Means  (k={KMEANS_N_CLUSTERS}, n_init=20) …", flush=True)
-km = KMeans(n_clusters=KMEANS_N_CLUSTERS, n_init=20, random_state=42)
-km.fit(X)
-print(f"  Inertia: {km.inertia_:.1f}")
+# ── Walk-forward K-Means: refit on data ≤ t, label next REFIT_EVERY days ──────
+print(f"\nWalk-forward K-Means refit  "
+      f"(min_train={MIN_TRAIN_DAYS}d, refit_every={REFIT_EVERY}d) …", flush=True)
 
-print("\nCluster → Regime mapping (sorted by avg VIX):")
-regime_series = label_clusters(km, features)
+regime_labels = pd.Series(index=features.index, name="regime", dtype="float")
+regime_counts = {0: 0, 1: 0, 2: 0}
+n_refits = 0
+
+for i in range(MIN_TRAIN_DAYS, len(features), REFIT_EVERY):
+    # Fit on past-only data ≤ index i-1
+    scaler_t = StandardScaler()
+    X_train  = scaler_t.fit_transform(features.iloc[:i].values)
+
+    km_t = KMeans(n_clusters=KMEANS_N_CLUSTERS, n_init=20, random_state=42)
+    km_t.fit(X_train)
+
+    # Stable cluster→regime mapping by avg VIX in TRAIN data
+    train_labels = km_t.labels_
+    train_vix    = features["vix_level"].iloc[:i].values
+    vix_by_cluster = {
+        c: train_vix[train_labels == c].mean()
+        for c in range(KMEANS_N_CLUSTERS)
+    }
+    sorted_by_vix = sorted(range(KMEANS_N_CLUSTERS),
+                           key=lambda c: vix_by_cluster[c])
+    cluster_to_regime = {
+        sorted_by_vix[0]: 1,   # lowest VIX → Sideways
+        sorted_by_vix[1]: 0,   # middle      → Trend
+        sorted_by_vix[2]: 2,   # highest     → Panic
+    }
+
+    # Predict next chunk using fitted model
+    end = min(i + REFIT_EVERY, len(features))
+    X_next = scaler_t.transform(features.iloc[i:end].values)
+    next_clusters = km_t.predict(X_next)
+    next_regimes  = np.array([cluster_to_regime[c] for c in next_clusters])
+    regime_labels.iloc[i:end] = next_regimes
+    for r in next_regimes:
+        regime_counts[int(r)] += 1
+    n_refits += 1
+
+regime_series = regime_labels.dropna().astype(int).rename("regime")
+print(f"  Refits: {n_refits}  Labeled days: {len(regime_series)}  "
+      f"(first {MIN_TRAIN_DAYS} days unlabeled)")
+print(f"  First labeled day: {regime_series.index[0].date()}")
+print(f"  Last  labeled day: {regime_series.index[-1].date()}\n")
+
+print("Regime distribution (walk-forward):")
+for r in [0, 1, 2]:
+    n = regime_counts[r]
+    pct = 100 * n / max(len(regime_series), 1)
+    print(f"  {REGIME_NAMES[r]:8s}  {n:5d} days ({pct:4.1f}%)")
 
 # Save
 out_path = DATA_DIR / "kmeans_regimes.csv"
