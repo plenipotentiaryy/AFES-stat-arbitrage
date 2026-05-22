@@ -68,12 +68,14 @@ def fit_hmm(X: np.ndarray) -> GaussianHMM | None:
 
 
 def build_features(spread: pd.Series) -> pd.DataFrame:
-    pct = spread.pct_change()
+    # Spread is mean-reverting and crosses zero, so pct_change() creates
+    # artificial infinities/outliers. Use absolute spread increments instead.
+    chg = spread.diff()
     return pd.DataFrame({
-        "vol":     pct.rolling(VOL_WINDOW).std(),
-        "ret":     pct.rolling(VOL_WINDOW).mean(),
-        "abs_chg": spread.diff().abs().rolling(VOL_WINDOW).mean(),
-    }).dropna()
+        "vol":     chg.rolling(VOL_WINDOW).std(),
+        "ret":     chg.rolling(VOL_WINDOW).mean(),
+        "abs_chg": chg.abs().rolling(VOL_WINDOW).mean(),
+    }).replace([np.inf, -np.inf], np.nan).dropna()
 
 
 # ── Fit HMM per pair (leak-free) ──────────────────────────────────────────────

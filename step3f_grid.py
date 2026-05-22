@@ -24,6 +24,7 @@ import itertools
 import sys
 import pandas as pd
 import numpy as np
+from numba import njit
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -47,6 +48,7 @@ MIN_TRADES   = 8
 #
 # results[c] = [total_pnl, n_trades, n_wins, sum_pnl_sq, max_dd, n_stops]
 
+@njit(cache=True)
 def _grid_kernel(zscore:    np.ndarray,   # float64[n_bars]
                  spread:    np.ndarray,   # float64[n_bars]
                  t1_price:  np.ndarray,   # float64[n_bars]
