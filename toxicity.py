@@ -1,5 +1,22 @@
 import numpy as np
 import pandas as pd
+from numba import njit
+
+
+@njit(cache=True)
+def _hawkes_intensity(shock_values: np.ndarray, alpha: float,
+                      beta_decay: float, threshold: float) -> np.ndarray:
+    n = len(shock_values)
+    out = np.zeros(n)
+    lam = 0.0
+    decay = np.exp(-beta_decay)
+    for i in range(1, n):
+        lam *= decay
+        if abs(shock_values[i - 1]) > threshold:
+            lam += alpha * abs(shock_values[i - 1])
+        out[i] = lam
+    return out
+
 
 class HawkesToxicityFilter:
     """
@@ -16,28 +33,10 @@ class HawkesToxicityFilter:
         self.intensity = 0.0
         
     def compute_intensity(self, shocks: pd.Series) -> pd.Series:
-        """
-        Compute rolling Hawkes intensity on a series of shocks (e.g., abs(z_diff)).
-        """
-        n = len(shocks)
-        intensities = np.zeros(n)
-        curr_lambda = 0.0
-        
-        # We assume shocks are values > some quantile (e.g. 1.5 sigma moves)
-        shock_values = shocks.values
-        
-        for i in range(1, n):
-            # Decay from previous step
-            # dt = 1 unit (5-min bar)
-            curr_lambda *= np.exp(-self.beta)
-            
-            # Add new shock contribution
-            if abs(shock_values[i-1]) > 1.5: # Threshold for a 'shock event'
-                curr_lambda += self.alpha * abs(shock_values[i-1])
-            
-            intensities[i] = curr_lambda
-            
-        return pd.Series(intensities, index=shocks.index)
+        """Compute rolling Hawkes intensity (numba-accelerated)."""
+        vals = np.ascontiguousarray(shocks.fillna(0).values, dtype=np.float64)
+        out  = _hawkes_intensity(vals, self.alpha, self.beta, 1.5)
+        return pd.Series(out, index=shocks.index)
 
     def get_execution_penalty(self, intensity: float) -> float:
         """

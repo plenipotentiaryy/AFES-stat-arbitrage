@@ -263,11 +263,13 @@ class MacroFilter:
 
     # ── Public API ────────────────────────────────────────────────────────
     def is_entry_blocked(self, ts) -> bool:
-        """True → do not open new positions on this bar."""
+        """True → do not open new positions on this bar.
+
+        VIX9D backwardation is handled via size reduction (position_size),
+        not as a hard entry block. Only K-Means Panic is a hard block.
+        """
         d = _to_date(ts)
-        if self._alert.get(d, False):          # VIX9D backwardation
-            return True
-        if self._km and self._km.get(d, 1) == 2:  # K-Means: block ONLY Panic (regime == 2)
+        if self._km and self._km.get(d, 1) == 2:  # K-Means Panic only
             return True
         return False
 
