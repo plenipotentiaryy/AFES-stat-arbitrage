@@ -62,7 +62,10 @@ class TailAdjustedEVProfiler:
             p_revert = np.full(len(df), 0.5)
             
         z = np.abs(df["zscore"].fillna(0).values)
-        gain = df[self.gain_col].fillna(0).values
+        if self.gain_col in df.columns:
+            gain = df[self.gain_col].fillna(0).values
+        else:
+            gain = np.maximum(z - abs(self.exit_z), 0.0)
         
         # Expected Shortfall from GPD
         xi, beta = self.gpd_params
