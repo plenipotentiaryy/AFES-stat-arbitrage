@@ -16,6 +16,7 @@ Pipeline position: 3g (after hmm.py, before grid.py and backtest.py)
 
 import itertools
 import numpy as np
+from numba import njit
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -39,8 +40,9 @@ N_COMBOS = len(COMBOS)
 REGIME_NAMES = {0: "Normal", 1: "Volatile"}
 
 
-# ── Grid kernel (pure Python — same logic as grid.py) ────────────────────────
+# ── Grid kernel (Numba JIT accelerated) ──────────────────────────────────────
 
+@njit(cache=True)
 def _grid_kernel(zscore:    np.ndarray,
                  spread:    np.ndarray,
                  t1_price:  np.ndarray,
