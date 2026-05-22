@@ -579,7 +579,8 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
         if macro_alert_s is not None and not macro_alert_s.empty:
             for d in unique_dates:
                 try:
-                    alert_dict[d] = bool(macro_alert_s.asof(d))
+                    val = macro_alert_s.asof(d)
+                    alert_dict[d] = bool(int(val)) if not pd.isna(val) else False
                 except Exception:
                     alert_dict[d] = False
 
