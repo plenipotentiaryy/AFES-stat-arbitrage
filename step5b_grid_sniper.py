@@ -82,7 +82,7 @@ def backtest(df, t1, t2, beta, entry_z, exit_z, stop_z) -> list:
     return pnls
 
 
-# ── Load ──────────────────────────────────────────────────────────────────────
+# load data
 closes = load_closes()
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
@@ -105,7 +105,7 @@ print(f"Running {len(COMBOS)} combinations...\n")
 
 days_total = (closes.index[-1] - closes.index[0]).days
 
-# ── Grid search ───────────────────────────────────────────────────────────────
+# grid search
 results = []
 
 for entry_z, exit_z, stop_z in COMBOS:
@@ -146,7 +146,7 @@ df_res = pd.DataFrame([{k: v for k, v in r.items() if k != "curve"}
                         for r in results])
 df_res = df_res.sort_values("sharpe", ascending=False).reset_index(drop=True)
 
-# ── Print full table ──────────────────────────────────────────────────────────
+# print full table
 print("=" * 85)
 print(f"{'#':>3} {'entry':>6} {'exit':>6} {'stop':>6} {'trades':>7} "
       f"{'WR':>6} {'sharpe':>7} {'total_pnl':>11} {'max_dd':>9} {'PF':>6}")
@@ -164,7 +164,7 @@ print(f"BEST: entry={best['entry_z']}  exit={best['exit_z']:+.1f}  stop={best['s
       f"→  Sharpe={best['sharpe']:.2f}  WR={best['win_rate']:.1f}%  "
       f"Trades={best['trades']:.0f}  P&L={best['total_pnl']:+.4f}")
 
-# ── Heatmaps: Sharpe by entry_z × exit_z for each stop_z ─────────────────────
+# heatmaps: Sharpe by entry_z × exit_z for each stop_z
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 fig, axes = plt.subplots(1, len(STOP_Z_GRID), figsize=(6 * len(STOP_Z_GRID), 5))
@@ -202,7 +202,7 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "sniper_grid.png", dpi=150)
 print(f"\nHeatmap saved to {OUTPUT_DIR / 'sniper_grid.png'}")
 
-# ── Top-10 equity curves ──────────────────────────────────────────────────────
+# top-10 equity curves
 fig2, ax2 = plt.subplots(figsize=(14, 6))
 top10     = df_res.head(10)
 colors    = plt.cm.RdYlGn(np.linspace(0.2, 0.9, 10))

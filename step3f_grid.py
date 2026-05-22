@@ -41,7 +41,7 @@ N_COMBOS     = len(COMBOS)
 MIN_TRADES   = 8
 
 
-# ── Numba JIT grid kernel ─────────────────────────────────────────────────────
+# numba JIT grid kernel
 # Runs ALL combos in a single pass over the bars.
 # Zero-Pandas rule: only float64 / int64 NumPy arrays inside.
 #
@@ -86,7 +86,7 @@ def _grid_kernel(zscore:    np.ndarray,   # float64[n_bars]
             sz = stop_arr[c]
             pc = pos[c]
 
-            # ── Exit / stop ───────────────────────────────────────────────
+            # exit / stop
             if pc != 0:
                 is_exit = (pc == 1 and z >= xz) or (pc == -1 and z <= -xz)
                 is_stop = (pc == 1 and z <= -sz) or (pc == -1 and z >= sz)
@@ -117,7 +117,7 @@ def _grid_kernel(zscore:    np.ndarray,   # float64[n_bars]
 
                     pos[c] = 0
 
-            # ── Entry ─────────────────────────────────────────────────────
+            # entry
             if pos[c] == 0:
                 if z < -ez:
                     pos[c]  = 1
@@ -129,7 +129,7 @@ def _grid_kernel(zscore:    np.ndarray,   # float64[n_bars]
     return results
 
 
-# ── Python wrapper ────────────────────────────────────────────────────────────
+# python wrapper
 
 def run_grid_numba(df: pd.DataFrame, t1: str, t2: str,
                    beta: float, combos: list, days: float,
@@ -208,7 +208,7 @@ def run_grid_numba(df: pd.DataFrame, t1: str, t2: str,
     return pd.DataFrame(rows).sort_values("sharpe", ascending=False).reset_index(drop=True)
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# data loading
 
 def load_closes_split() -> tuple[pd.DataFrame, pd.DataFrame, float]:
     """Returns (train_closes, test_closes, days_train)."""
@@ -256,7 +256,7 @@ def build_signals(closes: pd.DataFrame, t1: str, t2: str,
     }).dropna().between_time(SIGNAL_START, RTH_END)
 
 
-# ── Backtest engine ───────────────────────────────────────────────────────────
+# backtest engine
 
 def backtest(df: pd.DataFrame, t1: str, t2: str, beta: float,
              entry_z: float, exit_z: float, stop_z: float) -> list[dict]:
@@ -324,7 +324,7 @@ def calc_metrics(trades: list[dict], days: float) -> dict | None:
     }
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
+# load data
 
 closes_train, closes_test, days_train = load_closes_split()
 days_test = (closes_test.index[-1] - closes_test.index[0]).days
@@ -333,6 +333,14 @@ pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 if pairs.empty:
     raise SystemExit("pairs_selected.csv is empty — run step2_pairs.py first")
 
+print("\n" + "="*60)
+print("STEP 3f — PER-PAIR PARAMETER GRID SEARCH")
+print("="*60)
+print("Instead of using the same entry/exit/stop Z-scores for every pair,")
+print("we search for the best combination per pair using training data.")
+print("We then check those params work on the test data (never seen during search).")
+print("If train Sharpe is great but test Sharpe collapses, the params were overfit.")
+print()
 print(f"Per-pair grid  |  {N_COMBOS} combos  |  optimise on TRAIN → validate on TEST")
 print(f"TRAIN: {closes_train.index[0].date()} → {closes_train.index[-1].date()}  "
       f"({days_train:.0f} days)")
@@ -344,7 +352,7 @@ print(f"Stop  : {STOP_Z_GRID}\n")
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# ── Per-pair grid search ──────────────────────────────────────────────────────
+# per-pair grid search
 
 all_best: list[dict] = []
 all_pair_train_results: dict = {}
@@ -359,7 +367,7 @@ for _, row in pairs.iterrows():
         print(f"  SKIP {pair_name}: missing data")
         continue
 
-    # ── Build signals for both splits ────────────────────────────────────────
+    # build signals for both splits
     sig_train = build_signals(closes_train, t1, t2, beta, half_life)
     sig_test  = build_signals(closes_test,  t1, t2, beta, half_life)
 
@@ -370,7 +378,7 @@ for _, row in pairs.iterrows():
     print(f"  {pair_name}  train={len(sig_train)} bars  test={len(sig_test)} bars ...",
           end="", flush=True)
 
-    # ── Grid search on TRAIN — single Numba pass over all combos ─────────────
+    # grid search on TRAIN — single Numba pass over all combos
     df_train = run_grid_numba(sig_train, t1, t2, beta, COMBOS, days_train, pair_name)
 
     if df_train.empty:
@@ -379,7 +387,7 @@ for _, row in pairs.iterrows():
 
     all_pair_train_results[pair_name] = df_train
 
-    # ── Parameter Plateau: pick robust point, not argmax ─────────────────────
+    # parameter Plateau: pick robust point, not argmax
     # For each combo, score = Sharpe × min_ratio_of_neighbors.
     # A pair (e, x, s) with neighbors having Sharpe 0.9× of own = robust plateau.
     # A pair whose neighbors have 0.2× = isolated peak = overfit.
@@ -418,7 +426,7 @@ for _, row in pairs.iterrows():
     df_train["plateau_score"] = plateau_scores
     best_train = df_train.loc[df_train["plateau_score"].idxmax()]
 
-    # ── Validate best params on TEST — single-combo Numba pass ───────────────
+    # validate best params on TEST — single-combo Numba pass
     best_combo = [(float(best_train["entry_z"]),
                    float(best_train["exit_z"]),
                    float(best_train["stop_z"]))]
@@ -458,7 +466,7 @@ if not all_best:
 
 df_best = pd.DataFrame(all_best)
 
-# ── Summary table ─────────────────────────────────────────────────────────────
+# summary
 
 print("=" * 110)
 print(f"{'OPTIMAL PARAMS PER PAIR':^110}")
@@ -482,9 +490,11 @@ save_cols = ["pair", "entry_z", "exit_z", "stop_z",
              "test_sharpe", "test_wr", "test_trades", "test_pnl"]
 df_best[save_cols].to_csv(DATA_DIR / "optimal_params.csv", index=False)
 print(f"\nSaved optimal params → data/optimal_params.csv")
+print("HOW TO READ: ✓ = test Sharpe is positive (params generalise). ✗ = overfit.")
+print("Pairs marked ✗ will fall back to Monte Carlo defaults in the backtest.")
 print("step4_backtest.py will use these per-pair parameters automatically.\n")
 
-# ── Per-pair ranked tables (train) ────────────────────────────────────────────
+# per-pair ranked tables (train)
 print()
 for pair_name, df_t in all_pair_train_results.items():
     top = df_t.head(10)
@@ -497,7 +507,7 @@ for pair_name, df_t in all_pair_train_results.items():
               f"{r['trades']:>7.0f} {r['win_rate']:>5.1f}% {r['sharpe']:>8.2f} "
               f"{r['total_pnl']:>+10.4f} {r['stop_rate']:>5.1f}%{m}")
 
-# ── Per-pair heatmaps (train) ─────────────────────────────────────────────────
+# per-pair heatmaps (train)
 for pair_name, df_t in all_pair_train_results.items():
     n_stop = len(STOP_Z_GRID)
     fig, axes = plt.subplots(1, n_stop, figsize=(5 * n_stop, 5))
@@ -541,7 +551,7 @@ for pair_name, df_t in all_pair_train_results.items():
     plt.close(fig)
     print(f"Heatmap → {out}")
 
-# ── Top-5 test equity curves per pair ────────────────────────────────────────
+# top-5 test equity curves per pair
 for _, row in df_best.iterrows():
     pair_name = row["pair"]
     t1, t2    = pair_name.split("-")

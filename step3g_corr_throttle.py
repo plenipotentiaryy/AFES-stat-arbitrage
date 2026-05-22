@@ -23,14 +23,14 @@ THROTTLE_ON       = 0.50
 THROTTLE_OFF      = 1.00
 RESID_ZSCORE_WIN  = 60   # rolling window for spread z-score residual
 
-# ── Load data ────────────────────────────────────────────────────────────────
+# load data
 closes = pd.read_csv(DATA_DIR / "closes_daily.csv", index_col=0, parse_dates=True)
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
 if pairs.empty:
     raise SystemExit("pairs_selected.csv is empty")
 
-# ── Build per-pair daily spread residuals ────────────────────────────────────
+# build spread residuals per pair
 residuals: dict[str, pd.Series] = {}
 for _, row in pairs.iterrows():
     pair = row["pair"]
@@ -53,7 +53,7 @@ if not residuals:
 resid_df = pd.DataFrame(residuals).dropna(how="all")
 print(f"Built residuals for {resid_df.shape[1]} pairs over {len(resid_df)} days")
 
-# ── Rolling cross-pair mean |corr| ──────────────────────────────────────────
+# rolling avg cross-pair correlation
 n = resid_df.shape[1]
 dates = resid_df.index
 mean_abs_corr = pd.Series(index=dates, dtype=float)
@@ -85,7 +85,6 @@ print(f"Mean |corr|: avg={out['mean_abs_corr'].mean():.3f}  "
       f"max={out['mean_abs_corr'].max():.3f}")
 print(f"Saved → {DATA_DIR / 'corr_throttle.csv'}")
 
-# ── Chart ────────────────────────────────────────────────────────────────────
 OUTPUT_DIR.mkdir(exist_ok=True)
 fig, ax = plt.subplots(figsize=(14, 5))
 ax.plot(out.index, out["mean_abs_corr"], color="steelblue", lw=1.2,

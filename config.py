@@ -1,9 +1,7 @@
 from pathlib import Path
 
 PAIRS = [
-    # ═══════════════════════════════════════════════════════════════════
     # FINANCIALS  (18 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("JPM",  "BAC"),    # big banks — top 2 by assets
     ("WFC",  "C"),      # banks — #3 vs #4
     ("JPM",  "WFC"),    # big bank cross
@@ -26,9 +24,7 @@ PAIRS = [
     ("GS",   "RJF"),    # investment banking [Top100]
     ("MS",   "RJF"),    # investment banking [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # ENERGY  (15 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("XOM",  "CVX"),    # oil majors
     ("COP",  "CVX"),    # E&P vs integrated
     ("VLO",  "MPC"),    # oil refiners — crack spread proxy
@@ -46,9 +42,7 @@ PAIRS = [
     ("KMI",  "WMB"),    # oil & gas pipelines [Top100]
     ("OKE",  "WMB"),    # oil & gas pipelines [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # TECHNOLOGY  (14 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("MSFT", "AAPL"),   # mega-cap tech — OS/ecosystem duopoly
     ("GOOGL","META"),   # digital advertising duopoly
     ("CRM",  "NOW"),    # enterprise SaaS — Salesforce vs ServiceNow
@@ -66,9 +60,7 @@ PAIRS = [
     ("CSCO", "MSI"),    # communications equipment [Top100]
     ("FFIV", "MSI"),    # communications equipment [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # SEMICONDUCTORS & ELECTRONICS  (10 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("AMAT", "LRCX"),   # wafer fab equipment
     ("NVDA", "AMD"),    # GPU / AI chips
     ("AVGO", "QCOM"),   # mobile & broadband chips
@@ -80,9 +72,7 @@ PAIRS = [
     ("COHR", "TEL"),    # electronic components [Top100]
     ("GLW",  "TEL"),    # electronic components [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # CONSUMER STAPLES  (10 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("KO",   "PEP"),    # beverages
     ("PG",   "CL"),     # household & personal care
     # ("COST", "WMT"),  # DISABLED: huge VaR in MC
@@ -94,9 +84,7 @@ PAIRS = [
     ("MNST", "PEP"),    # soft drinks [Top100]
     # ("EL", "KVUE"),   # KVUE IPO 2023 — insufficient history
 
-    # ═══════════════════════════════════════════════════════════════════
     # CONSUMER DISCRETIONARY  (17 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("HD",   "LOW"),    # home improvement
     ("MCD",  "QSR"),    # fast food
     ("TGT",  "WMT"),    # mass retail
@@ -115,9 +103,7 @@ PAIRS = [
     ("COST", "DG"),     # consumer retail [Top100]
     ("COST", "DLTR"),   # consumer retail [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # HEALTHCARE  (14 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("UNH",  "CI"),     # health insurers — managed care
     ("MRK",  "PFE"),    # big pharma
     ("CVS",  "WBA"),    # pharmacy retail
@@ -134,9 +120,7 @@ PAIRS = [
     ("ALGN", "COO"),    # health care supplies [Top100]
     # ("ALGN","SOLV"),  # SOLV IPO 2024 — insufficient history
 
-    # ═══════════════════════════════════════════════════════════════════
     # INDUSTRIALS  (18 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("DAL",  "UAL"),    # airlines
     ("UPS",  "FDX"),    # logistics
     ("LMT",  "RTX"),    # defense prime
@@ -165,24 +149,18 @@ PAIRS = [
     ("CTAS", "LDOS"),   # diversified support services [Top100]
     ("CPRT", "LDOS"),   # diversified support services [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # TELECOM & MEDIA  (4 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("T",    "VZ"),     # telecom
     ("DIS",  "CMCSA"),  # media + distribution duopoly
     ("NFLX", "DIS"),    # streaming
     ("CHTR", "CMCSA"),  # cable operators
 
-    # ═══════════════════════════════════════════════════════════════════
     # AUTOS  (3 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("F",    "GM"),     # US automakers
     ("TSLA", "F"),      # EV vs legacy auto
     # ("RIVN","LCID"),  # RIVN/LCID IPO 2021 — insufficient history
 
-    # ═══════════════════════════════════════════════════════════════════
     # MATERIALS & MINING  (10 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("GOLD", "NEM"),    # gold miners — Barrick vs Newmont
     ("NEM",  "AEM"),    # gold miners — Newmont vs Agnico Eagle
     ("FCX",  "SCCO"),   # copper miners
@@ -199,9 +177,7 @@ PAIRS = [
     ("AMCR", "PKG"),    # packaging [Top100]
     ("AVY",  "IP"),     # packaging [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # REITs  (7 pairs)
-    # ═══════════════════════════════════════════════════════════════════
     ("PLD",  "SPG"),    # logistics vs retail REITs
     ("AMT",  "CCI"),    # cell tower REITs
     ("O",    "NNN"),    # net lease REITs
@@ -210,9 +186,7 @@ PAIRS = [
     ("ARE",  "BXP"),    # office REITs [Top100]
     ("DOC",  "WELL"),   # health care REITs [Top100]
 
-    # ═══════════════════════════════════════════════════════════════════
     # UNIVERSE DISCOVERY — pairs_universe.py (Johansen, joh_margin > 2.5)
-    # ═══════════════════════════════════════════════════════════════════
 
     # Already in intraday data:
     ("AVGO", "NVDA"),  # Semiconductors            joh_margin=9.90  H=0.052
@@ -345,10 +319,8 @@ PAIRS = [
     ("AXP", "MCO"),
     ("CPT", "EXR"),
 
-    # ═══════════════════════════════════════════════════════════════════
     # ALL-VS-ALL MINING — universe_all_pairs.csv (Johansen 90%, last 4y)
     # Hurst < 0.40 (strong mean-reversion), sorted by Joh margin
-    # ═══════════════════════════════════════════════════════════════════
     ("ADSK", "BX"),    # Joh=0.96  H=0.26  HL=17d   — SaaS vs PE
     ("BBY",  "SWK"),   # Joh=0.90  H=0.38  HL=45d
     ("PPG",  "TROW"),  # Joh=0.87  H=0.35  HL=60d
@@ -375,10 +347,8 @@ PAIRS = [
     ("PSA",  "UDR"),   # Joh=0.61  H=0.38  HL=35d   — REITs
     ("ROK",  "SWK"),   # Joh=0.61  H=0.34  HL=138d
 
-    # ═══════════════════════════════════════════════════════════════════
     # 9-MONTH MINING — universe_9m_pairs.csv (corr_90d ≥ 0.5, fresh stat links)
     # Fast half-life (4-12 days) — ideal for intraday mean-reversion
-    # ═══════════════════════════════════════════════════════════════════
     ("SYF",  "XLY"),   # Joh=1.02  H=0.41  HL=10d  c90=0.51
     ("PHM",  "SHW"),   # Joh=1.01  H=0.22  HL=7d   c90=0.73
     ("NVDA", "XLK"),   # Joh=0.73  H=0.13  HL=4d   c90=0.73
@@ -432,7 +402,7 @@ EXIT_Z = 0.0
 STOP_Z = 3.5
 ENTRY_Z_VOLATILE = 2.0   # stricter threshold when HMM detects volatile regime
 
-# ── Regime-Conditioned Profiling (RCDP) ─────────────────────────────────────
+# regime conditioned thresholds
 # Wider grids for per-regime grid search (regime_profiler.py)
 RCDP_ENTRY_GRID  = [1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2, 3.4, 3.6]
 RCDP_EXIT_GRID   = [-0.3, -0.1, 0.0, 0.1, 0.2, 0.3, 0.5]
@@ -451,10 +421,10 @@ COST_TAKER      = COST_COMMISSION + COST_SPREAD + COST_SLIPPAGE  # 0.07%
 COST_PER_SIDE   = COST_TAKER   # backward-compat alias used by step3a_hmm
 COST_PANIC_MULTIPLIER = 3.0    # multiplier for taker costs during HMM/K-Means Panic
 
-# ── Idiosyncratic Circuit Breaker ────────────────────────────────────────────
+# if z blows past this, something broke - force close and suspend pair
 CIRCUIT_BREAKER_Z = 4.5  # Max Z-score before immediate hard-stop and pair block
 
-# ── VW-Z Entry Chain ─────────────────────────────────────────────────────────
+# vW-Z Entry Chain
 # Gate 1: VW-Z replaces static z-score as the primary entry signal.
 #         Falls back to regular z when volumes_Nmin.csv is unavailable.
 # Gate 2: RVOL — current bar volume must be >= this fraction of the rolling
@@ -466,7 +436,7 @@ CIRCUIT_BREAKER_Z = 4.5  # Max Z-score before immediate hard-stop and pair block
 RVOL_MIN_ENTRY = 0.8    # min relative volume to allow entry (0.8 = 80% of typical)
 VELOCITY_BARS  = 3      # look-back bars for spread velocity check (3 × 5min = 15min)
 
-# ── M15 / H1 VWAP σ-band entry gate ─────────────────────────────────────────
+# m15 / H1 VWAP σ-band entry gate
 # Spread must be beyond this many σ from VWAP on BOTH M15 and H1 timeframes.
 # 1.0 = loose (enter at ±1σ from VWAP), 2.0 = standard, 3.0 = extreme only.
 VWAP_BAND_SIGMA = 2.0   # require |vwap_z_m15| >= X AND |vwap_z_h1| >= X
@@ -482,7 +452,7 @@ HALF_LIFE_MAX_BARS = 2000  # relaxed
 
 HURST_MAX = 0.55    # relaxed
 
-# ── Hurst Entry Gate (dynamic, per-trade) ────────────────────────────────────
+# hurst Entry Gate (dynamic, per-trade)
 # Computed lazily on the DAILY spread when |z| >= entry threshold.
 # Blocks entries when the spread is trending (structural drift), regardless of macro regime.
 HURST_ENTRY_WINDOW = 60     # daily bars of spread history for rolling Hurst at entry time
@@ -491,21 +461,21 @@ CORR_MIN  = 0.40    # relaxed
 RECENT_CORR_DAYS = 120   # rolling window for recent correlation check (calendar days)
 RECENT_CORR_MIN  = 0.50  # pair disabled if recent 120-day correlation drops below this
 
-# ── Gatev et al. SSD pre-filter (pairs_universe.py Layer 2b) ───────────────────
+# gatev et al. SSD pre-filter (pairs_universe.py Layer 2b)
 # Sum of Squared Deviations of normalised cumulative return indices.
 # Keeps only the X% of pairs with smallest SSD — fast pre-filter before Johansen.
 SSD_PERCENTILE = 80   # keep bottom 80% by SSD (discard top 20% most divergent)
 
-# ── Phase 1: rolling window cointegration ────────────────────────────────────
+# phase 1: rolling window cointegration
 COINT_WINDOW_DAYS  = 90    # rolling window for EG cointegration test (trading days)
 COINT_BREAK_P      = 0.15  # if rolling coint p > this during backtest → suspend pair
 COINT_RECHECK_DAYS = 5     # recheck coint every N trading days during backtest
 
-# ── Phase 4: K-Means macro regime ────────────────────────────────────────────
+# phase 4: K-Means macro regime
 KMEANS_N_CLUSTERS = 3      # 0=Trend, 1=Sideways, 2=Panic
 KMEANS_VOL_WINDOW = 20     # rolling window for macro features (trading days)
 
-# ── Walk-Forward Optimization (WFO) ───────────────────────────────────────
+# walk-Forward Optimization (WFO)
 # 180-day train / 90-day test — optimised for 20-year history
 WFO_TRAIN_MONTHS = 6    # formation window (~180 trading days)
 WFO_TEST_MONTHS  = 3    # trading window / OOS test (~90 trading days)
@@ -535,7 +505,7 @@ MAX_PAIR_WEIGHT   = 0.15        # cap: no single pair gets more than 15% of capi
 
 TARGET_RISK_USD = 150.0         # volatility scaling: target dollar risk per trade (1σ of spread)
 
-# ── Tail-adjusted EV entry gate ──────────────────────────────────────────────
+# tail-adjusted EV entry gate
 # Ported from fp_fx_betatest: a POT/EVT tail-loss model plus a logistic
 # reversion model. The gate only filters fresh entries; existing exits and
 # emergency risk controls remain controlled by the normal AFES backtest loop.
@@ -549,7 +519,7 @@ TAIL_RR_THRESHOLD = 0.5
 TAIL_CONFIDENCE_LEVEL = 0.95
 TAIL_REFIT_FREQ = "W"
 
-# ── RMT / regularized allocation ─────────────────────────────────────────────
+# rMT / regularized allocation
 # Enable by setting ALLOCATION_METHOD = "regularized".
 PORTFOLIO_OPT_MAX_GROSS = 1.0
 PORTFOLIO_OPT_WEIGHT_MIN = 0.0
@@ -558,6 +528,6 @@ PORTFOLIO_OPT_WEIGHT_MAX = MAX_PAIR_WEIGHT
 DATA_DIR = Path("data")
 OUTPUT_DIR = Path("output")
 
-# ── The Black Swan Hedge (Tail Risk Convexity) ───────────────────────────────
+# tail hedge params
 TAIL_HEDGE_DRAG_ANNUAL = 0.015  # 1.5% annual drag on portfolio (buying far OTM Puts)
 TAIL_HEDGE_PAYOUT_MULT = 10.0   # Convexity multiplier when HMM detects Panic

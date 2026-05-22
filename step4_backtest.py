@@ -196,7 +196,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 })
                 position = 0
 
-                # ── Auto-disable if pair is consistently losing ───────────
+                # auto-disable if pair is consistently losing
                 if cumulative_pnl < PAIR_MAX_LOSS:
                     break
 
@@ -227,7 +227,6 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     return pd.DataFrame(trades)
 
 
-# ── Load ─────────────────────────────────────────────────────────────────────
 closes = load_closes()
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
@@ -277,7 +276,7 @@ else:
 if pairs.empty:
     raise SystemExit("pairs_selected.csv is empty — run step2_pairs.py first")
 
-# ── Load per-pair optimal params (from step4d grid search on train data) ─────
+# load data
 _opt_params: dict[str, tuple[float, float, float]] = {}
 _opt_path = DATA_DIR / "optimal_params.csv"
 if _opt_path.exists():
@@ -296,7 +295,7 @@ print(f"Trading {len(pairs)} pairs | {closes.shape[0]} bars per ticker")
 print(f"Period: {closes.index[0]} — {closes.index[-1]}")
 print(f"Pair max loss cutoff: {PAIR_MAX_LOSS}\n")
 
-# ── Run backtest per pair ─────────────────────────────────────────────────────
+# run for each pair
 pair_results = {}
 
 for _, row in pairs.iterrows():
@@ -349,7 +348,7 @@ for _, row in pairs.iterrows():
 if not pair_results:
     raise SystemExit("No trades generated.")
 
-# ── Combine ───────────────────────────────────────────────────────────────────
+# merge results
 df_trades = (pd.concat([v["trades"] for v in pair_results.values()])
                .sort_values("exit_time")
                .reset_index(drop=True))
@@ -401,7 +400,7 @@ for pair_name, data in pair_results.items():
 df_trades.to_csv(DATA_DIR / "trades.csv", index=False)
 print(f"\nSaved {len(df_trades)} trades to {DATA_DIR / 'trades.csv'}")
 
-# ── SPY benchmark ─────────────────────────────────────────────────────────────
+# compare vs spy
 spy_return = None
 spy_sharpe = None
 try:
@@ -425,7 +424,7 @@ try:
 except Exception as e:
     print(f"\nSPY benchmark unavailable: {e}")
 
-# ── OOS summary ───────────────────────────────────────────────────────────────
+# OOS numbers
 print(f"\n{'='*60}")
 print("OUT-OF-SAMPLE COMPARISON")
 print(f"{'='*60}")
@@ -441,7 +440,7 @@ if spy_return is not None:
     alpha = sharpe - spy_sharpe
     print(f"Alpha (Sharpe):    {alpha:+.2f}")
 
-# ── Charts ────────────────────────────────────────────────────────────────────
+# save charts
 OUTPUT_DIR.mkdir(exist_ok=True)
 exit_times = pd.to_datetime(df_trades["exit_time"])
 

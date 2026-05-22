@@ -7,7 +7,7 @@ from config import DATA_DIR, OUTPUT_DIR
 
 ROLLING_WINDOW = 20   # trades for rolling Sharpe
 
-# ── Load ──────────────────────────────────────────────────────────────────────
+# load data
 df = pd.read_csv(DATA_DIR / "trades.csv")
 df["exit_time"]  = pd.to_datetime(df["exit_time"],  utc=True)
 df["entry_time"] = pd.to_datetime(df["entry_time"], utc=True)
@@ -31,9 +31,16 @@ profit_factor   = (pnl[pnl > 0].sum() / abs(pnl[pnl <= 0].sum())
 max_dd          = drawdown.min()
 total_costs     = (df["tx_cost"] + df["borrow_cost"]).sum()
 
+print("\n" + "="*60)
+print("STEP 5d — VISUAL DASHBOARD")
+print("="*60)
+print("Generates a comprehensive chart of all backtest results.")
+print("Includes: equity curve, drawdown, rolling Sharpe, per-pair breakdown,")
+print("win/loss distribution, exit reason breakdown, and cost drag.")
+print()
 print(f"Dashboard: {len(df)} trades across {len(pairs)} pairs")
 
-# ── Layout ────────────────────────────────────────────────────────────────────
+# layout
 fig = plt.figure(figsize=(20, 26))
 fig.patch.set_facecolor("#f8f9fa")
 
@@ -43,9 +50,7 @@ TITLE_SIZE = 10
 colors_pairs = plt.cm.tab10(np.linspace(0, 1, len(pairs)))
 pair_color   = {p: c for p, c in zip(pairs, colors_pairs)}
 
-# ═════════════════════════════════════════════════════════════════════════════
 # ROW 1
-# ═════════════════════════════════════════════════════════════════════════════
 
 # 1. Portfolio equity curve
 ax = fig.add_subplot(gs[0, :2])
@@ -74,9 +79,7 @@ ax.set_title("Per-pair Equity", fontsize=TITLE_SIZE, fontweight="bold")
 ax.legend(fontsize=7)
 ax.set_facecolor("#ffffff")
 
-# ═════════════════════════════════════════════════════════════════════════════
 # ROW 2
-# ═════════════════════════════════════════════════════════════════════════════
 
 # 3. P&L distribution
 ax = fig.add_subplot(gs[1, 0])
@@ -122,9 +125,7 @@ ax.fill_between(exit_times, rolling_sh, 0,
 ax.set_title(f"Rolling Sharpe ({ROLLING_WINDOW} trades)", fontsize=TITLE_SIZE, fontweight="bold")
 ax.set_facecolor("#ffffff")
 
-# ═════════════════════════════════════════════════════════════════════════════
 # ROW 3
-# ═════════════════════════════════════════════════════════════════════════════
 
 # 6. Win rate per pair
 ax = fig.add_subplot(gs[2, 0])
@@ -167,9 +168,7 @@ ax.set_ylabel("Total net P&L")
 ax.legend(fontsize=8)
 ax.set_facecolor("#ffffff")
 
-# ═════════════════════════════════════════════════════════════════════════════
 # ROW 4
-# ═════════════════════════════════════════════════════════════════════════════
 
 # 9. Monthly P&L heatmap
 ax = fig.add_subplot(gs[3, :2])
@@ -243,7 +242,6 @@ for label, value, weight in metrics:
 ax.set_facecolor("#f0f4f8")
 ax.set_title("Key Metrics", fontsize=TITLE_SIZE, fontweight="bold")
 
-# ── Save ──────────────────────────────────────────────────────────────────────
 OUTPUT_DIR.mkdir(exist_ok=True)
 plt.suptitle("AFES — Statistical Arbitrage Dashboard",
              fontsize=16, fontweight="bold", y=0.995, color="#1a237e")
@@ -251,4 +249,10 @@ plt.suptitle("AFES — Statistical Arbitrage Dashboard",
 out_path = OUTPUT_DIR / "dashboard.png"
 plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
 print(f"Dashboard saved to {out_path}")
+print()
+print("Open the image to see the full picture.")
+print("Key things to look for:")
+print("  Equity curve going up-right consistently (not just one lucky period)")
+print("  Rolling Sharpe staying positive throughout (not just in one stretch)")
+print("  Win/loss bars: many small wins, controlled losses — not the other way")
 # plt.show()

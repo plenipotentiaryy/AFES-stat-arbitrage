@@ -34,7 +34,7 @@ from config import (
 _LAZY_WINDOW_BARS = COINT_WINDOW_DAYS * BARS_PER_DAY   # 90d × 26 bars = 2 340
 
 
-# ── Numba-accelerated CUSUM + break score ────────────────────────────────────
+# numba-accelerated CUSUM + break score
 
 @njit(cache=True)
 def _compute_break_scores(nu, var_nu, hl, hl_med, d_beta,
@@ -126,7 +126,7 @@ def compute_break_scores_vectorized(df: pd.DataFrame,
     return scores, broken_pos, broken_neg
 
 
-# ── CointegrationFilter ───────────────────────────────────────────────────────
+# cointegrationFilter
 
 _COINT_CACHE_DIR = Path(DATA_DIR) / "coint_cache"
 _COINT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -189,13 +189,13 @@ class CointegrationFilter:
                 for ts, v in s.items()
             }
 
-    # ── Tier 1: O(1) daily lookup ─────────────────────────────────────────
+    # tier 1: O(1) daily lookup
     def is_valid(self, d) -> bool:
         """True = cointegrated per daily pre-compute. Defaults to True if no data."""
         key = d if isinstance(d, _date) else pd.Timestamp(d).date()
         return self._daily_dict.get(key, True)
 
-    # ── Tier 2: lazy intraday ADF on Z-trigger ────────────────────────────
+    # tier 2: lazy intraday ADF on Z-trigger
     def lazy_check(self, spread_tail: pd.Series, d) -> bool:
         """
         Run ADF on the most recent intraday spread window.
@@ -223,7 +223,7 @@ class CointegrationFilter:
         return ok
 
 
-# ── MacroFilter ───────────────────────────────────────────────────────────────
+# macroFilter
 
 class MacroFilter:
     """
@@ -261,7 +261,7 @@ class MacroFilter:
             for ts, v in kmeans_series.items():
                 self._km[_to_date(ts)] = int(v)
 
-    # ── Public API ────────────────────────────────────────────────────────
+    # public API
     def is_entry_blocked(self, ts) -> bool:
         """True → do not open new positions on this bar."""
         d = _to_date(ts)
@@ -290,7 +290,7 @@ class MacroFilter:
         return "FORCE_CLOSE"
 
 
-# ── HurstFilter ───────────────────────────────────────────────────────────────
+# hurstFilter
 
 def get_hurst_multiplier(h_val: float) -> float:
     """
@@ -363,7 +363,7 @@ class HurstFilter:
         return blocked, h
 
 
-# ── BreakVelocityDetector ─────────────────────────────────────────────────────
+# breakVelocityDetector
 
 class BreakVelocityDetector:
     """
@@ -429,7 +429,7 @@ class BreakVelocityDetector:
         return float(bt), bool(is_broken)
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# helper
 
 def _to_date(ts) -> _date:
     if isinstance(ts, _date) and not isinstance(ts, pd.Timestamp):
