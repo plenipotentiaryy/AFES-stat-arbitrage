@@ -39,7 +39,7 @@ N_COMBOS = len(COMBOS)
 REGIME_NAMES = {0: "Normal", 1: "Volatile"}
 
 
-# ── Grid kernel (pure Python — same logic as grid.py) ────────────────────────
+# grid kernel (pure Python — same logic as grid.py)
 
 def _grid_kernel(zscore:    np.ndarray,
                  spread:    np.ndarray,
@@ -177,7 +177,7 @@ def run_grid(df: pd.DataFrame, t1: str, t2: str,
     return pd.DataFrame(rows).sort_values("sharpe", ascending=False).reset_index(drop=True)
 
 
-# ── Signal builder (same as grid.py) ─────────────────────────────────────────
+# signal builder (same as grid.py)
 
 def build_signals(closes: pd.DataFrame, t1: str, t2: str,
                   beta: float, half_life: float) -> pd.DataFrame:
@@ -192,7 +192,7 @@ def build_signals(closes: pd.DataFrame, t1: str, t2: str,
     }).dropna().between_time(SIGNAL_START, RTH_END)
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# data loading
 
 def load_data():
     """Load closes, regimes, and pairs metadata."""
@@ -235,9 +235,18 @@ def split_train_test(closes, pairs):
     return closes.iloc[:split], closes.iloc[split:]
 
 
-# ── Main profiling loop ──────────────────────────────────────────────────────
+# entry point
 
 def main():
+    print("\n" + "="*60)
+    print("STEP 3g — REGIME-CONDITIONED PARAMETER PROFILING (RCDP)")
+    print("="*60)
+    print("Runs the grid search separately for calm and volatile bars.")
+    print("The idea: the optimal entry Z-score in a volatile market is")
+    print("different from a calm one — one set of thresholds does not fit all.")
+    print("Output: per-pair, per-regime optimal (entry, exit, stop) saved")
+    print("to regime_thresholds.csv — loaded by the backtest automatically.")
+    print()
     closes, regimes, pairs = load_data()
     closes_train, closes_test = split_train_test(closes, pairs)
 
@@ -303,7 +312,7 @@ def main():
             print("  — too few Normal bars, skipping")
             continue
 
-        # ── Grid search: Normal regime ────────────────────────────────────
+        # grid search: Normal regime
         df_normal = run_grid(sig_normal, t1, t2, beta, COMBOS,
                              days_train, min_trades=MIN_TRADES_NORMAL)
 
@@ -313,7 +322,7 @@ def main():
 
         best_normal = df_normal.iloc[0]
 
-        # ── Grid search: Volatile regime ──────────────────────────────────
+        # grid search: Volatile regime
         best_volatile = None
         vol_validated = False
 
@@ -339,7 +348,7 @@ def main():
                     if not df_test_vol.empty and df_test_vol.iloc[0]["sharpe"] > 0:
                         vol_validated = True
 
-        # ── Fallback for volatile regime ──────────────────────────────────
+        # fallback for volatile regime
         if best_volatile is None or not vol_validated:
             # Use normal entry + ENTRY_Z_VOLATILE offset as fallback
             fallback_entry = min(float(best_normal["entry_z"]) +
@@ -396,12 +405,11 @@ def main():
         print("\nNo pairs profiled. Ensure hmm.py (step 3b) has run.")
         return
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     df_out = pd.DataFrame(all_results)
     out_path = DATA_DIR / "regime_thresholds.csv"
     df_out.to_csv(out_path, index=False)
 
-    # ── Summary table ─────────────────────────────────────────────────────────
+    # summary
     print(f"\n{'=' * 100}")
     print(f"{'REGIME-CONDITIONED THRESHOLDS':^100}")
     print(f"{'=' * 100}")
@@ -429,7 +437,7 @@ def main():
           f"(Volatile from grid: {n_grid}, fallback: {n_fallback})")
     print(f"Saved → {out_path}")
 
-    # ── Visualization ─────────────────────────────────────────────────────────
+    # visualization
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     if pair_details:

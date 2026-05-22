@@ -8,7 +8,7 @@ from config import (
     DATA_DIR, OUTPUT_DIR,
 )
 
-# ── Strategy parameters (overriding config defaults) ─────────────────────────
+# strategy parameters (overriding config defaults)
 ENTRY_Z = 3.2   # optimal from sniper grid (Sharpe 4.20, WR 83.9%)
 EXIT_Z  = -0.2  # exit slightly past mean reversion
 STOP_Z  = 4.4   # wide stop — prevents premature exits
@@ -100,7 +100,6 @@ def backtest_pair(df, t1, t2, beta) -> pd.DataFrame:
     return pd.DataFrame(trades)
 
 
-# ── Load ──────────────────────────────────────────────────────────────────────
 closes = load_closes()
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 

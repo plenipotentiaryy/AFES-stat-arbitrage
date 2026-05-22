@@ -59,10 +59,10 @@ def plot_zscore_debug(
 
     fig, ax = plt.subplots(figsize=(18, 6))
 
-    # ── 1. Z-score line ───────────────────────────────────────────────────────
+    # 1. Z-score line
     ax.plot(x, z, color="gray", alpha=0.6, lw=1.0, label="Z-score")
 
-    # ── 2. Threshold lines ────────────────────────────────────────────────────
+    # 2. Threshold lines
     ax.axhline(0,        color="black",     lw=1.0,  label="Mean (0)")
     ax.axhline( entry_z, color="red",       lw=1.2,  ls="--", label=f"+entry {entry_z}")
     ax.axhline(-entry_z, color="green",     lw=1.2,  ls="--", label=f"−entry {entry_z}")
@@ -71,7 +71,7 @@ def plot_zscore_debug(
     ax.axhline( stop_z,  color="darkred",   lw=0.8,  ls="-.", label=f"stop ±{stop_z}")
     ax.axhline(-stop_z,  color="darkred",   lw=0.8,  ls="-.")
 
-    # ── 3. Fill zones ─────────────────────────────────────────────────────────
+    # 3. Fill zones
     ax.fill_between(x, z, entry_z,
                     where=(z >= entry_z),
                     color="red", alpha=0.25, label="Short spread zone")
@@ -79,7 +79,7 @@ def plot_zscore_debug(
                     where=(z <= -entry_z),
                     color="green", alpha=0.25, label="Long spread zone")
 
-    # ── 4. Trade markers (from real trades, not reconstructed position) ───────
+    # 4. Trade markers (from real trades, not reconstructed position)
     if trades is not None and not trades.empty:
         entry_times = pd.to_datetime(trades["entry_time"])
         exit_times  = pd.to_datetime(trades["exit_time"])
@@ -129,7 +129,7 @@ def plot_zscore_debug(
                        marker="x", color="crimson", s=90, zorder=5,
                        lw=2.0, label=f"Exit STOP ({len(exit_stop_x)})")
 
-    # ── 5. Styling ────────────────────────────────────────────────────────────
+    # 5. Styling
     n_tr = len(trades) if trades is not None and not trades.empty else 0
     n_stop = int((trades["exit_reason"] == "STOP").sum()) if n_tr > 0 else 0
     wr = ((trades["net_pnl"] > 0).mean() * 100) if n_tr > 0 else 0.0
