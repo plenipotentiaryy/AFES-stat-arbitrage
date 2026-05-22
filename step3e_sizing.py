@@ -113,7 +113,8 @@ def macro_alert_active(macro_alert: pd.Series | None, date) -> bool:
         return False
     key = pd.Timestamp(date).normalize().tz_localize(None)
     try:
-        return bool(macro_alert.asof(key))
+        val = macro_alert.asof(key)
+        return bool(int(val)) if not pd.isna(val) else False
     except Exception:
         return False
 
@@ -260,15 +261,18 @@ def position_size(pair: str, ts, regimes, iv_mult_s, mc_conf: dict,
                   corr_throttle_s: pd.Series | None = None,
                   hrp_w: dict | None = None) -> float:
     date = ts.date() if hasattr(ts, "date") else ts
-    if macro_alert_active(macro_alert_s, date):
-        return 0.0   # block new entries during macro panic (VIX9D backwardation)
+    alert = macro_alert_active(macro_alert_s, date)
     r = regime_multiplier(regimes, pair, ts)            # per-pair HMM
     g = global_hmm_multiplier(global_hmm_s, date)       # global SPY HMM
     i = iv_multiplier(iv_mult_s, date)                  # VIX percentile
     m = mc_confidence(mc_conf, pair)                    # OU Monte Carlo
     c = corr_throttle_multiplier(corr_throttle_s, date) # Layer A
     h = hrp_multiplier(hrp_w or {}, pair)               # Layer B
-    return r * g * i * m * c * h
+    sz = r * g * i * m * c * h
+    # VIX9D backwardation: reduce size by 50% but don't block entirely
+    if alert:
+        sz *= 0.5
+    return sz
 
 
 def main() -> None:
