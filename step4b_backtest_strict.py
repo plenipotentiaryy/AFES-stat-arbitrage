@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from numba import njit
 from config import (
     CLOSES_FILE,
     COST_TAKER, BORROW_RATE_ANNUAL, PAIR_MAX_LOSS,
@@ -18,12 +19,9 @@ BARS_PER_TRADING_DAY = BARS_PER_DAY
 
 
 def load_closes() -> pd.DataFrame:
-    closes = pd.read_csv(DATA_DIR / CLOSES_FILE, index_col=0, parse_dates=True)
-    if closes.index.tz is None:
-        closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
-    else:
-        closes.index = closes.index.tz_convert("US/Eastern")
-    return closes.between_time(RTH_START, RTH_END).dropna().tail(RECENT_BARS)
+    closes = pd.read_csv(DATA_DIR / CLOSES_FILE, index_col=0)
+    closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
+    return closes.between_time(RTH_START, RTH_END).tail(RECENT_BARS)
 
 
 def build_signals(closes, t1, t2, beta, half_life) -> pd.DataFrame:
@@ -38,66 +36,113 @@ def build_signals(closes, t1, t2, beta, half_life) -> pd.DataFrame:
     }).dropna().between_time(SIGNAL_START, RTH_END)
 
 
-def backtest_pair(df, t1, t2, beta) -> pd.DataFrame:
-    t1_col, t2_col = f"{t1}_close", f"{t2}_close"
+@njit(cache=True)
+def _backtest_kernel(zscore, spread, t1_price, t2_price, beta,
+                     entry_z, exit_z, stop_z,
+                     cost_taker, borrow_rate, bars_per_day, pair_max_loss):
+    n = zscore.shape[0]
+    # parallel output arrays (preallocate worst case)
+    entry_idx  = np.empty(n, dtype=np.int64)
+    exit_idx   = np.empty(n, dtype=np.int64)
+    direction  = np.empty(n, dtype=np.int8)
+    gross_pnl  = np.empty(n, dtype=np.float64)
+    tx_cost_a  = np.empty(n, dtype=np.float64)
+    borrow_a   = np.empty(n, dtype=np.float64)
+    net_pnl_a  = np.empty(n, dtype=np.float64)
+    cum_pnl_a  = np.empty(n, dtype=np.float64)
+    is_stop    = np.empty(n, dtype=np.int8)
+    k = 0
+
     position = 0
-    entry_spread = entry_t1 = entry_t2 = 0.0
+    entry_spread = 0.0
+    entry_t1 = 0.0
+    entry_t2 = 0.0
     entry_bar = 0
     cumulative_pnl = 0.0
-    trades = []
 
-    for i in range(len(df)):
-        z          = df["zscore"].iloc[i]
-        spread_now = df["spread"].iloc[i]
-        t1_price   = df[t1_col].iloc[i]
-        t2_price   = df[t2_col].iloc[i]
+    for i in range(n):
+        z = zscore[i]
+        sp = spread[i]
+        p1 = t1_price[i]
+        p2 = t2_price[i]
 
         if position != 0:
-            exit_signal = (position == 1 and z > -EXIT_Z) or (position == -1 and z < EXIT_Z)
-            stop_signal = (position == 1 and z < -STOP_Z) or (position == -1 and z > STOP_Z)
+            exit_signal = (position == 1 and z > -exit_z) or (position == -1 and z < exit_z)
+            stop_signal = (position == 1 and z < -stop_z) or (position == -1 and z > stop_z)
 
             if exit_signal or stop_signal:
-                gross_pnl      = position * (spread_now - entry_spread)
-                notional       = entry_t1 + beta * entry_t2
-                tx_cost        = 2 * notional * COST_TAKER
-                holding_days   = (i - entry_bar) / BARS_PER_TRADING_DAY
+                g = position * (sp - entry_spread)
+                notional = entry_t1 + beta * entry_t2
+                tx = 2.0 * notional * cost_taker
+                hold_days = (i - entry_bar) / bars_per_day
                 short_notional = (beta * entry_t2) if position == 1 else entry_t1
-                borrow_cost    = short_notional * BORROW_RATE_ANNUAL * holding_days / 252
-                net_pnl        = gross_pnl - tx_cost - borrow_cost
-                cumulative_pnl += net_pnl
+                bc = short_notional * borrow_rate * hold_days / 252.0
+                net = g - tx - bc
+                cumulative_pnl += net
 
-                trades.append({
-                    "pair":         f"{t1}-{t2}",
-                    "entry_time":   df.index[entry_bar],
-                    "exit_time":    df.index[i],
-                    "direction":    "LONG" if position == 1 else "SHORT",
-                    "holding_bars": i - entry_bar,
-                    "gross_pnl":    round(gross_pnl, 4),
-                    "tx_cost":      round(tx_cost, 4),
-                    "borrow_cost":  round(borrow_cost, 4),
-                    "net_pnl":      round(net_pnl, 4),
-                    "cum_pnl":      round(cumulative_pnl, 4),
-                    "exit_reason":  "STOP" if stop_signal else "SIGNAL",
-                    "entry_z":      round(df["zscore"].iloc[entry_bar], 2),
-                    "exit_z":       round(z, 2),
-                })
+                entry_idx[k] = entry_bar
+                exit_idx[k]  = i
+                direction[k] = position
+                gross_pnl[k] = g
+                tx_cost_a[k] = tx
+                borrow_a[k]  = bc
+                net_pnl_a[k] = net
+                cum_pnl_a[k] = cumulative_pnl
+                is_stop[k]   = 1 if stop_signal else 0
+                k += 1
                 position = 0
 
-                if cumulative_pnl < PAIR_MAX_LOSS:
+                if cumulative_pnl < pair_max_loss:
                     break
 
         if position == 0:
-            if z < -ENTRY_Z:
+            if z < -entry_z:
                 position = 1
-            elif z > ENTRY_Z:
+            elif z > entry_z:
                 position = -1
             if position != 0:
-                entry_spread = spread_now
-                entry_t1     = t1_price
-                entry_t2     = t2_price
-                entry_bar    = i
+                entry_spread = sp
+                entry_t1 = p1
+                entry_t2 = p2
+                entry_bar = i
 
-    return pd.DataFrame(trades)
+    return (entry_idx[:k], exit_idx[:k], direction[:k], gross_pnl[:k],
+            tx_cost_a[:k], borrow_a[:k], net_pnl_a[:k], cum_pnl_a[:k], is_stop[:k])
+
+
+def backtest_pair(df, t1, t2, beta) -> pd.DataFrame:
+    t1_col, t2_col = f"{t1}_close", f"{t2}_close"
+    zscore   = df["zscore"].to_numpy(dtype=np.float64)
+    spread   = df["spread"].to_numpy(dtype=np.float64)
+    p1       = df[t1_col].to_numpy(dtype=np.float64)
+    p2       = df[t2_col].to_numpy(dtype=np.float64)
+
+    (ei, xi, dir_, g, tx, bc, net, cum, stop) = _backtest_kernel(
+        zscore, spread, p1, p2, float(beta),
+        float(ENTRY_Z), float(EXIT_Z), float(STOP_Z),
+        float(COST_TAKER), float(BORROW_RATE_ANNUAL),
+        float(BARS_PER_TRADING_DAY), float(PAIR_MAX_LOSS),
+    )
+
+    if ei.size == 0:
+        return pd.DataFrame()
+
+    idx = df.index
+    return pd.DataFrame({
+        "pair":         f"{t1}-{t2}",
+        "entry_time":   idx[ei],
+        "exit_time":    idx[xi],
+        "direction":    np.where(dir_ == 1, "LONG", "SHORT"),
+        "holding_bars": xi - ei,
+        "gross_pnl":    np.round(g, 4),
+        "tx_cost":      np.round(tx, 4),
+        "borrow_cost":  np.round(bc, 4),
+        "net_pnl":      np.round(net, 4),
+        "cum_pnl":      np.round(cum, 4),
+        "exit_reason":  np.where(stop == 1, "STOP", "SIGNAL"),
+        "entry_z":      np.round(zscore[ei], 2),
+        "exit_z":       np.round(zscore[xi], 2),
+    })
 
 
 closes = load_closes()
@@ -107,7 +152,7 @@ if pairs.empty:
     raise SystemExit("pairs_selected.csv is empty — run step2_pairs.py first")
 
 print(f"STRICT STRATEGY  entry={ENTRY_Z}  exit={EXIT_Z}  stop={STOP_Z}")
-print(f"Trading {len(pairs)} pairs | {closes.shape[0]} bars per ticker")
+print(f"Trading {len(pairs)} pairs | {closes.shape[0]} bars in window")
 print(f"Period: {closes.index[0]} — {closes.index[-1]}\n")
 
 pair_results = {}
@@ -121,7 +166,11 @@ for _, row in pairs.iterrows():
         print(f"  SKIP {row['pair']}: missing ticker data")
         continue
 
-    df_sig = build_signals(closes, t1, t2, beta, half_life)
+    pair_closes = closes[[t1, t2]].dropna()
+    if pair_closes.empty:
+        print(f"  SKIP {row['pair']}: no overlapping data")
+        continue
+    df_sig = build_signals(pair_closes, t1, t2, beta, half_life)
     trades = backtest_pair(df_sig, t1, t2, beta)
 
     if trades.empty:

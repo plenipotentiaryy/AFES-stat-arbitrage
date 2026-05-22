@@ -32,6 +32,7 @@ from filters import (
 from config import HURST_ENTRY_WINDOW
 from tail_ev_profiler import TailAdjustedEVProfiler
 from regime_memory import RegimeMemoryWeighter
+from toxicity import HawkesToxicityFilter
 
 try:
     from rmt_covariance import clean_covariance_rmt
@@ -512,6 +513,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     active_exit_thresh = exit_thresh
     active_stop_thresh = stop_thresh
     _blocked_macro = _blocked_size = _blocked_tail = _blocked_rvol = _blocked_vel = _blocked_coint = _blocked_hurst = 0
+    _blocked_toxicity = 0
     entry_size_mult = 1.0
 
     has_m15  = "z_m15" in df.columns
@@ -623,6 +625,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
 
     has_toxicity = "toxicity" in df.columns
     toxicity_arr = df["toxicity"].to_numpy().astype(float) if has_toxicity else np.zeros(len(df))
+    toxicity_filter = HawkesToxicityFilter()
 
     for i in range(len(df)):
         ts         = ts_arr[i]
@@ -666,10 +669,8 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             notional_raw   = entry_t1 + abs(entry_beta) * entry_t2
             
             # Apply Toxicity Penalty to Taker cost
-            from toxicity import HawkesToxicityFilter
-            tox_f = HawkesToxicityFilter()
             tox_intensity = toxicity_arr[i]
-            tox_mult = tox_f.get_execution_penalty(tox_intensity)
+            tox_mult = toxicity_filter.get_execution_penalty(tox_intensity)
             
             # Apply Panic Multiplier to Taker cost if forced out by macro panic
             is_panic = macro_filter.is_force_close(ts) if macro_filter else False
@@ -807,7 +808,20 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     _blocked_tail += 1
                     continue
 
+<<<<<<< HEAD
             # gate 1: RVOL — block entries on thin volume
+=======
+            # ── Gate 0b: Hawkes toxicity — avoid initiating during
+            # self-exciting one-way shocks/adverse-selection bursts.
+            if position != 0 and has_toxicity:
+                tox_now = toxicity_arr[i]
+                if np.isfinite(tox_now) and tox_now > toxicity_filter.threshold:
+                    position = 0
+                    _blocked_toxicity += 1
+                    continue
+
+            # ── Gate 1: RVOL — block entries on thin volume ───────────────────
+>>>>>>> f1a5ae73df83f559ed61239be82cae998b4ec4b7
             if position != 0 and has_rvol:
                 rvol_now = rvol_arr[i]
                 if not np.isnan(rvol_now) and rvol_now < RVOL_MIN_ENTRY:
@@ -882,7 +896,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
 
     blocked = dict(macro=_blocked_macro, size=_blocked_size, tail=_blocked_tail,
                    rvol=_blocked_rvol, vel=_blocked_vel, coint=_blocked_coint,
-                   hurst=_blocked_hurst)
+                   hurst=_blocked_hurst, toxicity=_blocked_toxicity)
     return pd.DataFrame(trades), blocked
 
 
@@ -989,21 +1003,43 @@ else:
 if pairs.empty:
     raise SystemExit("pairs_selected.csv is empty — run step2_pairs.py first")
 
+<<<<<<< HEAD
 # load data
+=======
+# ── Load per-pair optimal params (from step3j WFO or step4d grid search) ──────
+def _as_eastern_timestamp(value) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.tz_localize("US/Eastern")
+    return ts.tz_convert("US/Eastern")
+
+
+>>>>>>> f1a5ae73df83f559ed61239be82cae998b4ec4b7
 _opt_params: dict[str, tuple[float, float, float]] = {}
+_wfo_param_schedule: dict[str, pd.DataFrame] = {}
 _wfo_path = DATA_DIR / "wfo_params.csv"
 _opt_path = DATA_DIR / "optimal_params.csv"
 
 if _wfo_path.exists():
     _opt_df = pd.read_csv(_wfo_path)
-    # WFO parameters are time-varying, but for the final backtest 
-    # we take the latest available params per pair.
-    for _, _r in _opt_df.sort_values("oos_end").iterrows():
-        _opt_params[_r["pair"]] = (float(_r["entry_z"]),
-                                   float(_r["exit_z"]),
-                                   float(_r["stop_z"]))
-    print(f"Per-pair parameters loaded from WFO (wfo_params.csv) "
-          f"({len(_opt_params)} pairs)")
+    _required = {"pair", "oos_start", "oos_end", "entry_z", "exit_z", "stop_z"}
+    if _required.issubset(_opt_df.columns):
+        _opt_df = _opt_df.copy()
+        _opt_df["oos_start"] = _opt_df["oos_start"].map(_as_eastern_timestamp)
+        _opt_df["oos_end"] = _opt_df["oos_end"].map(_as_eastern_timestamp)
+        for _c in ["entry_z", "exit_z", "stop_z"]:
+            _opt_df[_c] = pd.to_numeric(_opt_df[_c], errors="coerce")
+        _opt_df = _opt_df.dropna(subset=["entry_z", "exit_z", "stop_z"])
+        for _pair, _grp in _opt_df.sort_values(["pair", "oos_start"]).groupby("pair"):
+            _wfo_param_schedule[_pair] = _grp.reset_index(drop=True)
+            _last = _grp.sort_values("oos_end").iloc[-1]
+            _opt_params[_pair] = (float(_last["entry_z"]),
+                                  float(_last["exit_z"]),
+                                  float(_last["stop_z"]))
+        print(f"Time-varying WFO parameters loaded from wfo_params.csv "
+              f"({len(_wfo_param_schedule)} pairs, {len(_opt_df)} windows)")
+    else:
+        print("wfo_params.csv missing OOS schedule columns — will fall back to static params.")
 elif _opt_path.exists():
     _opt_df = pd.read_csv(_opt_path)
     for _, _r in _opt_df.iterrows():
@@ -1035,7 +1071,54 @@ else:
     print("No regime_thresholds.csv — using static ENTRY_Z_VOLATILE offset  "
           "(run regime_profiler.py for dynamic thresholds)")
 
+<<<<<<< HEAD
 # how much capital goes to each pair
+=======
+# ── Capital allocation weights per pair ───────────────────────────────────────
+def _historical_pair_correlation(labels: list[str]) -> pd.DataFrame | None:
+    """Estimate pair correlation from realized WFO trade P&L, if available."""
+    wfo_results = DATA_DIR / "wfo_results.csv"
+    if not wfo_results.exists():
+        return None
+    try:
+        hist = pd.read_csv(wfo_results, parse_dates=["exit_time"])
+    except Exception:
+        return None
+    if not {"pair", "exit_time", "net_pnl"}.issubset(hist.columns):
+        return None
+    hist = hist[hist["pair"].isin(labels)].copy()
+    if hist.empty:
+        return None
+    hist["exit_day"] = pd.to_datetime(hist["exit_time"], utc=True).dt.floor("D")
+    returns = (
+        hist.pivot_table(index="exit_day", columns="pair", values="net_pnl", aggfunc="sum")
+        .reindex(columns=labels)
+        .fillna(0.0)
+    )
+    if returns.shape[0] < 5 or returns.shape[1] < 2:
+        return None
+    try:
+        cov_hist = clean_covariance_rmt(returns) if clean_covariance_rmt is not None else returns.cov()
+    except Exception:
+        cov_hist = returns.cov()
+    diag = np.sqrt(np.clip(np.diag(cov_hist), 1e-12, None))
+    corr = cov_hist.to_numpy(dtype=float) / np.outer(diag, diag)
+    corr = np.clip(0.5 * (corr + corr.T), -0.99, 0.99)
+    np.fill_diagonal(corr, 1.0)
+    return pd.DataFrame(corr, index=labels, columns=labels)
+
+
+def _covariance_from_vol_and_history(labels: list[str], vol: pd.Series) -> pd.DataFrame:
+    vol = vol.reindex(labels).astype(float).clip(lower=1e-6)
+    corr = _historical_pair_correlation(labels)
+    if corr is None:
+        corr = pd.DataFrame(np.eye(len(labels)), index=labels, columns=labels)
+    cov = corr.to_numpy(dtype=float) * np.outer(vol.to_numpy(dtype=float), vol.to_numpy(dtype=float))
+    cov = 0.5 * (cov + cov.T)
+    return pd.DataFrame(cov, index=labels, columns=labels)
+
+
+>>>>>>> f1a5ae73df83f559ed61239be82cae998b4ec4b7
 def compute_pair_weights(pairs_df: pd.DataFrame,
                          opt_path,
                          method: str = ALLOCATION_METHOD,
@@ -1127,7 +1210,7 @@ def compute_pair_weights(pairs_df: pd.DataFrame,
             vol = pd.Series(1.0, index=labels)
         vol = vol.reindex(labels).replace([np.inf, -np.inf], np.nan)
         vol = vol.fillna(float(vol.median()) if vol.notna().any() else 1.0).clip(lower=1e-6)
-        cov = pd.DataFrame(np.diag(np.square(vol.to_numpy(dtype=float))), index=labels, columns=labels)
+        cov = _covariance_from_vol_and_history(labels, vol)
 
         try:
             optimizer = RegularizedPortfolioOptimizer(
@@ -1231,11 +1314,16 @@ for _, row in pairs.iterrows():
     df_sig = score_tail_ev_for_pair(df_sig, train_end=_oos_start, regime_dict=pair_regime)
     spread_daily = df_sig["spread"].resample('D').last().dropna()
 
-    # Use per-pair optimal params if available; otherwise fall back to MC
-    if row["pair"] in _opt_params:
+    # Use WFO params as a dated schedule. Static fallbacks are used only when a
+    # pair has no WFO row covering the backtest period.
+    pair_schedule = _wfo_param_schedule.get(row["pair"])
+    if pair_schedule is None or pair_schedule.empty:
+        pair_schedule = None
+
+    if pair_schedule is None and row["pair"] in _opt_params:
         opt_entry, opt_exit, opt_stop = _opt_params[row["pair"]]
         src = "grid"
-    else:
+    elif pair_schedule is None:
         theta_ou     = np.log(2) / max(float(half_life), 1.0)
         sigma_roll   = float(df_sig["spread"].std())
         avg_notional = float(closes[t1].mean() + beta * closes[t2].mean())
@@ -1248,37 +1336,81 @@ for _, row in pairs.iterrows():
     # Microstructure floor: raise entry_z if costs would eat the profit
     sigma_spread = float(df_sig["spread"].std())
     avg_notional = float(closes[t1].mean() + abs(beta) * closes[t2].mean())
-    z_floor = min_viable_entry_z(sigma_spread, avg_notional, opt_exit)
-    if z_floor > opt_entry:
-        print(f"  {row['pair']:12s}  [{src}→micro]  "
-              f"entry {opt_entry}→{z_floor:.2f}  exit={opt_exit:+.1f}  stop={opt_stop}  "
-              f"(cost floor: spread too narrow)")
-        opt_entry = round(z_floor, 2)
+    if pair_schedule is not None:
+        print(f"  {row['pair']:12s}  [WFO]  "
+              f"{len(pair_schedule)} dated parameter windows")
     else:
-        print(f"  {row['pair']:12s}  [{src}]  "
-              f"entry={opt_entry}  exit={opt_exit:+.1f}  stop={opt_stop}")
+        z_floor = min_viable_entry_z(sigma_spread, avg_notional, opt_exit)
+        if z_floor > opt_entry:
+            print(f"  {row['pair']:12s}  [{src}→micro]  "
+                  f"entry {opt_entry}→{z_floor:.2f}  exit={opt_exit:+.1f}  stop={opt_stop}  "
+                  f"(cost floor: spread too narrow)")
+            opt_entry = round(z_floor, 2)
+        else:
+            print(f"  {row['pair']:12s}  [{src}]  "
+                  f"entry={opt_entry}  exit={opt_exit:+.1f}  stop={opt_stop}")
 
     pair_weight   = _pair_weights.get(row["pair"], 1.0 / len(pairs))
     pair_max_notl = pair_weight * INITIAL_CAPITAL
     pair_half_life  = int(row.get("half_life_bars", 200))
     pair_hurst_f    = HurstFilter()   # fresh cache per pair
-    trades, _blocked = backtest_pair(df_sig, t1, t2, beta,
-                           pair_name=row["pair"],
-                           regime_dict=pair_regime,
-                           sizing_args=sizing_args,
-                           entry_z=opt_entry,
-                           exit_thresh=opt_exit,
-                           stop_thresh=opt_stop,
-                           coint_filter=_coint_filters.get(row["pair"]),
-                           macro_filter=_macro_filter,
-                           hurst_filter=pair_hurst_f,
-                           spread_daily=spread_daily,
-                           oos_start=_oos_start,
-                           max_hold_bars=pair_half_life * 2)
+    if pair_schedule is not None:
+        trade_parts = []
+        _blocked = dict(macro=0, size=0, tail=0, rvol=0, vel=0, coint=0, hurst=0, toxicity=0)
+        for _, wfo_row in pair_schedule.iterrows():
+            seg_start = wfo_row["oos_start"]
+            seg_end = wfo_row["oos_end"]
+            df_seg = df_sig[(df_sig.index >= seg_start) & (df_sig.index < seg_end)]
+            if df_seg.empty:
+                continue
+
+            seg_entry = float(wfo_row["entry_z"])
+            seg_exit = float(wfo_row["exit_z"])
+            seg_stop = float(wfo_row["stop_z"])
+            z_floor = min_viable_entry_z(sigma_spread, avg_notional, seg_exit)
+            if z_floor > seg_entry:
+                seg_entry = round(z_floor, 2)
+
+            seg_trades, seg_blocked = backtest_pair(
+                df_seg, t1, t2, beta,
+                pair_name=row["pair"],
+                regime_dict=pair_regime,
+                sizing_args=sizing_args,
+                entry_z=seg_entry,
+                exit_thresh=seg_exit,
+                stop_thresh=seg_stop,
+                coint_filter=_coint_filters.get(row["pair"]),
+                macro_filter=_macro_filter,
+                hurst_filter=pair_hurst_f,
+                spread_daily=spread_daily,
+                oos_start=seg_start,
+                max_hold_bars=pair_half_life * 2,
+            )
+            if not seg_trades.empty:
+                seg_trades["wfo_window"] = int(wfo_row["window"]) if "window" in wfo_row else np.nan
+                trade_parts.append(seg_trades)
+            for k, v in seg_blocked.items():
+                _blocked[k] = _blocked.get(k, 0) + int(v)
+        trades = pd.concat(trade_parts, ignore_index=True) if trade_parts else pd.DataFrame()
+    else:
+        trades, _blocked = backtest_pair(df_sig, t1, t2, beta,
+                               pair_name=row["pair"],
+                               regime_dict=pair_regime,
+                               sizing_args=sizing_args,
+                               entry_z=opt_entry,
+                               exit_thresh=opt_exit,
+                               stop_thresh=opt_stop,
+                               coint_filter=_coint_filters.get(row["pair"]),
+                               macro_filter=_macro_filter,
+                               hurst_filter=pair_hurst_f,
+                               spread_daily=spread_daily,
+                               oos_start=_oos_start,
+                               max_hold_bars=pair_half_life * 2)
 
     blocked_info = (f"blocked: macro={_blocked['macro']} size={_blocked['size']} "
                     f"tail={_blocked['tail']} rvol={_blocked['rvol']} "
-                    f"vel={_blocked['vel']} coint={_blocked['coint']} hurst={_blocked['hurst']}")
+                    f"vel={_blocked['vel']} coint={_blocked['coint']} "
+                    f"hurst={_blocked['hurst']} tox={_blocked.get('toxicity', 0)}")
     if trades.empty:
         print(f"  {row['pair']:12s}  0 trades  | {blocked_info}")
         continue
@@ -1297,14 +1429,44 @@ for p, data in pair_results.items():
 
 df_all = pd.concat(all_trades_list).sort_values("entry_time").reset_index(drop=True)
 
+
+def _build_margin_return_cov(trades_df: pd.DataFrame) -> pd.DataFrame | None:
+    needed = {"pair", "exit_time", "pnl_raw", "tx_cost_raw", "borrow_raw", "notional_raw"}
+    if not needed.issubset(trades_df.columns):
+        return None
+    tmp = trades_df.copy()
+    tmp["raw_return"] = (
+        (tmp["pnl_raw"] - tmp["tx_cost_raw"] - tmp["borrow_raw"])
+        / tmp["notional_raw"].replace(0, np.nan).abs()
+    )
+    tmp["exit_15m"] = pd.to_datetime(tmp["exit_time"], utc=True).dt.floor("15min")
+    ret = (
+        tmp.pivot_table(index="exit_15m", columns="pair", values="raw_return", aggfunc="sum")
+        .fillna(0.0)
+    )
+    if ret.shape[0] < 10 or ret.shape[1] == 0:
+        return None
+    try:
+        cov = clean_covariance_rmt(ret) if clean_covariance_rmt is not None and ret.shape[1] > 1 else ret.cov()
+    except Exception:
+        cov = ret.cov()
+    cov = cov.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if cov.shape[0] == 1 and float(cov.iloc[0, 0]) <= 0:
+        cov.iloc[0, 0] = max(float(ret.var().iloc[0]), 1e-12)
+    return cov
+
+
 # Tracks running portfolio equity across ALL trades from ALL pairs
 running_equity = INITIAL_CAPITAL
 final_trades = []
 open_trades = [] # List of active trades
 
 # Daily Portfolio Risk Control
-mar_detector = MarginSpiralDetector()
+mar_detector = MarginSpiralDetector() if MarginSpiralDetector is not None else None
 p_mc_threshold = 0.05 # Block entries if P_MC > 5%
+maint_margin_rate = 0.50
+margin_cov = _build_margin_return_cov(df_all)
+blocked_margin_entries = 0
 
 # Convex Overlay (Simulation)
 insurance_premium_daily = 0.0001 # 1 basis point per day cost
@@ -1324,6 +1486,7 @@ for i in range(len(df_all)):
     for j in sorted(closed_indices, reverse=True):
         open_trades.pop(j)
 
+<<<<<<< HEAD
     # margin-at-Risk (MaR) Entry Gate
     # Estimate current portfolio risk with this new trade
     current_notionals = [ot["notional_raw"] * (ot["capital_alloc"] / ot["notional_raw"]) for ot in open_trades]
@@ -1332,12 +1495,34 @@ for i in range(len(df_all)):
     # Check MaR (Simplified daily check using baseline cov)
     # In a full production system, we'd use the RMT-cleaned rolling cov here.
     
+=======
+>>>>>>> f1a5ae73df83f559ed61239be82cae998b4ec4b7
     # Capital allocation for this trade based on CURRENT portfolio equity
     pair_w = _pair_weights.get(p_name, 1.0 / len(pairs))
     capital_alloc = running_equity * pair_w
     
     # Units = (Allocation / Notional_at_entry) * Size_Multiplier
     u = (capital_alloc / max(tr["notional_raw"], 1.0)) * tr.get("size_mult", 1.0)
+
+    # ── Margin-at-Risk / P_MC entry gate ─────────────────────────────────────
+    if mar_detector is not None and margin_cov is not None and p_name in margin_cov.columns:
+        exposure = pd.Series(0.0, index=margin_cov.columns, dtype=float)
+        for ot in open_trades:
+            if ot["pair"] in exposure.index:
+                exposure.loc[ot["pair"]] += float(ot.get("capital_alloc", 0.0)) * float(ot.get("size_mult", 1.0))
+        exposure.loc[p_name] += float(capital_alloc) * float(tr.get("size_mult", 1.0))
+        maint_margin = float(exposure.abs().sum()) * maint_margin_rate
+        p_mc = mar_detector.calculate_p_mc(
+            weights=exposure.to_numpy(dtype=float),
+            equity=float(running_equity),
+            maint_margin=maint_margin,
+            covariance=margin_cov.to_numpy(dtype=float),
+            horizon_days=1.0,
+            n_sims=300,
+        )
+        if p_mc > p_mc_threshold:
+            blocked_margin_entries += 1
+            continue
     
     # Calculate dollar P&L
     d_gross  = tr["pnl_raw"] * u
@@ -1366,6 +1551,9 @@ for i in range(len(df_all)):
     final_trades.append(tr)
     
     # Equity is updated only when trades close (see above)
+
+if not final_trades:
+    raise SystemExit("No trades survived portfolio margin/P_MC gating.")
 
 df_trades = pd.DataFrame(final_trades).sort_values("exit_time")
 
@@ -1434,6 +1622,7 @@ print(f"\n{'='*60}")
 print(f"PORTFOLIO  ({len(pair_results)} pairs)  —  ${INITIAL_CAPITAL:,.0f} starting capital")
 print(f"{'='*60}")
 print(f"Trades:        {len(df_trades)}  ({trades_per_year:.0f}/yr)")
+print(f"Margin blocks: {blocked_margin_entries}  (P_MC threshold={p_mc_threshold:.0%})")
 print(f"Win rate:      {len(winning)/len(df_trades)*100:.1f}%")
 print(f"Stops:         {len(stops)}")
 print(f"Coint breaks:  {len(coint_breaks)}")
@@ -1464,6 +1653,10 @@ print(f"{'Pair':<12} {'Trades':>6} {'WR':>6} {'Net $':>9} {'Net P&L':>10} {'Shar
 print(f"{'─'*75}")
 for pair_name, data in pair_results.items():
     t  = data["trades"]
+    if t.empty:
+        print(f"{pair_name:<12} {0:>6} {'--':>6} {0.0:>+8.2f}$ {0.0:>+10.4f} "
+              f"{0.0:>7.2f} {'--':>8} {'MARGIN':>10}")
+        continue
     p  = t["net_pnl"]
     wr = (p > 0).mean() * 100
     tpy = len(t) / (days_total.days / 365.25)
