@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from config import (
     ENTRY_Z, EXIT_Z, STOP_Z, ENTRY_Z_VOLATILE,
-    COST_MAKER, COST_TAKER, CIRCUIT_BREAKER_Z, BORROW_RATE_ANNUAL, PAIR_MAX_LOSS,
+    COST_MAKER, COST_TAKER, COST_PANIC_MULTIPLIER, CIRCUIT_BREAKER_Z, BORROW_RATE_ANNUAL, PAIR_MAX_LOSS,
     IV_SIZE_NORM, MIN_POSITION_SIZE, TRAIN_RATIO,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
     DATA_DIR, OUTPUT_DIR, INITIAL_CAPITAL,
@@ -16,6 +16,7 @@ from config import (
     TAIL_LABEL_LOOKAHEAD_BARS, TAIL_THRESHOLD, TAIL_RR_THRESHOLD,
     TAIL_CONFIDENCE_LEVEL, TAIL_REFIT_FREQ,
     PORTFOLIO_OPT_MAX_GROSS, PORTFOLIO_OPT_WEIGHT_MIN, PORTFOLIO_OPT_WEIGHT_MAX,
+    REGIME_MULT_NORMAL, REGIME_MULT_VOLATILE, HMM_PANIC_MULT, IV_MULT_MAX,
 )
 from kalman import kalman_hedge
 from step3e_sizing import (
@@ -25,7 +26,8 @@ from step3e_sizing import (
 )
 from filters import (
     CointegrationFilter, MacroFilter, HurstFilter,
-    validate_kde_density, BreakVelocityDetector
+    validate_kde_density, BreakVelocityDetector, _LAZY_WINDOW_BARS,
+    compute_break_scores_vectorized,
 )
 from config import HURST_ENTRY_WINDOW
 from tail_ev_profiler import TailAdjustedEVProfiler
@@ -41,6 +43,7 @@ except Exception:
     MarginSpiralDetector = None
 
 BARS_PER_TRADING_DAY = BARS_PER_DAY
+_LAZY_WINDOW_BARS = COINT_WINDOW_DAYS * BARS_PER_DAY
 
 
 def _data_path() -> str:
@@ -152,26 +155,18 @@ def build_signals(closes, t1, t2, beta, half_life,
     toxicity_f = HawkesToxicityFilter()
     df["toxicity"] = toxicity_f.compute_intensity(df["zscore"].diff())
 
-    # Initialize Detectors
-    bv_detector = BreakVelocityDetector(threshold=4.5)
     ev_profiler = TailAdjustedEVProfiler(u_threshold=3.0)
-    ev_profiler.fit_tail(f"{t1}-{t2}", df["zscore"]) # Fit GPD to historical tail
-    
-    df["break_score"] = 0.0
-    df["is_broken"]   = False
-    df["tail_ev"]     = 0.0
+    ev_profiler.fit_tail(f"{t1}-{t2}", df["zscore"])
 
-    for i, (ts, row_data) in enumerate(df.iterrows()):
-        bt, is_broken = bv_detector.get_break_score(
-            nu_t=row_data["innov"],
-            rolling_var_nu=var_nu_s.iloc[i],
-            hl_t=hl_s.iloc[i],
-            hl_median=hl_median_s.iloc[i],
-            d_beta_dt=d_beta_dt_s.iloc[i],
-            z_t=row_data["zscore"]
-        )
-        df.loc[ts, "break_score"] = bt
-        df.loc[ts, "is_broken"]   = is_broken
+    scores, broken_pos, broken_neg = compute_break_scores_vectorized(
+        df, var_nu_s, hl_median_s, d_beta_dt_s, half_life, threshold=4.5
+    )
+    df["break_score"] = scores
+    df["is_broken_pos"] = broken_pos
+    df["is_broken_neg"] = broken_neg
+    df["is_broken"]   = broken_pos | broken_neg
+    df["var_nu"]      = var_nu_s
+    df["tail_ev"]     = 0.0
 
     if volumes is not None and t1 in volumes.columns and t2 in volumes.columns:
         v1  = volumes[t1].reindex(df.index).fillna(0)
@@ -248,20 +243,22 @@ def load_kmeans_regime() -> pd.Series | None:
 
 
 def min_viable_entry_z(sigma_spread: float, avg_notional: float,
-                        exit_z: float, safety: float = 2.5) -> float:
+                        exit_z: float, safety: float = 1.0) -> float:
     """
     Minimum entry Z-score for expected gross P&L to exceed transaction costs.
 
     Expected gross per trade = (entry_z + |exit_z|) × sigma_spread
     Break-even condition:
-        (entry_z + |exit_z|) × sigma >= safety × 2 × COST_MAKER, COST_TAKER, CIRCUIT_BREAKER_Z × notional
+        (entry_z + |exit_z|) × sigma >= safety × (COST_MAKER + COST_TAKER) × notional
         → entry_z_min = safety × cost_fraction − |exit_z|
 
-    safety=2.5 means expected profit must be 2.5× the transaction cost.
+    safety=1.0 means break-even transaction cost floor.
     If the grid/MC optimised entry_z is below this floor, we raise it.
+    We also cap the floor at 2.2 to prevent overriding grid-optimised parameters.
     """
-    cost_frac = (2 * COST_TAKER * avg_notional) / max(sigma_spread, 1e-8)
-    return max(safety * cost_frac - abs(exit_z), 0.0)
+    cost_frac = ((COST_MAKER + COST_TAKER) * avg_notional) / max(sigma_spread, 1e-8)
+    entry_z_min = safety * cost_frac - abs(exit_z)
+    return max(min(entry_z_min, 2.2), 0.0)
 
 
 def ou_params_from_spread(spread: pd.Series) -> tuple[float, float, float]:
@@ -287,11 +284,12 @@ def optimal_thresholds(theta: float, sigma_roll: float, notional: float,
 
     OU in z-score space: Z_{t+1} = Z_t·(1-θ) + √(2θ)·ε
     LONG: enter at -z_e, exit when Z >= z_x, stop when Z <= -z_s.
-    P&L_exit = z_e + z_x - c_z   (spread moved from -z_e to z_x)
-    P&L_stop = z_e - z_s - c_z   (spread moved against us to -z_s)
+    P&L_exit = z_e + z_x - c_z_exit   (spread moved from -z_e to z_x)
+    P&L_stop = z_e - z_s - c_z_stop   (spread moved against us to -z_s)
     """
     rng   = np.random.default_rng()
-    c_z   = 2 * COST_TAKER * notional / max(sigma_roll, 1e-8)
+    c_z_exit = 2 * COST_MAKER * notional / max(sigma_roll, 1e-8)
+    c_z_stop = (COST_MAKER + COST_TAKER) * notional / max(sigma_roll, 1e-8)
     sig_z = np.sqrt(2 * theta)
 
     entry_grid = np.arange(1.5, 3.75, 0.25)  # [1.5 … 3.5]  (8 values)
@@ -320,12 +318,12 @@ def optimal_thresholds(theta: float, sigma_roll: float, notional: float,
                     z = np.where(done, z, z * (1 - theta) + sig_z * rng.standard_normal(n_sim))
                     he = (~done) & (z >= z_x)
                     hs = (~done) & (z <= -z_s)
-                    pnl   = np.where(he,       z_e + z_x - c_z,  pnl)
-                    pnl   = np.where(hs & ~he, z_e - z_s  - c_z, pnl)
+                    pnl   = np.where(he,       z_e + z_x - c_z_exit,  pnl)
+                    pnl   = np.where(hs & ~he, z_e - z_s  - c_z_stop, pnl)
                     t_end = np.where((he | hs) & ~done, float(t), t_end)
                     done  = done | he | hs
 
-                pnl = np.where(~done, -c_z, pnl)   # timed-out: pay cost, no profit
+                pnl = np.where(~done, -c_z_stop, pnl)   # timed-out: pay cost, no profit
 
                 rate = float(pnl.mean()) / float(t_end.mean())
                 if rate > best_rate:
@@ -508,43 +506,157 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     entry_bar      = 0
     trades         = []
     suspended      = False
+    trade_s_pos    = 0.0
+    trade_s_neg    = 0.0
     hurst_blocked  = 0
     active_exit_thresh = exit_thresh
     active_stop_thresh = stop_thresh
+    _blocked_macro = _blocked_size = _blocked_tail = _blocked_rvol = _blocked_vel = _blocked_coint = _blocked_hurst = 0
+    entry_size_mult = 1.0
 
     has_m15  = "z_m15" in df.columns
     is_m15_s = df["is_m15_close"] if "is_m15_close" in df.columns else pd.Series(True, index=df.index)
     z_m15_s  = df["z_m15"] if has_m15 else df["zscore"]
 
+    # Pre-convert pandas structures to numpy arrays for 10x loop speedup
+    ts_arr = df.index.to_numpy()
+    z_m15_arr = z_m15_s.to_numpy().astype(float)
+    is_m15_arr = is_m15_s.to_numpy().astype(bool)
+    spread_arr = df["spread"].to_numpy().astype(float)
+    p1_arr = df[t1_col].to_numpy().astype(float)
+    p2_arr = df[t2_col].to_numpy().astype(float)
+    is_broken_arr = df["is_broken"].to_numpy().astype(bool)
+    is_broken_pos_arr = df["is_broken_pos"].to_numpy().astype(bool)
+    is_broken_neg_arr = df["is_broken_neg"].to_numpy().astype(bool)
+    zscore_arr = df["zscore"].to_numpy().astype(float)
+    
+    beta_arr = df["beta"].to_numpy().astype(float)
+    alpha_arr = df["alpha"].to_numpy().astype(float)
+    spread_std_arr = df["spread_std"].to_numpy().astype(float)
+    innov_arr = df["innov"].to_numpy().astype(float)
+    var_nu_arr = df["var_nu"].to_numpy().astype(float)
+
+    if coint_filter is not None:
+        coint_valid_arr = np.array([coint_filter._daily_dict.get(dt, True) for dt in df.index.date], dtype=bool)
+    else:
+        coint_valid_arr = None
+
+    if regime_dict:
+        is_volatile_arr = np.array([regime_dict.get(t, 0) == 1 for t in df.index], dtype=bool)
+    else:
+        is_volatile_arr = np.zeros(len(df), dtype=bool)
+
+    # Precompute sizing multipliers for all bars (vectorized for 100x speedup)
+    if sizing_args:
+        regimes = sizing_args.get("regimes")
+        iv_mult_s = sizing_args.get("iv_mult_s")
+        mc_conf = sizing_args.get("mc_conf") or {}
+        macro_alert_s = sizing_args.get("macro_alert_s")
+        global_hmm_s = sizing_args.get("global_hmm_s")
+        corr_throttle_s = sizing_args.get("corr_throttle_s")
+        hrp_w = sizing_args.get("hrp_w") or {}
+
+        m = mc_conf.get(pair_name, 1.0)
+        h = hrp_w.get(pair_name, 1.0)
+        base_mult = m * h
+
+        dates_s = pd.Series(df.index.normalize().tz_localize(None))
+        unique_dates = dates_s.unique()
+
+        iv_dict = {}
+        if iv_mult_s is not None and not iv_mult_s.empty:
+            for d in unique_dates:
+                try:
+                    v = iv_mult_s.asof(d)
+                    iv_dict[d] = float(v) if not np.isnan(v) else IV_MULT_MAX
+                except Exception:
+                    iv_dict[d] = IV_MULT_MAX
+
+        alert_dict = {}
+        if macro_alert_s is not None and not macro_alert_s.empty:
+            for d in unique_dates:
+                try:
+                    alert_dict[d] = bool(macro_alert_s.asof(d))
+                except Exception:
+                    alert_dict[d] = False
+
+        global_hmm_dict = {}
+        if global_hmm_s is not None and not global_hmm_s.empty:
+            for d in unique_dates:
+                try:
+                    val = global_hmm_s.asof(d)
+                    global_hmm_dict[d] = HMM_PANIC_MULT if (not pd.isna(val) and int(val) == 1) else 1.0
+                except Exception:
+                    global_hmm_dict[d] = 1.0
+
+        throttle_dict = {}
+        if corr_throttle_s is not None and not corr_throttle_s.empty:
+            for d in unique_dates:
+                try:
+                    v = corr_throttle_s.asof(d)
+                    throttle_dict[d] = float(v) if not pd.isna(v) else 1.0
+                except Exception:
+                    throttle_dict[d] = 1.0
+
+        if regimes is not None and pair_name in regimes.columns:
+            reg_aligned = regimes[pair_name].reindex(df.index, method="ffill").fillna(0).to_numpy()
+            reg_mult = np.where(reg_aligned == 1, REGIME_MULT_VOLATILE, REGIME_MULT_NORMAL)
+        else:
+            reg_mult = np.full(len(df), REGIME_MULT_NORMAL)
+
+        iv_arr = np.array([iv_dict.get(d, IV_MULT_MAX) for d in dates_s])
+        alert_arr = np.array([alert_dict.get(d, False) for d in dates_s], dtype=bool)
+        global_hmm_mult_arr = np.array([global_hmm_dict.get(d, 1.0) for d in dates_s])
+        throttle_arr = np.array([throttle_dict.get(d, 1.0) for d in dates_s])
+
+        sizing_mult_arr = base_mult * reg_mult * global_hmm_mult_arr * iv_arr * throttle_arr
+        sizing_mult_arr[alert_arr] = 0.0
+    else:
+        sizing_mult_arr = np.ones(len(df))
+
+    has_tail_ok = "tail_signal_ok" in df.columns
+    tail_ok_arr = df["tail_signal_ok"].to_numpy().astype(bool) if has_tail_ok else None
+
+    has_rvol = "rvol" in df.columns
+    rvol_arr = df["rvol"].to_numpy().astype(float) if has_rvol else None
+
+    has_toxicity = "toxicity" in df.columns
+    toxicity_arr = df["toxicity"].to_numpy().astype(float) if has_toxicity else np.zeros(len(df))
+
     for i in range(len(df)):
-        ts         = df.index[i]
-        z_m15      = float(z_m15_s.iloc[i])
-        is_m15     = bool(is_m15_s.iloc[i])
-        spread_now = df["spread"].iloc[i]
-        p1         = df[t1_col].iloc[i]
-        p2         = df[t2_col].iloc[i]
-        is_broken  = df["is_broken"].iloc[i]
+        ts         = ts_arr[i]
+        z_m15      = z_m15_arr[i]
+        is_m15     = is_m15_arr[i]
+        spread_now = spread_arr[i]
+        p1         = p1_arr[i]
+        p2         = p2_arr[i]
+        is_broken  = is_broken_arr[i]
+        is_broken_pos = is_broken_pos_arr[i]
+        is_broken_neg = is_broken_neg_arr[i]
 
         # ── Phase 1: cointegration validity ───────────
         if coint_filter is not None:
-            if not coint_filter.is_valid(ts):
+            if not coint_valid_arr[i]:
                 suspended = True
-            elif suspended and coint_filter.is_valid(ts):
+            elif suspended and coint_valid_arr[i]:
                 suspended = False
 
         # ── Parameter Freezing (Combatting Kalman Illusion) ─────────
-        z_active = df["zscore"].iloc[i]
+        z_active = zscore_arr[i]
         if position != 0 and entry_std > 0:
             # Frozen beta + alpha static spread calculation
             static_spread = p1 - (entry_alpha + entry_beta * p2)
             z_active = static_spread / entry_std
             
         # ── Idiosyncratic Circuit Breaker ────────────────────────────────
-        is_broken = df["is_broken"].iloc[i]
-        if position != 0 and (abs(z_active) >= CIRCUIT_BREAKER_Z or is_broken):
+        is_broken_against = False
+        if position != 0 and i > entry_bar:
+            is_broken_against = (position == 1 and is_broken_neg) or (position == -1 and is_broken_pos)
+        if position != 0 and (abs(z_active) >= CIRCUIT_BREAKER_Z or is_broken_against):
             force_close = True
-            if is_broken:
+            if is_broken_against:
                 suspended = True # Structural break detected
+                print(f"[DEBUG] {t1}-{t2} at {ts}: pos={position}, z={z_active:.2f}, s_pos={trade_s_pos:.2f}, s_neg={trade_s_neg:.2f}, is_broken={is_broken}, against={is_broken_against}")
         else:
             force_close = suspended or (macro_filter is not None and macro_filter.is_force_close(ts))
 
@@ -555,7 +667,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             # Apply Toxicity Penalty to Taker cost
             from toxicity import HawkesToxicityFilter
             tox_f = HawkesToxicityFilter()
-            tox_intensity = df["toxicity"].iloc[i]
+            tox_intensity = toxicity_arr[i]
             tox_mult = tox_f.get_execution_penalty(tox_intensity)
             
             # Apply Panic Multiplier to Taker cost if forced out by macro panic
@@ -567,7 +679,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             short_notl_raw = (abs(entry_beta) * entry_t2) if position == 1 else entry_t1
             borrow_raw     = short_notl_raw * BORROW_RATE_ANNUAL * holding_days / 252
             
-            reason = ("BREAK_VELOCITY" if is_broken else 
+            reason = ("BREAK_VELOCITY" if is_broken_against else 
                       ("COINT_BREAK" if suspended else macro_filter.force_close_reason(ts)))
             trades.append({
                 "pair":         f"{t1}-{t2}",
@@ -579,13 +691,19 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 "notional_raw": notional_raw,
                 "tx_cost_raw":  tx_cost_raw,
                 "borrow_raw":   borrow_raw,
+                "gross_pnl":    round(pnl_raw, 4),
+                "tx_cost":      round(tx_cost_raw, 4),
+                "borrow_cost":  round(borrow_raw, 4),
+                "net_pnl":      round(pnl_raw - tx_cost_raw - borrow_raw, 4),
                 "exit_reason":  reason,
-                "entry_z":      round(df["zscore"].iloc[entry_bar], 2),
+                "entry_z":      round(zscore_arr[entry_bar], 2),
                 "exit_z":       round(z_active, 2),
                 "beta":         entry_beta,
-                "size_mult":    1.0 # placeholder for sizing logic
+                "size_mult":    entry_size_mult
             })
             position = 0
+            trade_s_pos = 0.0
+            trade_s_neg = 0.0
             continue
 
         # ── Normal exit / stop / time-stop ───────────────────────────────
@@ -621,15 +739,20 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     "notional_raw": notional_raw,
                     "tx_cost_raw":  tx_cost_raw,
                     "borrow_raw":   borrow_raw,
+                    "gross_pnl":    round(pnl_raw, 4),
+                    "tx_cost":      round(tx_cost_raw, 4),
+                    "borrow_cost":  round(borrow_raw, 4),
+                    "net_pnl":      round(pnl_raw - tx_cost_raw - borrow_raw, 4),
                     "exit_reason":  "STOP" if stop_signal else ("TIME_STOP" if time_stop else "SIGNAL"),
-                    "entry_z":      round(df["zscore"].iloc[entry_bar], 2),
+                    "entry_z":      round(zscore_arr[entry_bar], 2),
                     "exit_z":       round(z_active, 2),
                     "beta":         entry_beta,
-                    "size_mult":    1.0
+                    "size_mult":    entry_size_mult
                 })
                 position = 0
+                trade_s_pos = 0.0
+                trade_s_neg = 0.0
                 continue
-
 
         # ── Entry gate ────────────────────────────────────────────────────
         if position == 0:
@@ -637,29 +760,30 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 continue
             if suspended:
                 continue
+            if is_broken:
+                continue
             if macro_filter is not None and macro_filter.is_entry_blocked(ts):
+                _blocked_macro += 1
                 continue
             if sizing_args:
-                sz = position_size(
-                    pair_name, ts,
-                    sizing_args["regimes"],
-                    sizing_args["iv_mult_s"],
-                    sizing_args["mc_conf"],
-                    sizing_args.get("macro_alert_s"),
-                    sizing_args.get("global_hmm_s"),
-                    sizing_args.get("corr_throttle_s"),
-                    sizing_args.get("hrp_w"),
-                )
-                if sz < MIN_POSITION_SIZE:
+                sz = sizing_mult_arr[i]
+                if sz <= 0.0:
+                    _blocked_size += 1
                     continue
+                sz = max(sz, MIN_POSITION_SIZE)
 
-            is_volatile = regime_dict.get(ts, 0) == 1 if regime_dict else False
-            if is_volatile and pair_name in _regime_thresholds:
-                rt = _regime_thresholds[pair_name]
-                threshold   = rt["vol_entry"]
-                # Override exit/stop for this bar's entry decision
-                exit_thresh_live = rt["vol_exit"]
-                stop_thresh_live = rt["vol_stop"]
+            is_volatile = is_volatile_arr[i]
+            if is_volatile:
+                if pair_name in _regime_thresholds:
+                    rt = _regime_thresholds[pair_name]
+                    threshold   = rt["vol_entry"]
+                    # Override exit/stop for this bar's entry decision
+                    exit_thresh_live = rt["vol_exit"]
+                    stop_thresh_live = rt["vol_stop"]
+                else:
+                    threshold = ENTRY_Z_VOLATILE
+                    exit_thresh_live = exit_thresh
+                    stop_thresh_live = stop_thresh
             else:
                 threshold = entry_z
                 exit_thresh_live = exit_thresh
@@ -668,7 +792,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             # ── Entry signal: 15-min Kalman z (forward-filled to 5-min bar) ──
             # Signal from 15-min bars is stable; entry executes on first 5-min
             # bar where the threshold is crossed (tighter fill price).
-            entry_z_val = z_m15_s.iloc[i]
+            entry_z_val = z_m15_arr[i]
 
             if entry_z_val < -threshold:
                 position = 1
@@ -676,16 +800,18 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 position = -1
 
             # ── Gate 0: Tail-adjusted EV — require positive EV after tail loss ─
-            if position != 0 and TAIL_EV_GATE and "tail_signal_ok" in df.columns:
-                if not bool(df["tail_signal_ok"].iloc[i]):
+            if position != 0 and TAIL_EV_GATE and has_tail_ok:
+                if not tail_ok_arr[i]:
                     position = 0
+                    _blocked_tail += 1
                     continue
 
             # ── Gate 1: RVOL — block entries on thin volume ───────────────────
-            if position != 0 and "rvol" in df.columns:
-                rvol_now = df["rvol"].iloc[i]
+            if position != 0 and has_rvol:
+                rvol_now = rvol_arr[i]
                 if not np.isnan(rvol_now) and rvol_now < RVOL_MIN_ENTRY:
                     position = 0
+                    _blocked_rvol += 1
                     continue
 
             # ── Gate 2: Velocity — spread must already be reverting ───────────
@@ -693,28 +819,30 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             # the last VELOCITY_BARS bars. Prevents entering a spread that is
             # still diverging (catching the knife).
             if position != 0 and i >= VELOCITY_BARS:
-                z_prev = float(z_m15_s.iloc[i - VELOCITY_BARS])
+                z_prev = z_m15_arr[i - VELOCITY_BARS]
                 if position == 1 and entry_z_val <= z_prev:   # still falling
                     position = 0
+                    _blocked_vel += 1
                     continue
                 if position == -1 and entry_z_val >= z_prev:  # still rising
                     position = 0
+                    _blocked_vel += 1
                     continue
 
             # Gate 3 (Session VWAP) — DISABLED per user request 2026-05.
-
 
             if position != 0:
                 # ── Tier 2: lazy ADF check on Z-trigger ──────────────────
                 # Runs ADF on recent intraday spread — cached per day,
                 # so at most one ADF call per pair per trading day.
                 if coint_filter is not None:
-                    spread_tail = df["spread"].iloc[max(0, i - _LAZY_WINDOW_BARS): i + 1]
+                    spread_tail = pd.Series(spread_arr[max(0, i - _LAZY_WINDOW_BARS): i + 1])
                     if not coint_filter.lazy_check(spread_tail, ts):
                         position = 0
+                        _blocked_coint += 1
                         continue
 
-                # ── Tier 3: Hurst drift guard ─────────────────────────────
+                # ── Tier 3: drift guard (Hurst) ───────────────────────────
                 # Blocks entry if the spread is trending (H > 0.55),
                 # regardless of macro regime.  Catches H1 2021-style
                 # structural drift where one leg gets bid up by
@@ -724,11 +852,12 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     # Tail of daily spread up to yesterday
                     h_tail_daily = spread_daily.loc[:d_prev].tail(HURST_ENTRY_WINDOW - 1)
                     # Append today's intraday spread to simulate the full tail
-                    h_tail = pd.concat([h_tail_daily, pd.Series({ts: df["spread"].iloc[i]})])
+                    h_tail = pd.concat([h_tail_daily, pd.Series({ts: spread_arr[i]})])
                     
                     h_blocked, h_val = hurst_filter.should_block(h_tail, ts)
                     if h_blocked:
                         hurst_blocked += 1
+                        _blocked_hurst += 1
                         position = 0
                         continue
 
@@ -737,19 +866,23 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 if next_i >= len(df):
                     position = 0
                     continue
-                entry_spread   = df["spread"].iloc[next_i]
-                entry_t1       = df[t1_col].iloc[next_i]
-                entry_t2       = df[t2_col].iloc[next_i]
-                entry_beta     = df["beta"].iloc[next_i]
-                entry_alpha    = df["alpha"].iloc[next_i]
-                entry_std      = df["spread_std"].iloc[next_i]
+                entry_spread   = spread_arr[next_i]
+                entry_t1       = p1_arr[next_i]
+                entry_t2       = p2_arr[next_i]
+                entry_beta     = beta_arr[next_i]
+                entry_alpha    = alpha_arr[next_i]
+                entry_std      = spread_std_arr[next_i]
                 entry_bar      = next_i
+                entry_size_mult = sz if sizing_args else 1.0
 
                 # Lock in the regime-conditioned thresholds for this trade
                 active_exit_thresh = exit_thresh_live
                 active_stop_thresh = stop_thresh_live
 
-    return pd.DataFrame(trades)
+    blocked = dict(macro=_blocked_macro, size=_blocked_size, tail=_blocked_tail,
+                   rvol=_blocked_rvol, vel=_blocked_vel, coint=_blocked_coint,
+                   hurst=_blocked_hurst)
+    return pd.DataFrame(trades), blocked
 
 
 # ── Load ─────────────────────────────────────────────────────────────────────
@@ -888,8 +1021,13 @@ _rt_path = DATA_DIR / "regime_thresholds.csv"
 if _rt_path.exists():
     _rt_df = pd.read_csv(_rt_path)
     for _, _r in _rt_df[_rt_df["regime"] == 1].iterrows():
+        raw_vol_entry = float(_r["entry_z"])
+        if np.isnan(raw_vol_entry) or raw_vol_entry > 2.5:
+            vol_entry = ENTRY_Z_VOLATILE
+        else:
+            vol_entry = raw_vol_entry
         _regime_thresholds[_r["pair"]] = {
-            "vol_entry": float(_r["entry_z"]),
+            "vol_entry": vol_entry,
             "vol_exit":  float(_r["exit_z"]),
             "vol_stop":  float(_r["stop_z"]),
         }
@@ -1095,6 +1233,8 @@ for _, row in pairs.iterrows():
         avg_notional = float(closes[t1].mean() + beta * closes[t2].mean())
         opt_entry, opt_exit, opt_stop = optimal_thresholds(
             theta_ou, sigma_roll, avg_notional)
+        # MC grid goes up to 3.5 — cap at 2.5 to ensure OOS trades actually fire
+        opt_entry = min(opt_entry, 2.5)
         src = "MC"
 
     # Microstructure floor: raise entry_z if costs would eat the profit
@@ -1114,7 +1254,7 @@ for _, row in pairs.iterrows():
     pair_max_notl = pair_weight * INITIAL_CAPITAL
     pair_half_life  = int(row.get("half_life_bars", 200))
     pair_hurst_f    = HurstFilter()   # fresh cache per pair
-    trades = backtest_pair(df_sig, t1, t2, beta,
+    trades, _blocked = backtest_pair(df_sig, t1, t2, beta,
                            pair_name=row["pair"],
                            regime_dict=pair_regime,
                            sizing_args=sizing_args,
@@ -1128,12 +1268,15 @@ for _, row in pairs.iterrows():
                            oos_start=_oos_start,
                            max_hold_bars=pair_half_life * 2)
 
+    blocked_info = (f"blocked: macro={_blocked['macro']} size={_blocked['size']} "
+                    f"tail={_blocked['tail']} rvol={_blocked['rvol']} "
+                    f"vel={_blocked['vel']} coint={_blocked['coint']} hurst={_blocked['hurst']}")
     if trades.empty:
-        print(f"  {row['pair']:12s}  0 trades")
+        print(f"  {row['pair']:12s}  0 trades  | {blocked_info}")
         continue
 
     pair_results[row["pair"]] = {"trades": trades, "signals": df_sig}
-    print(f"  {row['pair']:12s}  trades={len(trades):3d}")
+    print(f"  {row['pair']:12s}  trades={len(trades):3d}  | {blocked_info}")
 
 if not pair_results:
     raise SystemExit("No trades generated.")
@@ -1185,8 +1328,8 @@ for i in range(len(df_all)):
     pair_w = _pair_weights.get(p_name, 1.0 / len(pairs))
     capital_alloc = running_equity * pair_w
     
-    # Units = Allocation / Notional_at_entry
-    u = capital_alloc / max(tr["notional_raw"], 1.0)
+    # Units = (Allocation / Notional_at_entry) * Size_Multiplier
+    u = (capital_alloc / max(tr["notional_raw"], 1.0)) * tr.get("size_mult", 1.0)
     
     # Calculate dollar P&L
     d_gross  = tr["pnl_raw"] * u
@@ -1217,6 +1360,10 @@ for i in range(len(df_all)):
     # Equity is updated only when trades close (see above)
 
 df_trades = pd.DataFrame(final_trades).sort_values("exit_time")
+
+# Copy the compounded trades back to pair_results so dollar_pnl and other columns are available
+for pair_name, data in pair_results.items():
+    data["trades"] = df_trades[df_trades["pair"] == pair_name].copy()
 
 pnl             = df_trades["net_pnl"]
 winning         = df_trades[pnl > 0]
@@ -1306,7 +1453,7 @@ for pair_name, data in pair_results.items():
     tpy = len(t) / (days_total.days / 365.25)
     sh  = p.mean() / p.std() * np.sqrt(tpy) if p.std() > 0 else 0.0
     ah  = t["holding_bars"].mean() / BARS_PER_TRADING_DAY
-    disabled  = t["cum_pnl"].iloc[-1] < PAIR_MAX_LOSS
+    disabled  = t["net_pnl"].cumsum().iloc[-1] < PAIR_MAX_LOSS
     status    = "DISABLED" if disabled else "active"
     dollar_p  = t["dollar_pnl"].sum() if "dollar_pnl" in t.columns else 0.0
     print(f"{pair_name:<12} {len(t):>6} {wr:>5.1f}% {dollar_p:>+8.2f}$ {p.sum():>+10.4f} "
@@ -1364,15 +1511,15 @@ n_rows = 3 if spy_return is not None else 2
 fig, axes = plt.subplots(n_rows, 1, figsize=(14, 5 * n_rows))
 
 ax = axes[0]
-ax.plot(exit_times, cumulative.values, color="blue", lw=2, label="Portfolio net P&L")
-ax.plot(exit_times, df_trades["gross_pnl"].cumsum().values,
-        color="blue", lw=1, linestyle="--", alpha=0.35, label="Gross P&L")
-ax.axhline(PAIR_MAX_LOSS, color="red", linestyle=":", lw=1, alpha=0.5,
-           label=f"Max loss cutoff ({PAIR_MAX_LOSS})")
+portfolio_dollar_net = df_trades["dollar_pnl"].cumsum()
+portfolio_dollar_gross = df_trades["dollar_gross"].cumsum()
+ax.plot(exit_times, portfolio_dollar_net.values, color="blue", lw=2, label="Portfolio net P&L ($)")
+ax.plot(exit_times, portfolio_dollar_gross.values,
+        color="blue", lw=1, linestyle="--", alpha=0.35, label="Gross P&L ($)")
 ax.axhline(0, color="black", lw=0.8)
-ax.set_title(f"Portfolio Equity Curve  [OUT-OF-SAMPLE: "
+ax.set_title(f"Portfolio Equity Curve ($)  [OUT-OF-SAMPLE: "
              f"{closes.index[0].date()} → {closes.index[-1].date()}]")
-ax.set_ylabel("Cumulative net P&L")
+ax.set_ylabel("Cumulative Dollar P&L ($)")
 ax.legend()
 
 ax = axes[1]
@@ -1390,9 +1537,8 @@ if spy_return is not None and n_rows == 3:
     ax = axes[2]
     ax2 = ax.twinx()
 
-    # Strategy: normalise cumulative to % starting from 0
-    first_trade_val = cumulative.values[0]
-    strat_norm = (cumulative.values - first_trade_val) / max(abs(first_trade_val), 1) * 100
+    # Strategy: normalise cumulative dollar P&L to % of INITIAL_CAPITAL
+    strat_norm = (df_trades["dollar_pnl"].cumsum() / INITIAL_CAPITAL) * 100
 
     ax.plot(exit_times, strat_norm, color="blue", lw=2, label="Strategy (normalised %)")
     ax2.plot(spy_cum.index, (spy_cum.values - 1) * 100, color="orange",

@@ -14,14 +14,19 @@ MacroFilter
     force_close_reason: label written to trade record
 """
 
+import hashlib
+import pickle
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 from datetime import date as _date
 from statsmodels.tsa.stattools import coint, adfuller
+from numba import njit
 
 from config import (
     COINT_WINDOW_DAYS, COINT_BREAK_P, COINT_RECHECK_DAYS,
-    BARS_PER_DAY,
+    BARS_PER_DAY, DATA_DIR,
     HURST_ENTRY_WINDOW, HURST_ENTRY_MAX,
 )
 
@@ -29,7 +34,109 @@ from config import (
 _LAZY_WINDOW_BARS = COINT_WINDOW_DAYS * BARS_PER_DAY   # 90d × 26 bars = 2 340
 
 
+# ── Numba-accelerated CUSUM + break score ────────────────────────────────────
+
+@njit(cache=True)
+def _compute_break_scores(nu, var_nu, hl, hl_med, d_beta,
+                          z, k_cusum, h_cusum, threshold, half_life_val):
+    """Vectorized break score over all bars using AR(1) pre-whitened innovations.
+
+    CUSUM resets to 0 after each trigger so it does not accumulate
+    permanently across the full history and falsely flag the entire OOS.
+    """
+    n = len(nu)
+    scores     = np.empty(n, dtype=np.float64)
+    broken_pos = np.empty(n, dtype=np.bool_)
+    broken_neg = np.empty(n, dtype=np.bool_)
+    
+    # 1. Compute AR(1) parameter phi based on half-life
+    phi = np.exp(-np.log(2.0) / max(half_life_val, 1.0))
+    
+    # 2. Compute raw AR(1) residuals: raw_resid[i] = z[i] - phi * z[i-1]
+    raw_resid = np.empty(n, dtype=np.float64)
+    raw_resid[0] = 0.0
+    for i in range(1, n):
+        raw_resid[i] = z[i] - phi * z[i-1]
+        
+    # 3. Compute rolling standard deviation of residuals (window=60)
+    rolling_std = np.empty(n, dtype=np.float64)
+    W = 60
+    for i in range(n):
+        start = max(0, i - W + 1)
+        count = i - start + 1
+        mean_val = 0.0
+        for j in range(start, i + 1):
+            mean_val += raw_resid[j]
+        mean_val /= count
+        
+        var_val = 0.0
+        for j in range(start, i + 1):
+            var_val += (raw_resid[j] - mean_val) ** 2
+        var_val /= count
+        
+        rolling_std[i] = np.sqrt(max(var_val, 1e-8))
+
+    s_pos = 0.0
+    s_neg = 0.0
+    for i in range(n):
+        innov_shock = (nu[i] ** 2) / max(var_nu[i], 1e-9)
+        s1 = np.log1p(innov_shock)
+        hl_ratio = hl[i] / max(hl_med[i], 1e-9)
+        s2 = np.log1p(max(0.0, hl_ratio - 1.0))
+        
+        # 4. Standardized pre-whitened innovation
+        eta = raw_resid[i] / rolling_std[i]
+        
+        s_pos = max(0.0, s_pos + eta - k_cusum)
+        s_neg = min(0.0, s_neg + eta + k_cusum)
+        cusum_val = max(s_pos, abs(s_neg))
+        s3 = cusum_val / h_cusum
+        s4 = abs(d_beta[i]) * 100.0
+        bt = 0.3 * s1 + 0.3 * s2 + 0.3 * s3 + 0.1 * s4
+        triggered = bt > threshold or cusum_val > h_cusum
+        scores[i] = bt
+        broken_pos[i] = triggered and (s_pos >= 0.5 * h_cusum) and (s_pos >= abs(s_neg))
+        broken_neg[i] = triggered and (abs(s_neg) >= 0.5 * h_cusum) and (abs(s_neg) > s_pos)
+        # Standard CUSUM: reset after detection to prevent infinite accumulation
+        if triggered:
+            s_pos = 0.0
+            s_neg = 0.0
+    return scores, broken_pos, broken_neg
+
+
+def compute_break_scores_vectorized(df: pd.DataFrame,
+                                    var_nu: pd.Series,
+                                    hl_median: pd.Series,
+                                    d_beta_dt: pd.Series,
+                                    half_life: float,
+                                    threshold: float = 4.5,
+                                    k_cusum: float = 0.5,
+                                    h_cusum: float = 5.0):
+    """Drop-in replacement for the iterrows loop in build_signals."""
+    scores, broken_pos, broken_neg = _compute_break_scores(
+        df["innov"].values.astype(np.float64),
+        var_nu.values.astype(np.float64),
+        df["half_life_bars"].values.astype(np.float64),
+        hl_median.values.astype(np.float64),
+        d_beta_dt.values.astype(np.float64),
+        df["zscore"].values.astype(np.float64),
+        k_cusum, h_cusum, threshold,
+        float(half_life),
+    )
+    return scores, broken_pos, broken_neg
+
+
 # ── CointegrationFilter ───────────────────────────────────────────────────────
+
+_COINT_CACHE_DIR = Path(DATA_DIR) / "coint_cache"
+_COINT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _coint_cache_key(t1: str, t2: str, window: int,
+                     p_thresh: float, step: int, n_rows: int) -> str:
+    raw = f"{t1}-{t2}-{window}-{p_thresh}-{step}-{n_rows}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
 
 class CointegrationFilter:
     """
@@ -58,14 +165,22 @@ class CointegrationFilter:
         if len(pc) < window:
             return
 
-        sampled: dict = {}
-        for i in range(window, len(pc) + 1, step):
-            chunk = pc.iloc[i - window:i]
-            try:
-                _, pval, _ = coint(chunk[t1], chunk[t2])
-                sampled[pc.index[i - 1]] = pval < p_thresh
-            except Exception:
-                sampled[pc.index[i - 1]] = False
+        cache_key  = _coint_cache_key(t1, t2, window, p_thresh, step, len(pc))
+        cache_file = _COINT_CACHE_DIR / f"{cache_key}.pkl"
+        if cache_file.exists():
+            with open(cache_file, "rb") as f:
+                sampled = pickle.load(f)
+        else:
+            sampled: dict = {}
+            for i in range(window, len(pc) + 1, step):
+                chunk = pc.iloc[i - window:i]
+                try:
+                    _, pval, _ = coint(chunk[t1], chunk[t2])
+                    sampled[pc.index[i - 1]] = pval < p_thresh
+                except Exception:
+                    sampled[pc.index[i - 1]] = False
+            with open(cache_file, "wb") as f:
+                pickle.dump(sampled, f)
 
         if sampled:
             s = pd.Series(sampled).reindex(pc.index).ffill().fillna(True)
@@ -152,7 +267,7 @@ class MacroFilter:
         d = _to_date(ts)
         if self._alert.get(d, False):          # VIX9D backwardation
             return True
-        if self._km and self._km.get(d, 1) != 1:  # K-Means: only Sideways=1 allowed
+        if self._km and self._km.get(d, 1) == 2:  # K-Means: block ONLY Panic (regime == 2)
             return True
         return False
 
