@@ -327,14 +327,53 @@ def main() -> None:
         print("No time-series data available — cannot build sizing grid.")
         raise SystemExit(0)
 
+    # Convert timestamps to tz-naive normalized dates
+    dates_naive = timestamps.normalize().tz_localize(None)
+
+    # Pre-align daily series to timestamps once (outside the loop)
+    if macro_alert_s is not None and not macro_alert_s.empty:
+        macro_alert_aligned = macro_alert_s.asof(dates_naive).fillna(0).astype(int).to_numpy()
+    else:
+        macro_alert_aligned = np.zeros(len(timestamps), dtype=int)
+
+    if global_hmm_s is not None and not global_hmm_s.empty:
+        global_hmm_aligned = global_hmm_s.asof(dates_naive).fillna(0).astype(int).to_numpy()
+        g_mult = np.where(global_hmm_aligned == 1, HMM_PANIC_MULT, 1.0)
+    else:
+        g_mult = np.ones(len(timestamps))
+
+    if not iv_mult_s.empty:
+        i_mult = iv_mult_s.asof(dates_naive).fillna(IV_MULT_MAX).to_numpy()
+    else:
+        i_mult = np.full(len(timestamps), IV_MULT_MAX)
+
+    if corr_throttle_s is not None and not corr_throttle_s.empty:
+        c_mult = corr_throttle_s.asof(dates_naive).fillna(1.0).to_numpy()
+    else:
+        c_mult = np.ones(len(timestamps))
+
     sizes = {}
     for pair in pair_names:
-        col = []
-        for ts in timestamps:
-            col.append(position_size(pair, ts, regimes, iv_mult_s, mc_conf,
-                                     macro_alert_s, global_hmm_s,
-                                     corr_throttle_s, hrp_w))
-        sizes[pair] = col
+        # Per-pair HMM regime multiplier
+        if regimes is not None and pair in regimes.columns:
+            regime_series = regimes[pair].reindex(timestamps).fillna(0).to_numpy()
+            r_mult = np.where(regime_series == 1, REGIME_MULT_VOLATILE, REGIME_MULT_NORMAL)
+        else:
+            r_mult = np.full(len(timestamps), REGIME_MULT_NORMAL)
+
+        # MC confidence (scalar)
+        m = mc_conf.get(pair, 1.0)
+
+        # HRP weight (scalar)
+        h = hrp_w.get(pair, 1.0) if hrp_w else 1.0
+
+        # Vectorised multiplication
+        sz = r_mult * g_mult * i_mult * m * c_mult * h
+        
+        # Apply VIX9D backwardation block/multiplier (alert -> size *= 0.5)
+        sz = np.where(macro_alert_aligned == 1, sz * 0.5, sz)
+        
+        sizes[pair] = sz
 
     df_sizes = pd.DataFrame(sizes, index=timestamps)
 

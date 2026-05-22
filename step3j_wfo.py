@@ -28,6 +28,7 @@ import argparse
 import itertools
 import numpy as np
 import pandas as pd
+from numba import njit
 import scipy.optimize as opt
 from sklearn.ensemble import HistGradientBoostingClassifier
 import matplotlib
@@ -62,10 +63,16 @@ N_COMBOS = len(COMBOS)
 # A 12m OOS window gives ~6 months to trade; a pair with HL > 90 days
 # will barely complete one full cycle — it's a 'lazy' cointegration.
 HL_MAX_DAYS = 90   # calendar days (will be converted to bars inside)
+WFO_SIGNAL_WARMUP_BARS = 200  # max rolling z/VWAP lookback used by build_signals()
 
 
+<<<<<<< HEAD
 # grid kernel - no numba here
+=======
+# ── Grid kernel (same logic as grid.py, accelerated with numba) ───────────────
+>>>>>>> f1a5ae73df83f559ed61239be82cae998b4ec4b7
 
+@njit(cache=True)
 def _grid_kernel(zscore, spread, spread_mean, spread_std, vr_arr, t1_price, t2_price,
                  entry_arr, exit_arr, stop_arr,
                  beta, cost_maker, cost_taker, borrow_rate, bars_per_day):
@@ -196,7 +203,18 @@ def build_signals(closes, volumes, t1, t2, beta, half_life):
         "vr": vr
     }).dropna().between_time(SIGNAL_START, RTH_END)
 
+<<<<<<< HEAD
 # check coint dynamically each window
+=======
+
+def trim_oos_signal_warmup(sig: pd.DataFrame,
+                           oos_start: pd.Timestamp,
+                           oos_end: pd.Timestamp) -> pd.DataFrame:
+    """Drop warmup bars after rolling indicators are computed."""
+    return sig[(sig.index >= oos_start) & (sig.index < oos_end)]
+
+# ── Dynamic Cointegration ────────────────────────────────────────────────────
+>>>>>>> f1a5ae73df83f559ed61239be82cae998b4ec4b7
 
 _JOH_CRIT_IDX = {0.90: 0, 0.95: 1, 0.99: 2}
 
@@ -586,6 +604,9 @@ def main():
 
         closes_train = closes[(closes.index >= tr_s_ts) & (closes.index < tr_e_ts)]
         closes_test  = closes[(closes.index >= te_s_ts) & (closes.index < te_e_ts)]
+        warmup_pos = max(0, closes.index.searchsorted(te_s_ts) - WFO_SIGNAL_WARMUP_BARS)
+        warmup_start_ts = closes.index[warmup_pos]
+        closes_test_with_warmup = closes[(closes.index >= warmup_start_ts) & (closes.index < te_e_ts)]
 
         # Johansen uses ROLLING window (last 3 years of train) even in expanding
         # mode — long histories mask structural breaks like COST-WMT.
@@ -641,7 +662,11 @@ def main():
 
             # 3. Build signals with window-specific beta and hl
             sig_train = build_signals(closes_train, volumes, t1, t2, dynamic_beta, dynamic_hl)
-            sig_test  = build_signals(closes_test, volumes, t1, t2, dynamic_beta, dynamic_hl)
+            sig_test  = trim_oos_signal_warmup(
+                build_signals(closes_test_with_warmup, volumes, t1, t2, dynamic_beta, dynamic_hl),
+                te_s_ts,
+                te_e_ts,
+            )
 
             if len(sig_train) < 100 or len(sig_test) < 20:
                 continue
@@ -724,7 +749,11 @@ def main():
             if weight <= 0: continue
 
             # Re-build sig_test (or use cached if memory allowed, but for simplicity we rebuild)
-            sig_test = build_signals(closes_test, volumes, t1, t2, best["dynamic_beta"], best["dynamic_hl"])
+            sig_test = trim_oos_signal_warmup(
+                build_signals(closes_test_with_warmup, volumes, t1, t2, best["dynamic_beta"], best["dynamic_hl"]),
+                te_s_ts,
+                te_e_ts,
+            )
             
             pair_hurst_f = HurstFilter() if use_hurst else None
             spread_daily_full = (daily[t1] - best["dynamic_beta"] * daily[t2]).dropna() if use_hurst else None
