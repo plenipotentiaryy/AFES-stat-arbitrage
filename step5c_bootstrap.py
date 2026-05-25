@@ -19,7 +19,7 @@ real_dd = (real_curve - np.maximum.accumulate(real_curve)).min()
 
 print(f"Loaded {n} trades. Running {N_SIMS:,} simulations...\n")
 
-# ── Bootstrap resampling ──────────────────────────────────────────────────────
+# bootstrap resampling
 # Resample trades with replacement → N possible equity curves
 idx = np.random.randint(0, n, size=(N_SIMS, n))
 boot_samples = pnl[idx]                                   # (N_SIMS, n)
@@ -31,7 +31,7 @@ boot_sharpes = (boot_samples.mean(axis=1)
 running_max  = np.maximum.accumulate(boot_curves, axis=1)
 boot_drawdowns = (boot_curves - running_max).min(axis=1)
 
-# ── Random sign test ──────────────────────────────────────────────────────────
+# random sign test
 # Keep trade magnitudes, randomly flip signs → baseline of pure chance
 signs        = np.random.choice([-1, 1], size=(N_SIMS, n))
 sign_samples = np.abs(pnl) * signs
@@ -43,7 +43,6 @@ sign_sharpes = (sign_samples.mean(axis=1)
 p_value_total  = np.mean(sign_totals  >= real_total)
 p_value_sharpe = np.mean(sign_sharpes >= real_sharpe)
 
-# ── Print results ─────────────────────────────────────────────────────────────
 def ci(arr, lo=5, hi=95):
     return np.percentile(arr, lo), np.percentile(arr, hi)
 
@@ -70,13 +69,13 @@ sig_sharpe = "SIGNIFICANT" if p_value_sharpe < 0.05 else "not significant"
 print(f"  p (P&L)   : {p_value_total:.4f}  → {sig_total}")
 print(f"  p (Sharpe): {p_value_sharpe:.4f}  → {sig_sharpe}")
 
-# ── Visualisation ─────────────────────────────────────────────────────────────
+# generate charts
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 x = np.arange(1, n + 1)
 
-# ── 1. Equity curve fan (the "branches") ─────────────────────────────────────
+# 1. Equity curve fan (the "branches")
 ax = axes[0, 0]
 
 # Draw 300 individual paths as light branches
@@ -97,7 +96,7 @@ ax.set_xlabel("Trade #")
 ax.set_ylabel("Cumulative P&L")
 ax.legend(fontsize=8)
 
-# ── 2. Distribution of final P&L ─────────────────────────────────────────────
+# 2. Distribution of final P&L
 ax = axes[0, 1]
 ax.hist(boot_totals, bins=80, color="steelblue", alpha=0.7, edgecolor="none")
 ax.axvline(real_total, color="red",    lw=2,   label=f"Real: {real_total:+.3f}")
@@ -110,7 +109,7 @@ ax.set_title("Distribution of Final P&L (bootstrap)")
 ax.set_xlabel("Total P&L")
 ax.legend(fontsize=8)
 
-# ── 3. Distribution of Sharpe ─────────────────────────────────────────────────
+# 3. Distribution of Sharpe
 ax = axes[1, 0]
 ax.hist(boot_sharpes, bins=80, color="mediumseagreen", alpha=0.7, edgecolor="none")
 ax.axvline(real_sharpe, color="red", lw=2, label=f"Real: {real_sharpe:.2f}")
@@ -119,7 +118,7 @@ ax.set_title("Distribution of Sharpe Ratio (bootstrap)")
 ax.set_xlabel("Sharpe")
 ax.legend(fontsize=8)
 
-# ── 4. Random sign test ───────────────────────────────────────────────────────
+# 4. Random sign test
 ax = axes[1, 1]
 ax.hist(sign_totals, bins=80, color="gray", alpha=0.6, edgecolor="none",
         label="Random (sign-flipped)")

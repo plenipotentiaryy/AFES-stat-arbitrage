@@ -1,5 +1,5 @@
 """
-data_loader.py — Unified Parquet/CSV loader for 15-min OHLCV data.
+data_loader.py — Unified Parquet/CSV loader for intraday OHLCV data.
 
 Priority: Parquet (column-pruning, ~10x faster) → CSV fallback.
 
@@ -19,11 +19,11 @@ from pathlib import Path
 
 from config import (
     DATA_DIR, RTH_START, RTH_END,
-    CLOSES_FILE, VOLUMES_FILE,
+    CLOSES_FILE, VOLUMES_FILE, BAR_MINUTES
 )
 
-CLOSES_PARQUET  = DATA_DIR / "closes_15min.parquet"
-VOLUMES_PARQUET = DATA_DIR / "volumes_15min.parquet"
+CLOSES_PARQUET  = DATA_DIR / f"closes_{BAR_MINUTES}min.parquet"
+VOLUMES_PARQUET = DATA_DIR / f"volumes_{BAR_MINUTES}min.parquet"
 CLOSES_CSV      = DATA_DIR / CLOSES_FILE
 VOLUMES_CSV     = DATA_DIR / VOLUMES_FILE
 
@@ -64,7 +64,7 @@ def _apply_filters(df: pd.DataFrame,
         df = df[df.index >= pd.Timestamp(start).tz_localize(_TZ)]
     if end:
         df = df[df.index <= pd.Timestamp(end).tz_localize(_TZ)]
-    if freq and freq != "15min":
+    if freq and freq != f"{BAR_MINUTES}min":
         df = df.resample(freq).last().dropna(how="all")
     return df
 
@@ -97,7 +97,7 @@ def load_closes(tickers: list[str] | None = None,
                 rth:     bool = True,
                 freq:    str | None = None) -> pd.DataFrame:
     """
-    Load 15-min close prices.
+    Load intraday close prices.
 
     Parameters
     ----------
@@ -106,7 +106,7 @@ def load_closes(tickers: list[str] | None = None,
         None = all 233 tickers.
     start / end : "YYYY-MM-DD" strings, optional
     rth   : filter to Regular Trading Hours (09:30–16:00 ET)
-    freq  : resample rule, e.g. "1D", "1W". None = keep 15-min bars.
+    freq  : resample rule, e.g. "1D", "1W". None = keep default intraday bars.
     """
     return _load(CLOSES_PARQUET, CLOSES_CSV, tickers, start, end, rth, freq)
 
@@ -116,7 +116,7 @@ def load_volumes(tickers: list[str] | None = None,
                  end:     str | None = None,
                  rth:     bool = True,
                  freq:    str | None = None) -> pd.DataFrame:
-    """Load 15-min volume data. Same signature as load_closes."""
+    """Load intraday volume data. Same signature as load_closes."""
     return _load(VOLUMES_PARQUET, VOLUMES_CSV, tickers, start, end, rth, freq)
 
 

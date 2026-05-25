@@ -23,7 +23,7 @@ import statsmodels.api as sm
 
 from config import DATA_DIR
 
-# ── Parameters ────────────────────────────────────────────────────────────────
+# config
 CORR_MIN      = 0.50
 SSD_PCT       = 80
 HURST_MAX_USE = 0.50
@@ -87,7 +87,7 @@ def test_pair(s1: np.ndarray, s2: np.ndarray, t1: str, t2: str):
 
 
 if __name__ == "__main__":
-    # ── Load ──────────────────────────────────────────────────────────────────
+    # load data
     print("Loading closes_daily.csv …")
     daily = pd.read_csv(DATA_DIR / "closes_daily.csv", index_col=0, parse_dates=True)
     daily = daily.ffill().dropna(axis=1, thresh=MIN_OBS)
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     n_pairs = len(tickers) * (len(tickers) - 1) // 2
     print(f"Tickers: {len(tickers)}  |  Total candidate pairs: {n_pairs:,}\n")
 
-    # ── Layer 1: Correlation ───────────────────────────────────────────────────
+    # layer 1 - correlation filter
     print("Layer 1: correlation filter …")
     log_ret = np.log(daily / daily.shift(1)).dropna()
     corr    = log_ret.corr()
@@ -106,7 +106,7 @@ if __name__ == "__main__":
     ]
     print(f"  After corr >= {CORR_MIN}: {len(candidates):,} pairs")
 
-    # ── Layer 2: SSD pre-filter ────────────────────────────────────────────────
+    # layer 2 - SSD filter (top pairs by price distance)
     print("Layer 2: SSD filter …")
     normed = daily / daily.iloc[0]
     ssds = [((normed[t1] - normed[t2]) ** 2).sum() for t1, t2 in candidates]
@@ -114,7 +114,7 @@ if __name__ == "__main__":
     candidates = [p for p, s in zip(candidates, ssds) if s <= threshold]
     print(f"  After SSD <= {SSD_PCT}th pct: {len(candidates):,} pairs")
 
-    # ── Layer 3: Johansen ─────────────────────────────────────────────────────
+    # layer 3 - johansen cointegration
     print(f"Layer 3: Johansen cointegration (sequential) …")
     results = []
     for i, (t1, t2) in enumerate(candidates):
@@ -132,7 +132,6 @@ if __name__ == "__main__":
 
     print(f"\nDone: {len(results)} cointegrated pairs found")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
     if results:
         df_out = (pd.DataFrame(results)
                     .sort_values("joh_margin", ascending=False)

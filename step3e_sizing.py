@@ -11,7 +11,7 @@ from config import (
     DATA_DIR, OUTPUT_DIR,
 )
 
-# ── Load all sources ──────────────────────────────────────────────────────────
+# load everything
 
 def load_regimes() -> pd.DataFrame | None:
     path = DATA_DIR / "regimes.csv"
@@ -65,7 +65,7 @@ def load_mc_confidence() -> dict[str, float]:
     return {row["pair"]: row["win_rate"] / 100 for _, row in df.iterrows()}
 
 
-# ── Compute multipliers ───────────────────────────────────────────────────────
+# calc size multipliers from all layers
 
 def regime_multiplier(regimes: pd.DataFrame | None, pair: str, ts) -> float:
     if regimes is None or pair not in regimes.columns:
@@ -123,7 +123,7 @@ def mc_confidence(mc_conf: dict, pair: str) -> float:
     return mc_conf.get(pair, 1.0)
 
 
-# ── Layer A: correlated-drawdown throttle ────────────────────────────────────
+# throttle when pairs are all losing together
 def load_corr_throttle() -> pd.Series | None:
     path = DATA_DIR / "corr_throttle.csv"
     if not path.exists():
@@ -146,7 +146,7 @@ def corr_throttle_multiplier(s: pd.Series | None, date) -> float:
         return 1.0
 
 
-# ── Layer B: HRP weights ─────────────────────────────────────────────────────
+# HRP portfolio weights
 def _hrp_quasi_diag(link: np.ndarray) -> list[int]:
     """Recover leaf order from linkage matrix (Lopez de Prado, Ch.16)."""
     link = link.astype(int)
@@ -276,6 +276,14 @@ def position_size(pair: str, ts, regimes, iv_mult_s, mc_conf: dict,
 
 
 def main() -> None:
+    print("\n" + "="*60)
+    print("STEP 3e — DYNAMIC POSITION SIZING")
+    print("="*60)
+    print("Combines outputs from all previous layers into one number: size.")
+    print("Formula: size = regime_mult × IV_mult × MC_confidence × macro_mult")
+    print("Any single factor near zero collapses the whole position.")
+    print("If size < MIN_POSITION_SIZE the trade is skipped entirely.")
+    print()
     print("Loading data sources...\n")
 
     regimes = load_regimes()

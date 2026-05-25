@@ -35,7 +35,7 @@ from config import (
     KALMAN_DELTA, TRAIN_RATIO,
 )
 
-# ── Tunable parameters ────────────────────────────────────────────────────────
+# tunable parameters
 TARGET_RR        = 1.3    # Fixed Reward / Risk ratio (Gatev-style constraint)
 MIN_ENTRY_Z      = 1.5    # Scan range start
 MAX_ENTRY_Z      = 3.5    # Scan range end
@@ -45,7 +45,7 @@ MIN_EV           = 0.0    # Only use entry_z with positive expected value
 FALLBACK_ENTRY_Z = 2.0    # Fallback if no positive EV found
 
 
-# ── Kalman spread builder (mirrors backtest.py exactly) ──────────────────────
+# kalman spread builder (mirrors backtest.py exactly)
 
 def _kalman_hedge(p1: np.ndarray, p2: np.ndarray,
                   delta: float, beta_init: float):
@@ -87,7 +87,7 @@ def build_zscore(closes: pd.DataFrame, t1: str, t2: str,
     return zscore.between_time(SIGNAL_START, RTH_END)
 
 
-# ── Core profiling engine ─────────────────────────────────────────────────────
+# core profiling engine
 
 def profile_z_bounces(z_series: pd.Series,
                       min_z: float = MIN_ENTRY_Z,
@@ -116,7 +116,7 @@ def profile_z_bounces(z_series: pd.Series,
 
         wins = losses = 0
 
-        # ── SHORT side: Z crosses UP through +entry_z ─────────────────────
+        # short side
         cross_short = np.where(
             (z_vals[:-1] < entry_z) & (z_vals[1:] >= entry_z)
         )[0] + 1
@@ -130,7 +130,7 @@ def profile_z_bounces(z_series: pd.Series,
             if fw < fl:    wins   += 1
             elif fl < fw:  losses += 1
 
-        # ── LONG side: Z crosses DOWN through -entry_z ────────────────────
+        # long side
         cross_long = np.where(
             (z_vals[:-1] > -entry_z) & (z_vals[1:] <= -entry_z)
         )[0] + 1
@@ -168,12 +168,9 @@ def profile_z_bounces(z_series: pd.Series,
     return df
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
 
 def load_closes() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     closes = pd.read_csv(path, index_col=0)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     return closes.between_time(RTH_START, RTH_END)
@@ -190,7 +187,7 @@ def get_train_closes(closes: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
     return closes.iloc[:int(n * TRAIN_RATIO)]
 
 
-# ── Visualization for one pair ────────────────────────────────────────────────
+# visualization for one pair
 
 def _plot_pair(pair_name: str, df: pd.DataFrame, out_dir: Path):
     if df.empty:
@@ -244,7 +241,7 @@ def _plot_pair(pair_name: str, df: pd.DataFrame, out_dir: Path):
     plt.close(fig)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# entry point
 
 def main():
     closes = load_closes()
@@ -338,14 +335,14 @@ def main():
         print("\nNo pairs profiled.")
         return
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # save
     df_all = pd.concat(all_profiles, ignore_index=True)
     df_all.to_csv(DATA_DIR / "z_density_full.csv", index=False)
 
     df_summary = pd.DataFrame(summary_rows)
     df_summary.to_csv(DATA_DIR / "z_profiles.csv", index=False)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # summary
     n_tradeable = df_summary["tradeable"].sum()
     n_skip      = len(df_summary) - n_tradeable
 

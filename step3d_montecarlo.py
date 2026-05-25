@@ -15,7 +15,7 @@ N_SIMS = 10_000
 DT     = 1        # one bar
 
 
-# ── OU parameter estimation ───────────────────────────────────────────────────
+# fit OU: theta (reversion speed), mu (mean), sigma (noise)
 
 def estimate_ou(spread: pd.Series) -> dict:
     """
@@ -41,7 +41,7 @@ def estimate_ou(spread: pd.Series) -> dict:
             "half_life": half_life, "r2": model.rsquared}
 
 
-# ── Vectorised OU simulation ──────────────────────────────────────────────────
+# simulate paths - vectorised so its fast enough
 
 def simulate_ou(theta, mu, sigma, X0, n_steps, n_sims) -> np.ndarray:
     """Returns shape (n_sims, n_steps+1)."""
@@ -55,7 +55,7 @@ def simulate_ou(theta, mu, sigma, X0, n_steps, n_sims) -> np.ndarray:
     return paths
 
 
-# ── P&L for each simulated path ───────────────────────────────────────────────
+# calc pnl per path
 
 def compute_pnl(paths, mu, sigma, beta,
                 entry_level, exit_level, stop_level,
@@ -119,13 +119,9 @@ def var_cvar(pnl: np.ndarray, alpha=0.05) -> tuple[float, float]:
     return float(v), float(c)
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
 def _data_file():
     p = DATA_DIR / CLOSES_FILE
     if not p.exists():
-        fb = DATA_DIR / "closes_15min.csv"
-        if fb.exists():
-            return fb
         raise FileNotFoundError(f"No data: {CLOSES_FILE}")
     return p
 closes = pd.read_csv(_data_file(), index_col=0)
@@ -150,7 +146,15 @@ if _opt_path.exists():
 else:
     print("No optimal_params.csv — using global defaults for all pairs")
 
-print(f"\nOU Monte Carlo  |  {N_SIMS:,} simulations per trade")
+print("\n" + "="*60)
+print("STEP 3d — ORNSTEIN-UHLENBECK MONTE CARLO")
+print("="*60)
+print("For each pair we fit an OU (mean-reverting) process to the spread,")
+print("then simulate it 10,000 times to measure expected profitability.")
+print("If the expected P&L is negative — the maths say it won't work —")
+print("the pair gets a low mc_confidence score that shrinks position size.")
+print()
+print(f"OU Monte Carlo  |  {N_SIMS:,} simulations per trade")
 print(f"Global defaults: entry={ENTRY_Z}  exit={EXIT_Z:+.1f}  stop={STOP_Z}\n")
 
 summary_rows = []
@@ -256,7 +260,7 @@ for _, row in pairs.iterrows():
         "p_stop":    round(p_stop, 1),
     })
 
-    # ── Plot: paths fan + P&L distribution ────────────────────────────────────
+    # fan chart + pnl dist
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     # Panel 1: OU paths fan (long side)
@@ -322,7 +326,7 @@ for _, row in pairs.iterrows():
     print(f"  Chart saved → {OUTPUT_DIR / fname}")
     plt.close()
 
-# ── Summary table ─────────────────────────────────────────────────────────────
+# summary
 print(f"\n{'='*70}")
 print("SUMMARY — OU MONTE CARLO")
 print(f"{'='*70}")
@@ -330,3 +334,9 @@ df_summary = pd.DataFrame(summary_rows)
 print(df_summary.to_string(index=False))
 df_summary.to_csv(DATA_DIR / "ou_montecarlo_summary.csv", index=False)
 print(f"\nSaved to {DATA_DIR / 'ou_montecarlo_summary.csv'}")
+print()
+print("HOW TO READ THESE RESULTS:")
+print("  win_rate > 50%  = model says this trade has positive expected value")
+print("  sharpe > 0      = risk-adjusted return is positive")
+print("  p_stop high     = most paths are hitting the stop — thresholds may be wrong")
+print("  VaR / CVaR      = how bad the worst 5% of outcomes look in spread units")

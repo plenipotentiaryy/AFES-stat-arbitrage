@@ -6,21 +6,20 @@ from config import (
     STOP_Z as DEFAULT_STOP_Z,
     COST_PER_SIDE, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START, RECENT_BARS,
-    DATA_DIR, OUTPUT_DIR,
+    DATA_DIR, OUTPUT_DIR, CLOSES_FILE, BARS_PER_DAY,
 )
 
 ENTRY_Z_GRID = [3.5, 3.3, 3.2, 3.0]
 EXIT_Z_GRID  = [0.3, 0.2, 0.1, 0.0, -0.1, -0.2, -0.3]
 STOP_Z_GRID  = [3.8, 4.2, 4.4]
 
-BARS_PER_DAY = 26
 COMBOS       = list(itertools.product(ENTRY_Z_GRID, EXIT_Z_GRID, STOP_Z_GRID))
 print(f"Sniper grid: {len(ENTRY_Z_GRID)} entry × {len(EXIT_Z_GRID)} exit × "
       f"{len(STOP_Z_GRID)} stop = {len(COMBOS)} combinations\n")
 
 
 def load_closes() -> pd.DataFrame:
-    closes = pd.read_csv(DATA_DIR / "closes_15min.csv", index_col=0, parse_dates=True)
+    closes = pd.read_csv(DATA_DIR / CLOSES_FILE, index_col=0, parse_dates=True)
     if closes.index.tz is None:
         closes.index = closes.index.tz_localize("UTC").tz_convert("US/Eastern")
     else:
@@ -81,7 +80,6 @@ def backtest(df, t1, t2, beta, entry_z, exit_z, stop_z) -> list:
     return pnls
 
 
-# ── Load ──────────────────────────────────────────────────────────────────────
 closes = load_closes()
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
@@ -104,7 +102,7 @@ print(f"Running {len(COMBOS)} combinations...\n")
 
 days_total = (closes.index[-1] - closes.index[0]).days
 
-# ── Grid search ───────────────────────────────────────────────────────────────
+# grid search
 results = []
 
 for entry_z, exit_z, stop_z in COMBOS:
@@ -145,7 +143,7 @@ df_res = pd.DataFrame([{k: v for k, v in r.items() if k != "curve"}
                         for r in results])
 df_res = df_res.sort_values("sharpe", ascending=False).reset_index(drop=True)
 
-# ── Print full table ──────────────────────────────────────────────────────────
+# print full table
 print("=" * 85)
 print(f"{'#':>3} {'entry':>6} {'exit':>6} {'stop':>6} {'trades':>7} "
       f"{'WR':>6} {'sharpe':>7} {'total_pnl':>11} {'max_dd':>9} {'PF':>6}")
@@ -163,7 +161,7 @@ print(f"BEST: entry={best['entry_z']}  exit={best['exit_z']:+.1f}  stop={best['s
       f"→  Sharpe={best['sharpe']:.2f}  WR={best['win_rate']:.1f}%  "
       f"Trades={best['trades']}  P&L={best['total_pnl']:+.4f}")
 
-# ── Heatmaps: Sharpe by entry_z × exit_z for each stop_z ─────────────────────
+# heatmaps: Sharpe by entry_z × exit_z for each stop_z
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 fig, axes = plt.subplots(1, len(STOP_Z_GRID), figsize=(6 * len(STOP_Z_GRID), 5))
@@ -201,7 +199,7 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "sniper_grid.png", dpi=150)
 print(f"\nHeatmap saved to {OUTPUT_DIR / 'sniper_grid.png'}")
 
-# ── Top-10 equity curves ──────────────────────────────────────────────────────
+# top-10 equity curves
 fig2, ax2 = plt.subplots(figsize=(14, 6))
 top10_idx = df_res.head(10).index.tolist()
 colors    = plt.cm.RdYlGn(np.linspace(0.2, 0.9, 10))

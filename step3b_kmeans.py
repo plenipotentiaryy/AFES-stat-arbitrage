@@ -1,5 +1,5 @@
 """
-step5_kmeans.py — K-Means macro regime detection.
+step3b_kmeans.py — K-Means macro regime detection.
 
 Downloads SPY + ^VIX daily data and classifies each trading day into one of
 three market regimes using K-Means clustering on realized-vol features:
@@ -27,12 +27,12 @@ from config import DATA_DIR, OUTPUT_DIR, DAILY_START, KMEANS_N_CLUSTERS, KMEANS_
 REGIME_NAMES = {0: "Trend", 1: "Sideways", 2: "Panic"}
 FEATURE_TICKERS = ["SPY", "^VIX"]
 
-# ── Walk-forward (leak-free) refit parameters ─────────────────────────────────
+# walk-forward (leak-free) refit parameters
 MIN_TRAIN_DAYS = 252   # 1 year of trading data for first cluster fit
 REFIT_EVERY    = 30    # refit cadence in trading days
 
 
-# ── Download macro data ───────────────────────────────────────────────────────
+# load data
 
 def load_macro_data() -> pd.DataFrame:
     raw = yf.download(FEATURE_TICKERS, start=DAILY_START,
@@ -44,7 +44,7 @@ def load_macro_data() -> pd.DataFrame:
     return pd.DataFrame({"spy": spy, "vix": vix}).dropna()
 
 
-# ── Feature engineering ───────────────────────────────────────────────────────
+# feature engineering
 
 def build_features(df: pd.DataFrame, window: int = KMEANS_VOL_WINDOW) -> pd.DataFrame:
     spy_ret = df["spy"].pct_change()
@@ -58,7 +58,7 @@ def build_features(df: pd.DataFrame, window: int = KMEANS_VOL_WINDOW) -> pd.Data
     return features
 
 
-# ── Cluster and label regimes ─────────────────────────────────────────────────
+# cluster and label regimes
 
 def label_clusters(kmeans: KMeans, features: pd.DataFrame) -> pd.Series:
     """
@@ -101,11 +101,20 @@ def label_clusters(kmeans: KMeans, features: pd.DataFrame) -> pd.Series:
     return regime_labels
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# entry point
 
 DATA_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+print("\n" + "="*60)
+print("STEP 3b — K-MEANS MACRO REGIME")
+print("="*60)
+print("Classifies every trading day as one of three market environments:")
+print("  Trend   — market is moving directionally, moderate vol")
+print("  Sideways — calm, range-bound — best for pairs trading")
+print("  Panic   — crash or spike — we stop entering new trades entirely")
+print("This is market-wide, not per-pair. Uses SPY returns + VIX features.")
+print()
 print("Downloading macro data (SPY + VIX) …", flush=True)
 macro = load_macro_data()
 print(f"Loaded {len(macro)} trading days  "
@@ -118,7 +127,7 @@ if len(features) < MIN_TRAIN_DAYS + REFIT_EVERY:
     raise SystemExit(f"Need at least {MIN_TRAIN_DAYS + REFIT_EVERY} days; "
                      f"got {len(features)}")
 
-# ── Walk-forward K-Means: refit on data ≤ t, label next REFIT_EVERY days ──────
+# walk-forward K-Means: refit on data ≤ t, label next REFIT_EVERY days
 print(f"\nWalk-forward K-Means refit  "
       f"(min_train={MIN_TRAIN_DAYS}d, refit_every={REFIT_EVERY}d) …", flush=True)
 
@@ -166,17 +175,16 @@ print(f"  First labeled day: {regime_series.index[0].date()}")
 print(f"  Last  labeled day: {regime_series.index[-1].date()}\n")
 
 print("Regime distribution (walk-forward):")
+print("(Sideways is ideal for pairs trading — calm markets, predictable relationships)")
 for r in [0, 1, 2]:
     n = regime_counts[r]
     pct = 100 * n / max(len(regime_series), 1)
     print(f"  {REGIME_NAMES[r]:8s}  {n:5d} days ({pct:4.1f}%)")
 
-# Save
 out_path = DATA_DIR / "kmeans_regimes.csv"
 regime_series.to_csv(out_path, index=True, header=True)
 print(f"\nSaved {len(regime_series)} days to {out_path}")
 
-# ── Visualisation ─────────────────────────────────────────────────────────────
 colors = {0: "gold", 1: "lightgreen", 2: "salmon"}
 
 fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)

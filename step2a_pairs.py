@@ -39,7 +39,7 @@ DAILY_CACHE_MAX_AGE = 7    # re-download daily cache if older than this many day
 MAX_COST_FRACTION = 0.10
 
 
-# ── Daily closes via yfinance (cached) ───────────────────────────────────────
+# daily closes - cached so we dont hammer yf every run
 
 def load_daily_closes() -> pd.DataFrame:
     if DAILY_CACHE.exists():
@@ -60,16 +60,12 @@ def load_daily_closes() -> pd.DataFrame:
     return closes
 
 
-# ── Intraday (Alpha Vantage) ──────────────────────────────────────────────────
+# intraday bars from AV
 
 def _load_raw() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
     if not path.exists():
-        fallback = DATA_DIR / "closes_15min.csv"
-        if fallback.exists():
-            path = fallback
-        else:
-            raise FileNotFoundError(f"No data file: {CLOSES_FILE}")
+        raise FileNotFoundError(f"No data file: {CLOSES_FILE}")
     df = pd.read_csv(path, index_col=0, parse_dates=True)
     df.index = pd.to_datetime(df.index, utc=True).tz_convert("US/Eastern")
     return df.between_time(RTH_START, RTH_END)
@@ -89,7 +85,7 @@ def load_closes_dense() -> pd.DataFrame:
     return raw[dense].dropna()
 
 
-# ── Stats helpers ─────────────────────────────────────────────────────────────
+# small helpers for stats stuff
 
 def johansen_info(df2: pd.DataFrame) -> tuple[float, float, bool]:
     """
@@ -125,9 +121,18 @@ def compute_half_life(spread: pd.Series) -> float:
     return -np.log(2) / theta if theta < 0 else float("inf")
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
 
 DATA_DIR.mkdir(exist_ok=True)
+
+print("\n" + "="*60)
+print("STEP 2 — PAIR SELECTION")
+print("="*60)
+print("Looking for stock pairs that move together like a person")
+print("and a dog on a leash. We test 324 candidate pairs using")
+print("cointegration — a statistical test that checks whether the")
+print("gap between two stocks reliably closes over time.")
+print()
+
 daily = load_daily_closes()
 
 closes = load_closes()
@@ -155,9 +160,12 @@ print(f"\nIntraday spread window: {coint_start.date()} → {split_date.date()}"
 print(f"Daily data: {daily.index[0].date()} → {daily.index[-1].date()}"
       f"  ({len(daily)} trading days)")
 print(f"\nTesting {len(PAIRS)} predefined pairs\n")
+print("PASS = pair has a proven leash (cointegrated, mean-reverting, fast enough)")
+print("FAIL = cointegration test says the relationship is not statistically reliable")
+print("SKIP = missing data, bad beta, or costs too high to trade profitably")
+print()
 
-
-# ── Pair loop ─────────────────────────────────────────────────────────────────
+# main loop
 
 results = []
 
@@ -168,7 +176,7 @@ for t1, t2 in PAIRS:
         print(f"  SKIP {label}: missing intraday data")
         continue
 
-    # ── PRIMARY FILTER: rolling-window daily cointegration ───────────────────
+    # rolling 90d EG test - main filter, pretty strict
     if t1 not in daily.columns or t2 not in daily.columns:
         print(f"  SKIP {label}: missing daily data")
         continue
@@ -207,7 +215,7 @@ for t1, t2 in PAIRS:
         print(f"  SKIP {label}: beta_daily={beta_daily:.4f} outside valid range")
         continue
 
-    # ── Intraday spread metrics (computed with beta_daily for consistency) ────
+    # intraday spread calcs
     pc = closes_coint[[t1, t2]].dropna()
     if len(pc) < MIN_PAIR_OVERLAP:
         print(f"  SKIP {label}: only {len(pc)} intraday bars")
@@ -219,7 +227,7 @@ for t1, t2 in PAIRS:
     log_ret   = np.log(pc / pc.shift(1)).dropna()
     corr      = round(float(log_ret[t1].corr(log_ret[t2])), 4)
 
-    # ── Cost viability ────────────────────────────────────────────────────────
+    # if costs > 10% of expected pnl, not worth trading
     avg_notional  = float(pc[t1].mean() + beta_daily * pc[t2].mean())
     sigma_spread  = float(spread.std())
     cost_fraction = (2 * COST_TAKER * avg_notional) / max(sigma_spread, 1e-8)
@@ -228,29 +236,29 @@ for t1, t2 in PAIRS:
               f"(notional=${avg_notional:.0f}, σ_spread=${sigma_spread:.2f})")
         continue
 
-    # ── Hurst filter ──────────────────────────────────────────────────────────
+    # hurst check
     if hurst >= HURST_MAX:
         print(f"  FAIL {label}: Hurst={hurst:.3f} >= {HURST_MAX}")
         continue
 
-    # ── Half-life filter: too slow = spread won't revert before stop is hit ──
+    # half life too long, costs will eat us before it reverts
     if half_life > HALF_LIFE_MAX_BARS:
         print(f"  FAIL {label}: HL={half_life:.0f}b > {HALF_LIFE_MAX_BARS} (too slow)")
         continue
 
-    # ── Correlation filter ────────────────────────────────────────────────────
+    # corr check
     if corr < CORR_MIN:
         print(f"  FAIL {label}: corr={corr:.3f} < {CORR_MIN}")
         continue
 
-    # ── Recent 120-day correlation ────────────────────────────────────────────
+    # recent corr
     pc_recent   = closes[[t1, t2]].dropna().tail(RECENT_CORR_DAYS * BARS_PER_DAY)
     log_ret_rec = np.log(pc_recent / pc_recent.shift(1)).dropna()
     recent_corr = round(float(log_ret_rec[t1].corr(log_ret_rec[t2])), 4)
     # recent_corr kept as info — not a blocking filter for historical backtest
     # (backtest's CointegrationFilter handles dynamic breaks at runtime)
 
-    # ── INFO: intraday cointegration (not a filter) ──────────────────────────
+    # intraday coint - just info, not used as filter
     _, pvalue_intraday, _ = coint(pc[t1], pc[t2])
     adf_stat, adf_pvalue, *_ = adfuller(spread)
     beta_intraday = float(sm.OLS(pc[t1], sm.add_constant(pc[t2])).fit().params.iloc[1])
@@ -283,7 +291,6 @@ for t1, t2 in PAIRS:
           f"  [intraday_p={pvalue_intraday:.4f}]")
 
 
-# ── Results ───────────────────────────────────────────────────────────────────
 
 # ── Universe Consolidation ────────────────────────────────────────────────────
 # Keep every pair that passes the half-life gate (HL <= 15 days).  The legacy
@@ -307,6 +314,11 @@ if df_top.empty:
 
 print("\n" + "=" * 120)
 print(f"CONSOLIDATED UNIVERSE ({len(df_top)} Robust Pairs)")
+print("These are the pairs that passed all filters. They will be used in")
+print("every downstream step — backtest, sizing, live trading.")
+print("beta_daily = how many shares of stock B to short per share of stock A")
+print("half_life_bars = how many 5-min bars it typically takes for the gap to close by half")
+print("hurst < 0.5 = gap shrinks over time (good). hurst > 0.5 = gap drifts (bad)")
 print("-" * 120)
 print(df_top[["pair", "correlation", "coint_pvalue_daily", "johansen_coint", "beta_daily", "half_life_bars", "hurst"]
         ].to_string(index=False))
@@ -314,3 +326,4 @@ print("=" * 120)
 
 df_top.to_csv(DATA_DIR / "pairs_selected.csv", index=False)
 print(f"\nSaved {len(df_top)} consolidated pairs to {DATA_DIR / 'pairs_selected.csv'}")
+print("Next: run step3a (HMM) to detect calm vs volatile regimes for each pair.")

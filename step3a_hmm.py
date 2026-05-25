@@ -21,7 +21,7 @@ N_SEEDS    = 10   # HMM restarts — pick best log-likelihood
 EXIT_Z_CMP = 0.0  # exit threshold used in the comparison backtest
 N_JOBS     = max(1, (os.cpu_count() or 4) - 1)  # leave one core free
 
-# ── Leak-free training parameters ─────────────────────────────────────────────
+# training config - strict no-lookahead
 # Per-pair HMM:   fit on bars BEFORE test_start_date, predict on test/OOS bars.
 # Global SPY HMM: expanding-window refit on past-only daily data.
 PER_PAIR_TRAIN_BARS    = 7000   # ~3 months of train-only intraday bars
@@ -29,13 +29,10 @@ GLOBAL_MIN_TRAIN_DAYS  = 252    # 1y of SPY daily data for first global fit
 GLOBAL_REFIT_EVERY     = 30     # refit cadence in trading days
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
+# load data
 def _data_file():
     p = DATA_DIR / CLOSES_FILE
     if not p.exists():
-        fb = DATA_DIR / "closes_15min.csv"
-        if fb.exists():
-            return fb
         raise FileNotFoundError(f"No data: {CLOSES_FILE}")
     return p
 closes = pd.read_csv(_data_file(), index_col=0)
@@ -44,6 +41,15 @@ closes.index = closes.index.tz_convert("US/Eastern")
 closes = closes.between_time(RTH_START, RTH_END)
 
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
+
+print("\n" + "="*60)
+print("STEP 3a — HMM REGIME DETECTION")
+print("="*60)
+print("For each pair we fit a 2-state Hidden Markov Model on the spread.")
+print("State 0 = Normal (spread behaves predictably).")
+print("State 1 = Volatile (spread is jumpy — require bigger gap to enter).")
+print("We also fit a global HMM on SPY to catch market-wide panics.")
+print()
 print(f"Pairs: {len(pairs)}\n")
 
 # Test start date — pairs_selected.csv contains this column from step2a.
@@ -51,8 +57,8 @@ print(f"Pairs: {len(pairs)}\n")
 if "test_start_date" not in pairs.columns:
     raise SystemExit("pairs_selected.csv lacks 'test_start_date' — re-run step2a")
 TEST_START = pd.Timestamp(pairs["test_start_date"].iloc[0]).tz_localize("US/Eastern")
-print(f"Train cutoff for per-pair HMM: bars < {TEST_START.date()}")
-print(f"Predicting on bars >= {TEST_START.date()}  (OOS labels only)\n")
+print(f"Training on data before {TEST_START.date()} — predicting labels after that (no lookahead)")
+print(f"This ensures the model never sees future data during fitting.\n")
 
 
 def fit_hmm(X: np.ndarray) -> GaussianHMM | None:
@@ -81,7 +87,7 @@ def build_features(spread: pd.Series) -> pd.DataFrame:
     }).replace([np.inf, -np.inf], np.nan).dropna()
 
 
-# ── Fit HMM per pair (leak-free) ──────────────────────────────────────────────
+# fit one hmm per pair, train only, predict on OOS bars
 # Train on bars strictly BEFORE TEST_START; predict on bars >= TEST_START.
 # regimes.csv covers the OOS window only — backtest queries dates beyond.
 def _process_pair(pair_name: str, beta: float, s1: pd.Series, s2: pd.Series,
@@ -133,14 +139,20 @@ for pair_name, series, msg in _results:
     if series is not None:
         all_regimes[pair_name] = series
 
-# ── Save regimes (wide format: timestamp × pair) ──────────────────────────────
+# save regime labels
 if all_regimes:
     regime_df = pd.DataFrame(all_regimes)
     regime_df.to_csv(DATA_DIR / "regimes.csv")
-    print(f"Saved {DATA_DIR / 'regimes.csv'}  ({regime_df.shape})\n")
+    print(f"\nSaved regime labels to {DATA_DIR / 'regimes.csv'}  ({regime_df.shape})")
+    print("The backtest will use these labels to decide entry thresholds bar by bar.\n")
 
 
-# ── Comparison backtest: with vs without regime filter ────────────────────────
+# quick backtest, no regime vs hmm filter - just to check its worth it
+print("="*65)
+print("COMPARISON: Does the HMM filter actually help?")
+print("We run a simplified backtest twice per pair — with and without the regime filter.")
+print("If HMM filter improves Sharpe and win rate, it is earning its place in the pipeline.")
+print("="*65)
 def run_backtest(spread, zscore, beta, entry_z_override=None,
                  regime_dict=None, use_regime=False):
     t1_price_proxy = spread  # we use spread units for cost estimation
@@ -222,7 +234,6 @@ for _, row in pairs.iterrows():
     print()
 
 
-# ── Visualisation ─────────────────────────────────────────────────────────────
 OUTPUT_DIR.mkdir(exist_ok=True)
 n_pairs = len(all_regimes)
 
@@ -274,12 +285,20 @@ print(f"Chart saved to {OUTPUT_DIR / 'regimes_pairs.png'}")
 # plt.show()
 
 
-# ── Global macro HMM on SPY ───────────────────────────────────────────────────
+# global market regime using SPY
 # Trained on SPY daily returns — single market-wide panic signal.
 # When global_hmm = 1, sizing.py cuts ALL pair sizes by HMM_PANIC_MULT (÷3).
 
 import yfinance as yf
 
+print()
+print("="*60)
+print("GLOBAL MACRO HMM — Fitting on SPY daily returns")
+print("="*60)
+print("This is a single market-wide panic detector.")
+print("When it fires (panic=1) all new entries are blocked across every pair.")
+print("It refits every 30 days on expanding history — no future data used.")
+print()
 print(f"\nFitting global macro HMM on SPY (walk-forward, "
       f"min_train={GLOBAL_MIN_TRAIN_DAYS}d, refit_every={GLOBAL_REFIT_EVERY}d) …")
 _spy_raw = yf.download("SPY", start="2005-01-01", interval="1d", progress=False)
@@ -346,3 +365,4 @@ else:
     print(f"  First labeled day: {global_hmm_regime.index[0].date()}")
     print(f"  Last  labeled day: {global_hmm_regime.index[-1].date()}")
     print(f"  Saved {DATA_DIR / 'global_hmm_regime.csv'}")
+    print("  The backtest and sizing layer will load this to block entries on panic days.")
