@@ -76,7 +76,6 @@ def backtest_pair(df, t1, t2, beta, exit_z) -> pd.DataFrame:
     return trades
 
 
-# ── Load ──────────────────────────────────────────────────────────────────────
 closes = load_closes()
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
@@ -86,7 +85,7 @@ if pairs.empty:
 print(f"Grid search EXIT_Z = {EXIT_Z_GRID}")
 print(f"Pairs: {list(pairs['pair'])}\n")
 
-# ── Grid search ───────────────────────────────────────────────────────────────
+# grid search
 rows = []
 
 for exit_z in EXIT_Z_GRID:
@@ -126,7 +125,7 @@ for exit_z in EXIT_Z_GRID:
         "curve":     curve.values,
     })
 
-# ── Table ─────────────────────────────────────────────────────────────────────
+# table
 print("=" * 70)
 print(f"{'exit_z':>8} {'trades':>7} {'win_rate':>9} {'sharpe':>7} "
       f"{'total_pnl':>11} {'avg_pnl':>9} {'max_dd':>10}")
@@ -141,7 +140,7 @@ print(f"\nBest EXIT_Z by Sharpe: {best['exit_z']:+.1f}  →  "
       f"Sharpe={best['sharpe']:.2f}, WR={best['win_rate']:.1f}%, "
       f"Trades={best['trades']}, P&L={best['total_pnl']:+.4f}")
 
-# ── Charts ────────────────────────────────────────────────────────────────────
+# save charts
 OUTPUT_DIR.mkdir(exist_ok=True)
 colors = plt.cm.RdYlGn(np.linspace(0.1, 0.9, len(rows)))
 

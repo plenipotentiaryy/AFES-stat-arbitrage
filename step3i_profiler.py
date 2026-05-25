@@ -32,7 +32,7 @@ from config import (
 from kalman import kalman_hedge
 from step3f_grid import load_closes_split
 
-# ── Parameters ────────────────────────────────────────────────────────────────
+# parameters
 ENTRY_LEVELS = np.arange(1.5, 3.05, 0.05)   # 1.50 … 3.00 in steps of 0.05
 RR_RATIO     = 1.3                            # target reward:risk
 EXIT_Z       = 0.0                            # always exit at mean
@@ -129,7 +129,7 @@ def build_zscore(closes: pd.DataFrame, t1: str, t2: str,
     return zscore.values.astype(np.float64)
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
+# load data
 closes_train, closes_test, days_train = load_closes_split()
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
@@ -160,7 +160,7 @@ for _, row in pairs.iterrows():
         print(f"  SKIP {pair}: too few bars ({len(z_train)})")
         continue
 
-    # ── Scan all entry levels on TRAIN ────────────────────────────────────
+    # scan all entry levels on TRAIN
     train_rows = []
     for ez in ENTRY_LEVELS:
         r = profile_pair(z_train, ez)
@@ -176,7 +176,7 @@ for _, row in pairs.iterrows():
     df_train = pd.DataFrame(train_rows).sort_values("ev", ascending=False)
     best     = df_train.iloc[0]
 
-    # ── Validate best level on TEST ───────────────────────────────────────
+    # validate best level on TEST
     test_r = profile_pair(z_test, float(best["entry_z"]))
     if test_r:
         test_ev   = test_r["ev"]
@@ -205,7 +205,7 @@ for _, row in pairs.iterrows():
         "test_n":     int(test_n),
     })
 
-    # ── EV curve chart ────────────────────────────────────────────────────
+    # ev curve
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     for ax, df_rows, label in [
@@ -243,7 +243,7 @@ for _, row in pairs.iterrows():
     plt.savefig(out, dpi=150)
     plt.close(fig)
 
-# ── Summary ───────────────────────────────────────────────────────────────────
+# summary
 print(f"\n{'='*90}")
 print(f"{'PROFILER RESULTS':^90}")
 print(f"{'='*90}")

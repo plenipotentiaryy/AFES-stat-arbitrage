@@ -17,7 +17,7 @@ RISK_FREE_RATE = 0.045    # ~4.5% (approximate current US risk-free rate)
 MIN_OPTION_VOLUME = 10    # skip options with very low volume
 
 
-# ── Black-Scholes & IV ────────────────────────────────────────────────────────
+# black-Scholes & IV
 
 def bs_call(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0:
@@ -113,7 +113,14 @@ def atm_iv_for_ticker(ticker_str: str) -> float | None:
         return None
 
 
-# ── Download VIX / VIX9D history ─────────────────────────────────────────────
+print("\n" + "="*60)
+print("STEP 3c — IMPLIED VOLATILITY FILTER")
+print("="*60)
+print("VIX = the market's fear gauge. High VIX = investors buying insurance.")
+print("When fear is elevated, spreads widen erratically — we reduce position size.")
+print("VIX9D = near-term fear (9 days). If VIX9D > VIX, something specific is coming.")
+print("We also pull current ATM implied vol from each stock's option chain.")
+print()
 print("Downloading VIX / VIX9D historical data...")
 vix_raw   = yf.download("^VIX",  period="2y", interval="1d", progress=False)
 vix9d_raw = yf.download("^VIX9D", period="2y", interval="1d", progress=False)
@@ -128,7 +135,7 @@ vix9d = vix9d.reindex(vix.index).ffill()   # align to VIX calendar
 print(f"VIX:   {len(vix)} daily bars  ({vix.index[0].date()} — {vix.index[-1].date()})")
 print(f"VIX9D: {len(vix9d.dropna())} daily bars\n")
 
-# ── Get current ATM IV for each ticker in our pairs ───────────────────────────
+# get current ATM IV for each ticker in our pairs
 pairs = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
 print("Fetching current ATM IV from option chains:")
@@ -159,7 +166,7 @@ for _, row in pairs.iterrows():
     else:
         print(f"  {row['pair']:12s}  ATM IV = N/A")
 
-# ── Rolling IV percentile filter (VIX-based) ──────────────────────────────────
+# rolling IV percentile filter (VIX-based)
 vix_pct = vix.rolling(IV_LOOKBACK).quantile(IV_THRESHOLD / 100)
 
 # Position size signal: 1.0 = normal, IV_SIZE_HIGH = elevated
@@ -169,7 +176,7 @@ iv_signal = pd.Series(
     name="position_size",
 )
 
-# ── Term structure signal (VIX9D / VIX ratio) ────────────────────────────────
+# term structure signal (VIX9D / VIX ratio)
 # Ratio > 1.0 → backwardation: short-term fear > medium-term → panic signal
 term_ratio = (vix9d / vix).rename("term_ratio")
 
@@ -182,7 +189,7 @@ monday_no_crush = (is_monday & (vix9d_chg >= 0)).rename("monday_no_crush")
 # → backtest / sizing layers should block new entries when macro_alert == 1
 macro_alert = ((term_ratio > 1.0) | monday_no_crush).astype(int).rename("macro_alert")
 
-# ── Current market status ─────────────────────────────────────────────────────
+# current market status
 current_vix      = float(vix.iloc[-1])
 current_vix9d    = float(vix9d.iloc[-1]) if not pd.isna(vix9d.iloc[-1]) else None
 current_pct_rank = float((vix.tail(IV_LOOKBACK) <= current_vix).mean() * 100)
@@ -192,6 +199,7 @@ current_alert    = int(macro_alert.iloc[-1])
 
 print(f"\n{'='*55}")
 print(f"CURRENT IV STATUS")
+print(f"(This tells you what the market thinks about risk right now)")
 print(f"{'='*55}")
 print(f"VIX today:          {current_vix:.2f}")
 if current_vix9d:
@@ -209,7 +217,7 @@ pct_alert    = macro_alert.mean() * 100
 print(f"\nHistorically elevated ({IV_THRESHOLD}th pct): {pct_elevated:.0f}% of days")
 print(f"Macro alert active:               {pct_alert:.0f}% of days")
 
-# ── Save IV filter ────────────────────────────────────────────────────────────
+# save IV filter
 iv_out = pd.DataFrame({
     "vix":             vix,
     "vix9d":           vix9d,
@@ -222,7 +230,7 @@ iv_out = pd.DataFrame({
 iv_out.to_csv(DATA_DIR / "iv_filter.csv")
 print(f"\nSaved {DATA_DIR / 'iv_filter.csv'}")
 
-# ── Visualisation ─────────────────────────────────────────────────────────────
+# generate charts
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 fig, axes = plt.subplots(4, 1, figsize=(15, 16), sharex=True)

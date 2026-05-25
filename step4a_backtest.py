@@ -76,9 +76,6 @@ _LAZY_WINDOW_BARS = COINT_WINDOW_DAYS * BARS_PER_DAY
 def _data_path() -> str:
     p = DATA_DIR / CLOSES_FILE
     if not p.exists():
-        fallback = DATA_DIR / "closes_15min.csv"
-        if fallback.exists():
-            return str(fallback)
         raise FileNotFoundError(f"No data file: {CLOSES_FILE}")
     return str(p)
 
@@ -144,7 +141,7 @@ def build_signals(closes, t1, t2, beta, half_life,
     }).dropna().between_time(SIGNAL_START, RTH_END)
     df["velocity"] = df["zscore"].diff(VELOCITY_BARS)
 
-    # ── M15 Kalman z-score: signal on 15-min, execution on 5-min ─────────────
+    # m15 Kalman z-score: signal on 15-min, execution on 5-min
     # Resample pair closes to 15-min, run separate Kalman, ffill back to 5-min.
     # is_m15_close marks the last 5-min bar of each 15-min period (exit gate).
     try:
@@ -203,7 +200,7 @@ def build_signals(closes, t1, t2, beta, half_life,
         v2  = volumes[t2].reindex(df.index).fillna(0)
         vol = (v1 + abs(beta) * v2).clip(lower=1.0)
 
-        # ── VW-Z: volume-weighted z-score ────────────────────────────────────
+        # vwz - volume weighted zscore
         # High-volume bars anchor the "fair value" of the spread more strongly
         # than quiet bars, so the resulting z-score filters out thin-market noise.
         vw_sum  = vol.rolling(window).sum().clip(lower=1.0)
@@ -211,7 +208,7 @@ def build_signals(closes, t1, t2, beta, half_life,
         vw_var  = (vol * (df["spread"] - vw_mean) ** 2).rolling(window).sum() / vw_sum
         df["vwz"] = (df["spread"] - vw_mean) / np.sqrt(vw_var.clip(lower=1e-16))
 
-        # ── RVOL: volume relative to same time-of-day 20-day rolling avg ─────
+        # rvol vs same time of day baseline
         # shift(1) inside the transform makes each bar's reference use only
         # the PREVIOUS day's rolling average — no lookahead.
         tod_avg = vol.groupby(vol.index.time).transform(
@@ -219,13 +216,13 @@ def build_signals(closes, t1, t2, beta, half_life,
         ).clip(lower=1.0)
         df["rvol"] = vol / tod_avg
 
-        # ── Intraday spread VWAP (resets at session open each day) ───────────
+        # intraday spread VWAP (resets at session open each day)
         dates         = df.index.normalize()
         cum_sv        = (df["spread"] * vol).groupby(dates).cumsum()
         cum_v         = vol.groupby(dates).cumsum().clip(lower=1.0)
         df["vwap_spread"] = cum_sv / cum_v
 
-        # ── M15 VWAP + σ-bands (period-anchored, resets every 3 bars = 15 min) ─
+        # m15 VWAP + σ-bands (period-anchored, resets every 3 bars = 15 min)
         # Each 15-min candle group (9:30-9:44, 9:45-9:59, …) gets its own
         # cumulative VWAP and volume-weighted variance.
         # z_m15 = (spread - vwap_m15) / std_m15  →  ±1/2/3σ bands
@@ -242,7 +239,7 @@ def build_signals(closes, t1, t2, beta, half_life,
         df["vwap_std_m15"] = std_m15
         df["vwap_z_m15"]   = (df["spread"] - vwap_m15) / std_m15.clip(lower=1e-10)
 
-        # ── H1 VWAP + σ-bands (period-anchored, resets every 12 bars = 60 min) ─
+        # h1 VWAP + σ-bands (period-anchored, resets every 12 bars = 60 min)
         h1_key = pd.Series(
             df.index.hour.astype(str),
             index=df.index,
@@ -804,21 +801,21 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             enabled=SBR_GUARD_ENABLED,
         )
 
-        # ── Phase 1: cointegration validity ───────────
+        # coint check
         if coint_filter is not None:
             if not coint_valid_arr[i]:
                 suspended = True
             elif suspended and coint_valid_arr[i]:
                 suspended = False
 
-        # ── Parameter Freezing (Combatting Kalman Illusion) ─────────
+        # freeze beta/alpha at entry so kalman cant quietly adjust away a real loss
         z_active = zscore_arr[i]
         if position != 0 and entry_std > 0:
             # Frozen beta + alpha static spread calculation
             static_spread = p1 - (entry_alpha + entry_beta * p2)
             z_active = static_spread / entry_std
             
-        # ── Idiosyncratic Circuit Breaker ────────────────────────────────
+        # hard stop if z blows out
         is_broken_against = False
         if position != 0 and i > entry_bar:
             is_broken_against = (position == 1 and is_broken_neg) or (position == -1 and is_broken_pos)
@@ -886,7 +883,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             trade_s_neg = 0.0
             continue
 
-        # ── Normal exit / stop / time-stop ───────────────────────────────
+        # check if we should exit
         if position != 0:
             bars_held   = i - entry_bar
             time_stop   = bars_held >= effective_max_hold
@@ -950,7 +947,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 trade_s_neg = 0.0
                 continue
 
-        # ── Entry gate ────────────────────────────────────────────────────
+        # entry checks
         if position == 0:
             if oos_start is not None and ts < oos_start:
                 continue
@@ -1003,7 +1000,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             elif entry_z_val > threshold:
                 position = -1
 
-            # ── Gate 0: Tail-adjusted EV — require positive EV after tail loss ─
+            # gate 0: Tail-adjusted EV — require positive EV after tail loss
             if position != 0 and TAIL_EV_GATE and has_tail_ok:
                 if not tail_ok_arr[i]:
                     position = 0
@@ -1027,7 +1024,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     _blocked_rvol += 1
                     continue
 
-            # ── Gate 2: Velocity — spread must already be reverting ───────────
+            # gate 2: Velocity — spread must already be reverting
             # Entry VW-Z (or z) must have started moving back toward zero over
             # the last VELOCITY_BARS bars. Prevents entering a spread that is
             # still diverging (catching the knife).
@@ -1045,7 +1042,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             # Gate 3 (Session VWAP) — DISABLED per user request 2026-05.
 
             if position != 0:
-                # ── Tier 2: lazy ADF check on Z-trigger ──────────────────
+                # tier 2: lazy ADF check on Z-trigger
                 # Runs ADF on recent intraday spread — cached per day,
                 # so at most one ADF call per pair per trading day.
                 if coint_filter is not None:
@@ -1055,7 +1052,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                         _blocked_coint += 1
                         continue
 
-                # ── Tier 3: drift guard (Hurst) ───────────────────────────
+                # tier 3: drift guard (Hurst)
                 # Blocks entry if the spread is trending (H > 0.55),
                 # regardless of macro regime.  Catches H1 2021-style
                 # structural drift where one leg gets bid up by
@@ -1125,11 +1122,10 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     return pd.DataFrame(trades), blocked
 
 
-# ── Load ─────────────────────────────────────────────────────────────────────
 closes = load_closes()
 pairs  = pd.read_csv(DATA_DIR / "pairs_selected.csv")
 
-# ── Volumes (optional — enables VW-Z / RVOL / VWAP chain) ────────────────────
+# volumes (optional — enables VW-Z / RVOL / VWAP chain)
 _volumes: pd.DataFrame | None = None
 _vol_path = DATA_DIR / f"volumes_{5}min.csv"
 if not _vol_path.exists():
@@ -1237,6 +1233,7 @@ def _as_eastern_timestamp(value) -> pd.Timestamp:
     return ts.tz_convert("US/Eastern")
 
 
+
 _opt_params: dict[str, tuple[float, float, float]] = {}
 _wfo_param_schedule: dict[str, pd.DataFrame] = {}
 _wfo_path = DATA_DIR / "wfo_params.csv"
@@ -1273,7 +1270,6 @@ elif _opt_path.exists():
 else:
     print("No optimized params found — will use OU Monte Carlo defaults.")
 
-# ── Load regime-conditioned thresholds (from regime_profiler.py) ──────────────
 _regime_thresholds: dict[str, dict] = {}
 _rt_path = DATA_DIR / "regime_thresholds.csv"
 if _rt_path.exists():
@@ -1338,6 +1334,7 @@ def _covariance_from_vol_and_history(labels: list[str], vol: pd.Series) -> pd.Da
     return pd.DataFrame(cov, index=labels, columns=labels)
 
 
+
 def compute_pair_weights(pairs_df: pd.DataFrame,
                          opt_path,
                          method: str = ALLOCATION_METHOD,
@@ -1353,7 +1350,7 @@ def compute_pair_weights(pairs_df: pd.DataFrame,
     n = len(pairs_df)
     equal = {p: 1.0 / n for p in pairs_df["pair"]}
 
-    # ── Risk-parity (inverse-volatility) allocation ───────────────────────
+    # risk-parity (inverse-volatility) allocation
     # weight_i = (1/σ_i) / Σ(1/σ_j) — each pair contributes equal $-volatility.
     # Uses train_pnl_std from optimal_params.csv if available; falls back to
     # 1/half_life as a proxy (faster mean-reversion ≈ tighter spread).
@@ -1486,7 +1483,7 @@ for _p, _w in sorted(_pair_weights.items(), key=lambda x: -x[1]):
     print(f"  {_p:<12}  {_w*100:5.1f}%  (${_w * INITIAL_CAPITAL:,.0f})")
 print()
 
-# ── OOS start date — read from pairs_selected.csv (set by pairs.py via TRAIN_RATIO)
+# where OOS starts
 # Kalman warms up on full history; trading begins only from this date.
 _oos_start: pd.Timestamp | None = None
 if "test_start_date" in pairs.columns:
@@ -1495,6 +1492,15 @@ if "test_start_date" in pairs.columns:
 else:
     print("WARNING: test_start_date not in pairs_selected.csv — running on full period (in-sample!)")
 
+print("\n" + "="*60)
+print("STEP 4a — FULL BACKTEST")
+print("="*60)
+print("Replaying every 5-minute bar in the out-of-sample period.")
+print("At each bar: check exit conditions first, then check if we should enter.")
+print("All 10 safety filters are active. Real costs and borrow fees deducted.")
+print("The Kalman filter updates the hedge ratio every bar — but once we")
+print("enter a trade, it is frozen so the filter cannot hide a real loss.")
+print()
 print(f"Trading {len(pairs)} pairs | {closes.shape[0]} bars per ticker")
 print(f"Full data: {closes.index[0]} — {closes.index[-1]}")
 if _oos_start:
@@ -1502,7 +1508,7 @@ if _oos_start:
     print(f"OOS bars: {oos_bars} / {len(closes.index)}  ({oos_bars/len(closes.index)*100:.0f}% of total)")
 print(f"Pair max loss cutoff: {PAIR_MAX_LOSS}\n")
 
-# ── Run backtest per pair ─────────────────────────────────────────────────────
+# run for each pair
 pair_results = {}
 
 for _, row in pairs.iterrows():
@@ -1635,7 +1641,7 @@ for _, row in pairs.iterrows():
 if not pair_results:
     raise SystemExit("No trades generated.")
 
-# ── 3. Chronological Event-Driven Compounding (Infrastructure Upgrade) ────────
+# 3. Chronological Event-Driven Compounding (Infrastructure Upgrade)
 all_trades_list = []
 for p, data in pair_results.items():
     t_df = data["trades"]
@@ -1731,7 +1737,7 @@ for i in range(len(df_all)):
     d_gross  = tr["pnl_raw"] * u
     d_costs  = (tr["tx_cost_raw"] + tr["borrow_raw"]) * u
     
-    # ── Convex Overlay ───────────────────────────────────────────────────────
+    # convex Overlay
     # Subtract Insurance Premium (proportional to gross exposure and time)
     days_held = tr["holding_bars"] / BARS_PER_TRADING_DAY
     insurance_cost = tr["notional_raw"] * u * insurance_premium_daily * days_held
@@ -1816,7 +1822,7 @@ sharpe          = (pnl.mean() / pnl.std() * np.sqrt(trades_per_year)
 profit_factor   = (winning["net_pnl"].sum() / abs(losing["net_pnl"].sum())
                    if len(losing) > 0 and losing["net_pnl"].sum() != 0 else float("inf"))
 
-# ── Dollar P&L summary ───────────────────────────────────────────────────────
+# convert to actual dollars
 dollar_net      = df_trades["dollar_pnl"].sum()
 dollar_gross    = df_trades["dollar_gross"].sum()
 dollar_costs    = df_trades["dollar_costs"].sum()
@@ -1829,7 +1835,7 @@ avg_dollar_trade = df_trades["dollar_pnl"].mean()
 margin_risk = None
 if MarginSpiralDetector is not None and clean_covariance_rmt is not None:
     try:
-        # ── 15-minute Intraday Margin Analysis ──────────────────────────
+        # 15-minute Intraday Margin Analysis
         # pivot_table on exit_time with 15min frequency to catch intraday shocks
         pair_intraday = (
             df_trades.assign(exit_15m=pd.to_datetime(df_trades["exit_time"]).dt.floor("15min"))
@@ -1850,6 +1856,14 @@ if MarginSpiralDetector is not None and clean_covariance_rmt is not None:
     except Exception as exc:
         print(f"Margin spiral check skipped: {type(exc).__name__}: {exc}")
 
+print("\n" + "="*60)
+print("BACKTEST COMPLETE — PORTFOLIO RESULTS")
+print("HOW TO READ:")
+print("  Win rate > 55%    = strategy finds genuine edge, not noise")
+print("  Profit factor > 1 = winners outweigh losers in dollar terms")
+print("  Sharpe > 1        = good risk-adjusted return")
+print("  Coint breaks      = trades closed early because the pair relationship broke")
+print("  Panic exits       = trades closed because K-Means detected market panic")
 print(f"\n{'='*60}")
 print(f"PORTFOLIO  ({len(pair_results)} pairs)  —  ${INITIAL_CAPITAL:,.0f} starting capital")
 print(f"{'='*60}")
@@ -1903,7 +1917,7 @@ for pair_name, data in pair_results.items():
 df_trades.to_csv(DATA_DIR / "trades.csv", index=False)
 print(f"\nSaved {len(df_trades)} trades to {DATA_DIR / 'trades.csv'}")
 
-# ── SPY benchmark ─────────────────────────────────────────────────────────────
+# compare vs spy
 spy_return = None
 spy_sharpe = None
 try:
@@ -1927,7 +1941,7 @@ try:
 except Exception as e:
     print(f"\nSPY benchmark unavailable: {e}")
 
-# ── OOS summary ───────────────────────────────────────────────────────────────
+# OOS numbers
 print(f"\n{'='*60}")
 print("OUT-OF-SAMPLE COMPARISON")
 print(f"{'='*60}")
@@ -1943,7 +1957,7 @@ if spy_return is not None:
     alpha = sharpe - spy_sharpe
     print(f"Alpha (Sharpe):    {alpha:+.2f}")
 
-# ── Charts ────────────────────────────────────────────────────────────────────
+# save charts
 OUTPUT_DIR.mkdir(exist_ok=True)
 exit_times = pd.to_datetime(df_trades["exit_time"])
 
@@ -1998,7 +2012,7 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "backtest_results.png", dpi=150)
 print(f"Chart saved to {OUTPUT_DIR / 'backtest_results.png'}")
 
-# ── Z-score debug plots per pair ──────────────────────────────────────────────
+# debug z plots for each pair
 try:
     from step5f_debug_plot import plot_zscore_debug
     print("\nGenerating Z-score debug plots …")

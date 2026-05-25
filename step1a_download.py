@@ -46,7 +46,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Month slice list ──────────────────────────────────────────────────────────
+# split into monthly chunks
 
 def month_slices(years: int = HISTORY_YEARS) -> list[str]:
     """Return list of 'YYYY-MM' strings from (now - years) to last month."""
@@ -61,7 +61,7 @@ def month_slices(years: int = HISTORY_YEARS) -> list[str]:
     return slices
 
 
-# ── Single-slice download ─────────────────────────────────────────────────────
+# download one chunk
 
 def fetch_slice_v2(ticker: str, month: str) -> pd.DataFrame | str | None:
     """
@@ -163,7 +163,7 @@ def download_all(tickers: list[str], slices: list[str]) -> None:
         log.info(f"  Failed slices logged to {FAILED_LOG}")
 
 
-# ── Merge slices → CSV + Parquet ─────────────────────────────────────────────
+# combine all slices
 
 def merge_to_csv(tickers: list[str], rebuild: bool = False) -> None:
     """
@@ -231,12 +231,12 @@ def merge_to_csv(tickers: list[str], rebuild: bool = False) -> None:
                 existing[col] = new_df[col]
             final_df = existing
 
-        # ── CSV (human-readable backup) ───────────────────────────────────
+        # also save as csv
         final_df.to_csv(out_csv)
         log.info(f"  CSV  → {out_csv}  "
                  f"({len(final_df):,} rows × {len(final_df.columns)} tickers)")
 
-        # ── Parquet (fast columnar format for data_loader.py) ─────────────
+        # parquet (fast columnar format for data_loader.py)
         out_parquet = out_csv.with_suffix(".parquet")
         final_df.to_parquet(out_parquet, engine="pyarrow",
                             compression="snappy", index=True)
@@ -244,9 +244,18 @@ def merge_to_csv(tickers: list[str], rebuild: bool = False) -> None:
         log.info(f"  Parquet → {out_parquet}  ({size_mb:.1f} MB)")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# entry point
 
 if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("STEP 1 — DATA DOWNLOAD")
+    print("="*60)
+    print("Downloading historical 5-minute price bars from Alpha Vantage.")
+    print(f"This covers {HISTORY_YEARS} years of intraday data for all tickers.")
+    print("Each ticker/month combo is cached individually so the download")
+    print("can be safely interrupted and resumed from where it stopped.")
+    print("Rate limited to avoid hitting API limits (75 requests/min).")
+    print()
     import sys
     rebuild = "--rebuild" in sys.argv
 

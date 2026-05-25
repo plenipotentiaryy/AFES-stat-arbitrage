@@ -41,7 +41,7 @@ import statsmodels.api as sm
 from config import (
     TAIL_HEDGE_DRAG_ANNUAL, TAIL_HEDGE_PAYOUT_MULT, INITIAL_CAPITAL,
     COST_MAKER, COST_TAKER, CIRCUIT_BREAKER_Z,
-    CLOSES_FILE, BORROW_RATE_ANNUAL,
+    CLOSES_FILE, VOLUMES_FILE, BORROW_RATE_ANNUAL,
     RTH_START, RTH_END, SIGNAL_START,
     BARS_PER_DAY, DATA_DIR, OUTPUT_DIR,
     WFO_TRAIN_MONTHS, WFO_TEST_MONTHS, WFO_STEP_MONTHS, WFO_MIN_TRADES,
@@ -1112,17 +1112,14 @@ def _trades_to_daily_pnl(trades: list, dates: pd.DatetimeIndex) -> pd.Series:
 
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
 
 def load_closes():
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     closes = pd.read_csv(path, index_col=0)
     closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
     closes = closes.between_time(RTH_START, RTH_END)
-    
-    vol_path = DATA_DIR / "volumes_15min.csv"
+
+    vol_path = DATA_DIR / VOLUMES_FILE
     volumes = None
     if vol_path.exists():
         volumes = pd.read_csv(vol_path, index_col=0)
@@ -1168,9 +1165,8 @@ def make_windows(closes, expanding=WFO_EXPANDING):
     return windows
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# entry point
 
-# ── Load Global Macro HMM Regime ──────────────────────────────────────────────
 
 def load_global_hmm() -> pd.Series | None:
     """Load global_hmm_regime.csv (date → 0/1). Returns None if missing."""
@@ -1213,7 +1209,7 @@ def main():
     if daily is None:
         raise SystemExit("closes_daily.csv is required for WFO cointegration testing.")
 
-    # ── Load EV-optimal params from Z-Bounce Density Profiler (step 3h) ──────────
+    # load data
     _z_profiles: dict[str, dict] = {}
     _zp_path = DATA_DIR / "z_profiles.csv"
     if _zp_path.exists():
@@ -1230,7 +1226,7 @@ def main():
     else:
         print("No z_profiles.csv — using grid search (run z_profiler.py for faster WFO)")
 
-    # ── Load Global Macro-HMM Regime ──────────────────────────────────────────
+    # load data
     if args.no_hmm:
         global_hmm = None
         print("Macro-HMM filter: DISABLED (--no-hmm flag)")
@@ -1244,7 +1240,7 @@ def main():
         else:
             print("Macro-HMM filter: global_hmm_regime.csv not found — DISABLED")
 
-    # ── Apply date range filter ───────────────────────────────────────────────
+    # optional date filter
     if args.start:
         start_ts = pd.Timestamp(args.start).tz_localize("US/Eastern")
         closes = closes[closes.index >= start_ts]
@@ -1356,7 +1352,7 @@ def main():
             spread_daily = daily_train[t1] - dynamic_beta * daily_train[t2]
             dynamic_hl   = compute_half_life(spread_daily) * BARS_PER_DAY
 
-            # ── OU Half-life gate: reject lazy pairs ──────────────────────────
+            # skip if mean reversion is too slow for the window
             if dynamic_hl > hl_max_bars:
                 continue  # mean-reversion too slow for the OOS window
             
@@ -1486,7 +1482,7 @@ def main():
             best["train_returns"] = _trades_to_daily_pnl(train_trades, daily_train.index)
             window_best[pair_name] = best
             
-        # ── 6. Portfolio Optimization (MVO) ───────────
+        # 6. Portfolio Optimization (MVO)
         active_pairs = list(window_best.keys())
         if active_pairs:
             train_returns_df = pd.DataFrame({p: window_best[p]["train_returns"] for p in active_pairs}).fillna(0)
@@ -1501,7 +1497,7 @@ def main():
         else:
             optimal_weights = {}
 
-        # ── 7. OOS Execution (Second Pass with Weights) ───────────
+        # 7. OOS Execution (Second Pass with Weights)
         for pair_name in active_pairs:
             t1, t2 = pair_name.split("-")
             best = window_best[pair_name]
@@ -1683,7 +1679,7 @@ def main():
               "Check that pairs_selected.csv matches closes data.")
         return
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # save
     df_trades = pd.DataFrame(all_oos_trades)
     df_params = pd.DataFrame(wfo_params)
 
@@ -1720,7 +1716,7 @@ def main():
     df_trades.to_csv(DATA_DIR / "wfo_results.csv", index=False)
     df_params.to_csv(DATA_DIR / "wfo_params.csv",  index=False)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # summary
     pnl       = df_trades["net_pnl"]
     win_rate  = (pnl > 0).mean() * 100
     total_pnl = pnl.sum()
@@ -1758,7 +1754,7 @@ def main():
     print(f"\nSaved → data/wfo_results.csv  ({n_trades} trades)")
     print(f"Saved → data/wfo_params.csv   ({len(df_params)} rows)")
 
-    # ── Per-pair WFO stability summary ────────────────────────────────────────
+    # per-pair WFO stability summary
     print(f"\n{'Pair':<12}  {'Windows':>7}  {'OOS Sh':>7}  {'Train Sh':>9}  "
           f"{'OOS Trades':>10}  {'OOS P&L':>10}")
     print("-" * 65)
@@ -1772,7 +1768,7 @@ def main():
         print(f"{pair:<12}  {n_w:>7}  {avg_oos_sh:>7.2f}  "
               f"{avg_train_sh:>9.2f}  {tot_tr:>10}  {tot_pnl:>+10.4f}")
 
-    # ── Visualization ─────────────────────────────────────────────────────────
+    # visualization
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     fig, axes = plt.subplots(2, 1, figsize=(16, 12))
@@ -1838,7 +1834,7 @@ def main():
     ax2.legend(fontsize=7, ncol=3, loc="upper left")
     ax2.grid(True, alpha=0.2)
 
-    # Add correlation annotation
+    # Add correlation annotation    
     if len(df_params) > 5:
         corr = df_params[["train_sharpe", "oos_sharpe"]].corr().iloc[0, 1]
         ax2.text(0.02, 0.97, f"r(train, OOS) = {corr:.2f}",

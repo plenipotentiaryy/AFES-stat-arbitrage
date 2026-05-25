@@ -88,7 +88,7 @@ def fetch_range(client: RESTClient, ticker: str,
     return df[~df.index.duplicated(keep="first")]
 
 
-# ── Build download work list ──────────────────────────────────────────────────
+# work list for download
 closes_path = DATA_DIR / CLOSES_FILE
 existing_closes: pd.DataFrame | None = None
 
@@ -164,7 +164,7 @@ else:
         print(f"  ... and {len(work_list) - 10} more")
     print()
 
-# ── Parallel download ─────────────────────────────────────────────────────────
+# download in parallel
 all_data: dict[str, tuple[pd.DataFrame, str]] = {}   # ticker → (df, mode)
 _lock    = threading.Lock()
 _counter = [0]
@@ -203,7 +203,7 @@ if work_list:
         for f in as_completed(futures):
             f.result()
 
-# ── Merge into existing CSVs ──────────────────────────────────────────────────
+# merge new data into existing files
 if all_data:
     for filename, col_key in [
         (CLOSES_FILE,  "close"),
@@ -236,7 +236,7 @@ else:
     print("No new data downloaded — CSVs unchanged.")
 
 
-# ── Gap audit ─────────────────────────────────────────────────────────────────
+# check for gaps in data
 print("\n── Gap audit ─────────────────────────────────────────────────────────")
 closes = pd.read_csv(closes_path, index_col=0, parse_dates=True)
 if closes.index.tz is None:

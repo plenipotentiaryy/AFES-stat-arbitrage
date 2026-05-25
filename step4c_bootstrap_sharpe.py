@@ -75,7 +75,6 @@ def probabilistic_sharpe(returns, target=TARGET_SHARPE):
     return float(stats.norm.cdf(z))
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 for label, path in [("Base (all trades)", DATA_DIR / "trades.csv"),
                     ("Capped (max-7)",   DATA_DIR / "trades_capped.csv")]:
     if not path.exists(): continue

@@ -36,7 +36,7 @@ VIX_HIGH   = 25.0
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# data loading
 
 def load_daily() -> pd.DataFrame:
     path = DATA_DIR / "closes_daily.csv"
@@ -52,8 +52,6 @@ def load_daily() -> pd.DataFrame:
 
 def load_closes() -> pd.DataFrame:
     path = DATA_DIR / CLOSES_FILE
-    if not path.exists():
-        path = DATA_DIR / "closes_15min.csv"
     df = pd.read_csv(path, index_col=0, parse_dates=True)
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, utc=True)
@@ -75,7 +73,7 @@ def load_vix_daily() -> pd.Series | None:
     return None
 
 
-# ── Backtest engine (lean, no sizing) ────────────────────────────────────────
+# backtest engine (lean, no sizing)
 
 def run_backtest(df: pd.DataFrame, t1: str, t2: str, beta: float,
                  entry_z: float, exit_z: float, stop_z: float,
@@ -131,7 +129,7 @@ def run_backtest(df: pd.DataFrame, t1: str, t2: str, beta: float,
             if z < -entry_z: pos = 1
             elif z > entry_z: pos = -1
             if pos != 0:
-                # ── Hurst drift guard ─────────────────────────────
+                # hurst drift guard
                 if hurst_filter is not None and spread_daily is not None:
                     ts = df.index[i]
                     d_prev = (ts - pd.Timedelta(days=1)).normalize()
@@ -177,7 +175,7 @@ def metrics(trades: list[dict], days: float) -> dict:
             "pnl": round(float(pnl.sum()), 4), "dd": round(dd, 4)}
 
 
-# ── Load data ─────────────────────────────────────────────────────────────────
+# load data
 
 closes_all = load_closes()
 daily_all = load_daily()
@@ -292,9 +290,7 @@ if not wf_df.empty:
     print(f"\nWalk-forward chart saved → {OUTPUT_DIR / 'stress_walkforward.png'}")
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # 2. VIX REGIME BREAKDOWN
-# ═══════════════════════════════════════════════════════════════════════
 
 print(f"\n{'='*70}")
 print("VIX REGIME BREAKDOWN")
@@ -350,9 +346,7 @@ else:
     print("  VIX data not available — run step7_iv.py first")
 
 
-# ═══════════════════════════════════════════════════════════════════════
 # 3. "TRADE TODAY?" DECISION
-# ═══════════════════════════════════════════════════════════════════════
 
 print(f"\n{'='*70}")
 print("TRADE TODAY? — LIVE SIGNAL")
