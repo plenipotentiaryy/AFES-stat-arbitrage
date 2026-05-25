@@ -531,8 +531,48 @@ IV_MULT_MIN          = 0.5   # half size when IV is at its highest
 MIN_POSITION_SIZE    = 0.10  # skip trade entirely if combined size below this
 
 INITIAL_CAPITAL = 10_000        # starting portfolio balance in USD
-ALLOCATION_METHOD = "riskparity"   # "equal" | "sharpe" | "markowitz" | "riskparity"
+ALLOCATION_METHOD = "riskparity"   # "equal" | "sharpe" | "markowitz" | "riskparity" | "hrp"
 MAX_PAIR_WEIGHT   = 0.15        # cap: no single pair gets more than 15% of capital
+
+# ── WFO pair-quality gate ────────────────────────────────────────────────────
+# When the train-window grid search produces a "best" parameter set whose
+# Sharpe or total PnL falls at or below the configured floors, AFES skips
+# the OOS pass for that pair in that window.  The check is per-window: a
+# pair that fails one window is still re-evaluated in the next one.  Set
+# the floor to a negative number to disable a specific check; setting both
+# to -inf disables the gate entirely.
+WFO_MIN_TRAIN_SHARPE = 0.0
+WFO_MIN_TRAIN_PNL    = 0.0
+
+# ── Single-Bullet Entry Guard (Section 7.4) ─────────────────────────────────
+# When the per-bar RegimeState.sbr exceeds SBR_GUARD_THRESHOLD the trading
+# loop tightens the active stop-loss to SBR_GUARD_STOP_MULT * entry_z_base
+# (only if that produces a tighter stop than the otherwise-effective one).
+# Grid averaging and multi-entry are structurally disallowed in the current
+# AFES backtest loops, so the multiplier on stop_z is the only behavioural
+# knob this guard exposes today.  Set SBR_GUARD_ENABLED = False to disable.
+SBR_GUARD_ENABLED   = True
+SBR_GUARD_THRESHOLD = 0.60
+SBR_GUARD_STOP_MULT = 1.5
+
+# ── Active ticker correlation throttle (Section 7.3) ─────────────────────────
+# When a new trade's pair shares a ticker with an already-open position and
+# the 90-day spread correlation exceeds the threshold, AFES treats it as
+# hidden concentration risk.  Choose how to enforce the rule via
+# CORR_BLOCK_MODE:
+#   "DISABLED" — no enforcement.
+#   "SCALE"    — multiply size of the new trade by CORR_BLOCK_SCALE.
+#   "HARD"     — drop the new trade entirely.
+CORR_BLOCK_MODE        = "SCALE"
+CORR_BLOCK_THRESHOLD   = 0.65
+CORR_BLOCK_SCALE       = 0.25
+CORR_BLOCK_WINDOW_DAYS = 90
+
+# ── Covariance regularization (Ledoit-Wolf shrinkage) ────────────────────────
+# When True, optimize_portfolio_weights() in step3j_wfo applies analytical
+# Ledoit-Wolf shrinkage before MVO.  Stabilises Σ for large universes where the
+# empirical estimate has poorly-conditioned eigenvalues.
+COVARIANCE_SHRINKAGE = True
 
 TARGET_RISK_USD = 150.0         # volatility scaling: target dollar risk per trade (1σ of spread)
 
@@ -562,3 +602,74 @@ OUTPUT_DIR = Path("output")
 # ── The Black Swan Hedge (Tail Risk Convexity) ───────────────────────────────
 TAIL_HEDGE_DRAG_ANNUAL = 0.015  # 1.5% annual drag on portfolio (buying far OTM Puts)
 TAIL_HEDGE_PAYOUT_MULT = 10.0   # Convexity multiplier when HMM detects Panic
+
+# ── Pair-Level Performance Feedback (PerformanceFeedbackTracker) ─────────────
+# Independent loop based on Return-on-Notional with Bayesian shrinkage; lives
+# alongside the post-trade shadow buffer (separate module: feedback.py).
+PFB_WINDOW         = 10      # N_window — rolling buffer length per pair
+PFB_K_PRIOR        = 3.0     # K — Bayesian shrinkage strength
+PFB_SR_PRIOR       = 1.0     # SR_prior — neutral prior Sharpe
+PFB_S_MIN          = 0.2     # S_min — floor of S_perf
+PFB_S_MAX          = 1.2     # S_max — ceiling of S_perf (allows boost)
+PFB_SR_FLOOR       = -0.1    # SR_floor — underperformance cut-off
+PFB_SR_TARGET      = 1.2     # SR_target — outperformance saturation
+PFB_EPSILON        = 1e-6    # ε — zero-variance denominator floor
+PFB_ENABLED        = False   # global kill-switch (backward compat)
+
+
+# ── Post-Trade Learning (online retraining + θ search + S_perf) ──────────────
+POSTTRADE_SHADOW_N     = 100    # FIFO size of the per-pair virtual-trade buffer
+POSTTRADE_RETRAIN_K    = 5      # retrain MetaGate + retune θ every K buffer adds
+POSTTRADE_MIN_BUFFER   = 15     # cold-start: skip retrain/retune until N ≥ this
+POSTTRADE_THETA_GRID_LO = 0.45  # lower bound of θ grid search
+POSTTRADE_THETA_GRID_HI = 0.65
+POSTTRADE_THETA_GRID_STEP = 0.01
+
+POSTTRADE_PERF_M       = 10     # rolling window of executed-trade PnLs for SR_M
+POSTTRADE_SR_FLOOR     = 0.0    # SR ≤ this → S_perf clipped to 0.2
+POSTTRADE_SR_TARGET    = 1.2    # SR ≥ this → S_perf clipped to 1.2
+POSTTRADE_SPERF_FLOOR  = 0.2    # minimum allowable pair-health multiplier
+POSTTRADE_BARS_PER_YEAR = 252   # annualisation factor for SR_M
+POSTTRADE_ENABLED      = False  # global kill-switch (backward compat)
+
+
+# ── Online Parameter Adaptation (between WFO refits) ─────────────────────────
+# Layer 1 (Adaptive EWMA window — driven by composite Break Score Bt):
+ADAPT_ALPHA          = 0.5     # window compression factor; W_t shrinks by α·(Bt/B_max)
+ADAPT_W_MIN          = 20      # minimum allowable EWMA window (statistical floor)
+ADAPT_W_MAX          = 300     # maximum allowable EWMA window (sanity cap)
+ADAPT_B_MAX          = 4.5     # critical break-score threshold (B_max)
+
+# Layer 2 (Volatility-adjusted entry — driven by σ_fast / σ_slow ratio):
+ADAPT_GAMMA          = 1.0     # vol sensitivity; entry_z widens proportionally
+ADAPT_BREAK_BETA     = 0.10    # β in entry_z_eff = base*(1+γ·vol_excess)+β·B_t
+ADAPT_SIGMA_FAST_BARS = 20     # short-horizon vol window for spread diffs
+ADAPT_SIGMA_SLOW_BARS = 200    # long-horizon baseline vol window
+ADAPT_ENTRY_Z_CAP    = 5.0     # absolute ceiling on adaptive entry_z
+
+# Layer 3 (Drift-tightened stop — driven by live CUSUM Ct):
+ADAPT_ETA            = 0.4     # max stop tightening fraction
+ADAPT_DELTA          = 0.6     # min stop-ratio floor to prevent noise-induced exits
+ADAPT_STOP_Z_FLOOR   = 1.5     # absolute floor on adaptive stop_z
+
+# CUSUM parameters reused for both Bt input and stop-adaptation:
+ADAPT_CUSUM_K        = 0.5     # slack (σ units)
+ADAPT_CUSUM_H        = 5.0     # alarm threshold (σ units)
+
+# Numerical and operational:
+ADAPT_EPSILON        = 1e-9    # var floor inside EWMA z-score denominator
+ADAPT_DIAG_CSV       = "adaptive_params_log.csv"
+ADAPT_ENABLED        = False   # global default kill-switch (preserves legacy behaviour)
+
+
+# ── MetaGate (Bayesian/Ensemble gate aggregator) ─────────────────────────────
+# Confidence-score boundaries and meta-model decision parameters.
+METAGATE_HURST_LO     = 0.50   # H ≤ → s_Hurst = 1.0 (perfect mean-reversion)
+METAGATE_HURST_HI     = 0.65   # H ≥ → s_Hurst = 0.0 (trending / unsafe)
+METAGATE_BREAK_HI     = 4.5    # composite break score where s_Break → 0
+METAGATE_CUSUM_H      = 5.0    # CUSUM threshold; C ≥ → s_CUSUM = 0
+METAGATE_THETA_ENTRY  = 0.52   # P(Win) gate threshold for live execution
+METAGATE_MIN_TRAIN_N  = 15     # < N training trades → fallback to AND-gate
+METAGATE_GBM_MIN_N    = 40     # ≥ N → switch from logit to HistGradientBoosting
+METAGATE_REQUIRE_USABLE = True # WFO skips pair-window if no fitted/calibrated MetaGate
+METAGATE_DIAG_CSV     = "metagate_diagnostics.csv"
