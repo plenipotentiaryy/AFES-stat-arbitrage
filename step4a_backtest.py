@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+from numba import njit
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from config import (
@@ -28,8 +31,31 @@ from filters import (
     CointegrationFilter, MacroFilter, HurstFilter,
     validate_kde_density, BreakVelocityDetector, _LAZY_WINDOW_BARS,
     compute_break_scores_vectorized,
+    OnlineParameterAdapter, compute_adaptive_arrays,
 )
-from config import HURST_ENTRY_WINDOW
+from feedback import PerformanceFeedbackTracker
+from regime import (
+    RegimeState,
+    compute_effective_trade_knobs,
+    time_since_break_series,
+    shift_daily_to_t1,
+    apply_sbr_guard,
+)
+from config import (
+    HURST_ENTRY_WINDOW,
+    ADAPT_ALPHA, ADAPT_GAMMA, ADAPT_ETA, ADAPT_DELTA,
+    ADAPT_W_MIN, ADAPT_W_MAX, ADAPT_B_MAX,
+    ADAPT_CUSUM_K, ADAPT_CUSUM_H,
+    ADAPT_SIGMA_FAST_BARS, ADAPT_SIGMA_SLOW_BARS,
+    ADAPT_ENTRY_Z_CAP, ADAPT_STOP_Z_FLOOR,
+    ADAPT_EPSILON, ADAPT_DIAG_CSV, ADAPT_ENABLED,
+    CORR_BLOCK_MODE, CORR_BLOCK_THRESHOLD,
+    CORR_BLOCK_SCALE, CORR_BLOCK_WINDOW_DAYS,
+    SBR_GUARD_ENABLED, SBR_GUARD_THRESHOLD, SBR_GUARD_STOP_MULT,
+)
+from risk.ticker_overlap import (
+    TickerOverlapBlocker, compute_spread_correlations, filter_trade_list,
+)
 from tail_ev_profiler import TailAdjustedEVProfiler
 from regime_memory import RegimeMemoryWeighter
 from toxicity import HawkesToxicityFilter
@@ -280,6 +306,60 @@ def ou_params_from_spread(spread: pd.Series) -> tuple[float, float, float]:
     return max(theta, 1e-6), mu, float(reg.resid.std())
 
 
+@njit(cache=True)
+def _ou_mc_grid_kernel(entry_grid: np.ndarray, exit_grid: np.ndarray, stop_grid: np.ndarray,
+                       theta: float, sig_z: float, c_z_exit: float, c_z_stop: float,
+                       n_sim: int, max_bars: int, seed: int):
+    """Triple-grid OU Monte Carlo. Returns (best_z_e, best_z_x, best_z_s, best_rate)."""
+    np.random.seed(seed)
+    best_rate = -1e18
+    best_e, best_x, best_s = 0.0, 0.0, 0.0
+
+    for ie in range(entry_grid.shape[0]):
+        z_e = entry_grid[ie]
+        for ix in range(exit_grid.shape[0]):
+            z_x = exit_grid[ix]
+            if z_x >= z_e:
+                continue
+            for isz in range(stop_grid.shape[0]):
+                z_s = stop_grid[isz]
+                if z_s <= z_e:
+                    continue
+
+                # Path-level state
+                pnl_sum = 0.0
+                t_end_sum = 0.0
+                for p in range(n_sim):
+                    z = -z_e
+                    done_t = 0
+                    done_pnl = 0.0
+                    for t in range(1, max_bars + 1):
+                        z = z * (1.0 - theta) + sig_z * np.random.normal()
+                        if z >= z_x:
+                            done_pnl = z_e + z_x - c_z_exit
+                            done_t = t
+                            break
+                        if z <= -z_s:
+                            done_pnl = z_e - z_s - c_z_stop
+                            done_t = t
+                            break
+                    if done_t == 0:
+                        # timed out
+                        done_pnl = -c_z_stop
+                        done_t = max_bars
+                    pnl_sum += done_pnl
+                    t_end_sum += done_t
+
+                mean_pnl = pnl_sum / n_sim
+                mean_t   = t_end_sum / n_sim
+                rate = mean_pnl / mean_t if mean_t > 0 else -1e18
+                if rate > best_rate:
+                    best_rate = rate
+                    best_e, best_x, best_s = z_e, z_x, z_s
+
+    return best_e, best_x, best_s, best_rate
+
+
 def optimal_thresholds(theta: float, sigma_roll: float, notional: float,
                        n_sim: int = 5000, max_bars: int = 1500
                        ) -> tuple[float, float, float]:
@@ -291,52 +371,24 @@ def optimal_thresholds(theta: float, sigma_roll: float, notional: float,
     P&L_exit = z_e + z_x - c_z_exit   (spread moved from -z_e to z_x)
     P&L_stop = z_e - z_s - c_z_stop   (spread moved against us to -z_s)
     """
-    rng   = np.random.default_rng()
     c_z_exit = 2 * COST_MAKER * notional / max(sigma_roll, 1e-8)
     c_z_stop = (COST_MAKER + COST_TAKER) * notional / max(sigma_roll, 1e-8)
     sig_z = np.sqrt(2 * theta)
 
-    entry_grid = np.arange(1.5, 3.75, 0.25)  # [1.5 … 3.5]  (8 values)
-    exit_grid  = np.arange(-0.3, 1.05, 0.1)  # [-0.3 … 1.0] fine step for exit-past-zero
-    stop_grid  = np.arange(3.0,  5.5,  0.5)  # [3.0 … 5.0]  (5 values)
+    entry_grid = np.arange(1.5, 3.75, 0.25)
+    exit_grid  = np.arange(-0.3, 1.05, 0.1)
+    stop_grid  = np.arange(3.0,  5.5,  0.5)
 
-    best_rate = -np.inf
-    best      = (float(ENTRY_Z), float(EXIT_Z), float(STOP_Z))
-
-    for z_e in entry_grid:
-        for z_x in exit_grid:
-            if z_x >= z_e:          # exit must be less extreme than entry
-                continue
-            for z_s in stop_grid:
-                if z_s <= z_e:      # stop must be more extreme than entry
-                    continue
-
-                z     = np.full(n_sim, -z_e)
-                done  = np.zeros(n_sim, bool)
-                pnl   = np.zeros(n_sim)
-                t_end = np.full(n_sim, float(max_bars))
-
-                for t in range(1, max_bars + 1):
-                    if done.all():
-                        break
-                    z = np.where(done, z, z * (1 - theta) + sig_z * rng.standard_normal(n_sim))
-                    he = (~done) & (z >= z_x)
-                    hs = (~done) & (z <= -z_s)
-                    pnl   = np.where(he,       z_e + z_x - c_z_exit,  pnl)
-                    pnl   = np.where(hs & ~he, z_e - z_s  - c_z_stop, pnl)
-                    t_end = np.where((he | hs) & ~done, float(t), t_end)
-                    done  = done | he | hs
-
-                pnl = np.where(~done, -c_z_stop, pnl)   # timed-out: pay cost, no profit
-
-                rate = float(pnl.mean()) / float(t_end.mean())
-                if rate > best_rate:
-                    best_rate = rate
-                    best      = (z_e, z_x, z_s)
+    z_e, z_x, z_s, best_rate = _ou_mc_grid_kernel(
+        entry_grid.astype(np.float64), exit_grid.astype(np.float64), stop_grid.astype(np.float64),
+        float(theta), float(sig_z), float(c_z_exit), float(c_z_stop),
+        int(n_sim), int(max_bars),
+        int(np.random.randint(0, 2**31 - 1)),
+    )
 
     if best_rate <= 0:
         return float(ENTRY_Z), float(EXIT_Z), float(STOP_Z)
-    return round(best[0], 2), round(best[1], 2), round(best[2], 2)
+    return round(z_e, 2), round(z_x, 2), round(z_s, 2)
 
 
 
@@ -498,7 +550,11 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                   hurst_filter: HurstFilter | None = None,
                   spread_daily: pd.Series | None = None,
                   oos_start: pd.Timestamp | None = None,
-                  max_hold_bars: int = 9999) -> pd.DataFrame:
+                  max_hold_bars: int = 9999,
+                  adaptive: bool = ADAPT_ENABLED,
+                  adaptive_w_base: int | None = None,
+                  adaptive_diag_path: str | None = None,
+                  feedback_tracker: PerformanceFeedbackTracker | None = None) -> pd.DataFrame:
     """
     Refactored for Robustness:
     1. Returns raw spread-unit P&L (gross_pnl_raw, notional_raw) for global compounding.
@@ -518,6 +574,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     _blocked_macro = _blocked_size = _blocked_tail = _blocked_rvol = _blocked_vel = _blocked_coint = _blocked_hurst = 0
     _blocked_toxicity = 0
     entry_size_mult = 1.0
+    entry_s_perf    = 1.0  # PerformanceFeedbackTracker multiplier at entry
 
     has_m15  = "z_m15" in df.columns
     is_m15_s = df["is_m15_close"] if "is_m15_close" in df.columns else pd.Series(True, index=df.index)
@@ -551,6 +608,59 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
     else:
         is_volatile_arr = np.zeros(len(df), dtype=bool)
 
+    # ── Online Parameter Adaptation arrays ──────────────────────────────────
+    # When `adaptive=False` (default) every per-bar reference falls back to
+    # the static scalars, preserving bit-identical legacy behaviour.
+    adaptive_entry_z_arr = None
+    adaptive_stop_z_arr  = None
+    adaptive_window_arr  = None
+    adaptive_b_arr       = None
+    adaptive_c_arr       = None
+    adaptive_blocked     = 0
+    if adaptive:
+        from metagate import rolling_cusum, simple_break_score
+        z_for_adapt = zscore_arr
+        c_arr = rolling_cusum(z_for_adapt, k=ADAPT_CUSUM_K, h=ADAPT_CUSUM_H)
+        b_arr = simple_break_score(z_for_adapt, c_arr, h_cusum=ADAPT_CUSUM_H)
+        # σ_fast / σ_slow on spread differences (consistent with the
+        # OnlineParameterAdapter state machine).
+        diffs = pd.Series(spread_arr).diff().fillna(0.0)
+        sf = diffs.rolling(ADAPT_SIGMA_FAST_BARS,
+                           min_periods=ADAPT_SIGMA_FAST_BARS).std().bfill().to_numpy(dtype=np.float64)
+        ss = diffs.rolling(ADAPT_SIGMA_SLOW_BARS,
+                           min_periods=ADAPT_SIGMA_FAST_BARS).std().bfill().to_numpy(dtype=np.float64)
+        if adaptive_w_base is None:
+            # Default to the median rolling-std window inferred from
+            # spread_std_arr. Fall back to a safe constant 60 when not
+            # determinable.
+            valid_std = spread_std_arr[np.isfinite(spread_std_arr)]
+            w_base_eff = 60 if len(valid_std) == 0 else 60  # build_signals uses a fixed window per pair
+        else:
+            w_base_eff = int(adaptive_w_base)
+        adaptive_window_arr, adaptive_entry_z_arr, adaptive_stop_z_arr, _, _, _ = compute_adaptive_arrays(
+            spread_arr, b_arr, c_arr, sf, ss,
+            w_base=w_base_eff, entry_z_base=entry_z, stop_z_base=stop_thresh,
+        )
+        adaptive_b_arr = b_arr
+        adaptive_c_arr = c_arr
+        # Live diagnostics — stream straight to CSV if requested
+        adapt_diag_rows: list = [] if adaptive_diag_path else None
+
+    # ── Unified RegimeState raw break/CUSUM arrays ───────────────────────
+    # RegimeState is constructed on every bar.  When the adaptive layer is
+    # active, reuse its already-computed B_t / C_t arrays so all downstream
+    # decisions see the same structural-risk measurements.  Otherwise compute
+    # the lightweight MetaGate-compatible proxy once for the loop.
+    if adaptive and adaptive_b_arr is not None and adaptive_c_arr is not None:
+        regime_b_arr = adaptive_b_arr
+        regime_c_arr = adaptive_c_arr
+    else:
+        from metagate import rolling_cusum as _rolling_cusum
+        from metagate import simple_break_score as _simple_break_score
+        regime_c_arr = _rolling_cusum(zscore_arr)
+        regime_b_arr = _simple_break_score(zscore_arr, regime_c_arr)
+    regime_t_since_break_arr = time_since_break_series(regime_b_arr)
+
     # Precompute sizing multipliers for all bars (vectorized for 100x speedup)
     if sizing_args:
         regimes = sizing_args.get("regimes")
@@ -560,6 +670,14 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
         global_hmm_s = sizing_args.get("global_hmm_s")
         corr_throttle_s = sizing_args.get("corr_throttle_s")
         hrp_w = sizing_args.get("hrp_w") or {}
+
+        # Shift every daily-frequency series by one day so as-of lookups on
+        # intraday timestamps return only T-1 information.  Each series is
+        # shifted exactly once here, at the consumer boundary.
+        iv_mult_s = shift_daily_to_t1(iv_mult_s)
+        macro_alert_s = shift_daily_to_t1(macro_alert_s)
+        global_hmm_s = shift_daily_to_t1(global_hmm_s)
+        corr_throttle_s = shift_daily_to_t1(corr_throttle_s)
 
         m = mc_conf.get(pair_name, 1.0)
         h = hrp_w.get(pair_name, 1.0)
@@ -640,6 +758,51 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
         is_broken  = is_broken_arr[i]
         is_broken_pos = is_broken_pos_arr[i]
         is_broken_neg = is_broken_neg_arr[i]
+        if macro_filter is not None:
+            hmm_val = macro_filter.get_hmm_regime(ts)
+            kmeans_val = macro_filter.get_kmeans_regime(ts)
+        else:
+            hmm_val = 0
+            kmeans_val = 1
+        regime_state = RegimeState(
+            timestamp=ts,
+            hmm_regime=hmm_val,
+            kmeans_regime=kmeans_val,
+            break_score=regime_b_arr[i],
+            cusum_val=regime_c_arr[i],
+            hurst_val=0.5,
+            adf_p_value=0.0,
+            rcdp_score=0.5,
+            vol_ratio=df["vol_ratio"].iloc[i] if "vol_ratio" in df.columns else 1.0,
+            time_since_break=regime_t_since_break_arr[i],
+        )
+        if adaptive:
+            eff_knobs = compute_effective_trade_knobs(
+                regime_state,
+                entry_z_base=entry_z,
+                stop_z_base=stop_thresh,
+                max_hold_base=max_hold_bars,
+            )
+            effective_entry_z = eff_knobs.entry_z_eff
+            effective_stop_z = eff_knobs.stop_z_eff
+            effective_max_hold = eff_knobs.max_hold_eff
+        else:
+            effective_entry_z = entry_z
+            effective_stop_z = stop_thresh
+            effective_max_hold = max_hold_bars
+
+        # Section 7.4: Single-Bullet Entry Guard tightens the stop in high
+        # structural-break-risk regimes.  See regime.apply_sbr_guard for the
+        # rule: returns the *tighter* of (adaptive stop, 1.5 * entry_z) when
+        # regime_state.sbr exceeds the threshold.
+        effective_stop_z = apply_sbr_guard(
+            regime_state,
+            entry_z_base=entry_z,
+            current_stop_z=effective_stop_z,
+            threshold=SBR_GUARD_THRESHOLD,
+            stop_mult=SBR_GUARD_STOP_MULT,
+            enabled=SBR_GUARD_ENABLED,
+        )
 
         # ── Phase 1: cointegration validity ───────────
         if coint_filter is not None:
@@ -665,7 +828,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 suspended = True # Structural break detected
                 print(f"[DEBUG] {t1}-{t2} at {ts}: pos={position}, z={z_active:.2f}, s_pos={trade_s_pos:.2f}, s_neg={trade_s_neg:.2f}, is_broken={is_broken}, against={is_broken_against}")
         else:
-            force_close = suspended or (macro_filter is not None and macro_filter.is_force_close(ts))
+            force_close = suspended or regime_state.is_panic()
 
         if position != 0 and force_close:
             pnl_raw        = position * (spread_now - entry_spread)
@@ -676,7 +839,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             tox_mult = toxicity_filter.get_execution_penalty(tox_intensity)
             
             # Apply Panic Multiplier to Taker cost if forced out by macro panic
-            is_panic = macro_filter.is_force_close(ts) if macro_filter else False
+            is_panic = regime_state.is_panic()
             cost_mult = (COST_PANIC_MULTIPLIER if is_panic else 1.0) * tox_mult
             tx_cost_raw    = notional_raw * (COST_MAKER + COST_TAKER * cost_mult)
             
@@ -684,8 +847,15 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
             short_notl_raw = (abs(entry_beta) * entry_t2) if position == 1 else entry_t1
             borrow_raw     = short_notl_raw * BORROW_RATE_ANNUAL * holding_days / 252
             
-            reason = ("BREAK_VELOCITY" if is_broken_against else 
-                      ("COINT_BREAK" if suspended else macro_filter.force_close_reason(ts)))
+            if is_broken_against:
+                reason = "BREAK_VELOCITY"
+            elif suspended:
+                reason = "COINT_BREAK"
+            elif macro_filter is not None:
+                reason = macro_filter.force_close_reason(ts)
+            else:
+                reason = "FORCE_CLOSE"
+            net_pnl_val = pnl_raw - tx_cost_raw - borrow_raw
             trades.append({
                 "pair":         f"{t1}-{t2}",
                 "entry_time":   df.index[entry_bar],
@@ -699,13 +869,18 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 "gross_pnl":    round(pnl_raw, 4),
                 "tx_cost":      round(tx_cost_raw, 4),
                 "borrow_cost":  round(borrow_raw, 4),
-                "net_pnl":      round(pnl_raw - tx_cost_raw - borrow_raw, 4),
+                "net_pnl":      round(net_pnl_val, 4),
                 "exit_reason":  reason,
                 "entry_z":      round(zscore_arr[entry_bar], 2),
                 "exit_z":       round(z_active, 2),
                 "beta":         entry_beta,
-                "size_mult":    entry_size_mult
+                "size_mult":    entry_size_mult,
+                "s_perf":       entry_s_perf,
             })
+            if feedback_tracker is not None:
+                feedback_tracker.add_trade(
+                    pair_name or f"{t1}-{t2}", net_pnl_val, notional_raw
+                )
             position = 0
             trade_s_pos = 0.0
             trade_s_neg = 0.0
@@ -714,16 +889,26 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
         # ── Normal exit / stop / time-stop ───────────────────────────────
         if position != 0:
             bars_held   = i - entry_bar
-            time_stop   = bars_held >= max_hold_bars
+            time_stop   = bars_held >= effective_max_hold
+            live_stop_thresh = effective_stop_z if adaptive else active_stop_thresh
 
             # Exit signal now uses FROZEN z_active to avoid Kalman Illusion
             exit_signal = is_m15 and (not time_stop) and (
                 (position == 1 and z_active >= active_exit_thresh) or
                 (position == -1 and z_active <= -active_exit_thresh))
-            
+
             stop_signal = (not time_stop) and (
-                (position == 1 and z_active <= -active_stop_thresh) or 
-                (position == -1 and z_active >= active_stop_thresh))
+                (position == 1 and z_active <= -live_stop_thresh) or
+                (position == -1 and z_active >= live_stop_thresh))
+
+            # Bookkeeping: count adaptive-tightening-caused early exits.
+            if (adaptive and stop_signal and (not exit_signal) and (not time_stop)
+                    and live_stop_thresh < active_stop_thresh):
+                static_would_stop = (
+                    (position == 1 and z_active <= -active_stop_thresh) or
+                    (position == -1 and z_active >= active_stop_thresh))
+                if not static_would_stop:
+                    adaptive_blocked += 1
 
             if exit_signal or stop_signal or time_stop:
                 pnl_raw        = position * (spread_now - entry_spread)
@@ -734,6 +919,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 short_notl_raw = (abs(entry_beta) * entry_t2) if position == 1 else entry_t1
                 borrow_raw     = short_notl_raw * BORROW_RATE_ANNUAL * holding_days / 252
 
+                net_pnl_val = pnl_raw - tx_cost_raw - borrow_raw
                 trades.append({
                     "pair":         f"{t1}-{t2}",
                     "entry_time":   df.index[entry_bar],
@@ -747,13 +933,18 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                     "gross_pnl":    round(pnl_raw, 4),
                     "tx_cost":      round(tx_cost_raw, 4),
                     "borrow_cost":  round(borrow_raw, 4),
-                    "net_pnl":      round(pnl_raw - tx_cost_raw - borrow_raw, 4),
+                    "net_pnl":      round(net_pnl_val, 4),
                     "exit_reason":  "STOP" if stop_signal else ("TIME_STOP" if time_stop else "SIGNAL"),
                     "entry_z":      round(zscore_arr[entry_bar], 2),
                     "exit_z":       round(z_active, 2),
                     "beta":         entry_beta,
-                    "size_mult":    entry_size_mult
+                    "size_mult":    entry_size_mult,
+                    "s_perf":       entry_s_perf,
                 })
+                if feedback_tracker is not None:
+                    feedback_tracker.add_trade(
+                        pair_name or f"{t1}-{t2}", net_pnl_val, notional_raw
+                    )
                 position = 0
                 trade_s_pos = 0.0
                 trade_s_neg = 0.0
@@ -767,7 +958,7 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 continue
             if is_broken:
                 continue
-            if macro_filter is not None and macro_filter.is_entry_blocked(ts):
+            if regime_state.is_panic():
                 _blocked_macro += 1
                 continue
             if sizing_args:
@@ -793,6 +984,14 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 threshold = entry_z
                 exit_thresh_live = exit_thresh
                 stop_thresh_live = stop_thresh
+
+            # ── Adaptive entry-threshold override ───────────────────────
+            # When adaptation is enabled the per-bar entry_z_t supersedes
+            # any regime-fixed threshold (regime sizing still applies via
+            # `sizing_mult_arr`, so this only relaxes/tightens entry).
+            if adaptive:
+                threshold = effective_entry_z
+                stop_thresh_live = effective_stop_z
 
             # ── Entry signal: 15-min Kalman z (forward-filled to 5-min bar) ──
             # Signal from 15-min bars is stable; entry executes on first 5-min
@@ -887,15 +1086,42 @@ def backtest_pair(df, t1, t2, beta, pair_name: str = "",
                 entry_alpha    = alpha_arr[next_i]
                 entry_std      = spread_std_arr[next_i]
                 entry_bar      = next_i
-                entry_size_mult = sz if sizing_args else 1.0
+                # Apply pair-level performance feedback (smooth damping of
+                # underperforming pairs / boost for outperformers).
+                if feedback_tracker is not None:
+                    entry_s_perf = float(feedback_tracker.get_multiplier(
+                        pair_name or f"{t1}-{t2}"))
+                else:
+                    entry_s_perf = 1.0
+                entry_size_mult = (sz if sizing_args else 1.0) * entry_s_perf
 
                 # Lock in the regime-conditioned thresholds for this trade
                 active_exit_thresh = exit_thresh_live
                 active_stop_thresh = stop_thresh_live
 
+                # Adaptive diagnostics — one row per executed entry.
+                if (adaptive and adaptive_diag_path is not None
+                        and adapt_diag_rows is not None):
+                    adapt_diag_rows.append({
+                        "timestamp":        df.index[i],
+                        "pair":             pair_name or f"{t1}-{t2}",
+                        "raw_spread":       float(spread_arr[i]),
+                        "break_score":      float(adaptive_b_arr[i]),
+                        "cusum":            float(adaptive_c_arr[i]),
+                        "adaptive_window":  int(adaptive_window_arr[i]),
+                        "adaptive_entry_z": float(effective_entry_z),
+                        "adaptive_stop_z":  float(effective_stop_z),
+                        "adaptive_max_hold": int(effective_max_hold),
+                        "realized_zscore":  float(zscore_arr[i]),
+                    })
+
     blocked = dict(macro=_blocked_macro, size=_blocked_size, tail=_blocked_tail,
                    rvol=_blocked_rvol, vel=_blocked_vel, coint=_blocked_coint,
-                   hurst=_blocked_hurst, toxicity=_blocked_toxicity)
+                   hurst=_blocked_hurst, toxicity=_blocked_toxicity,
+                   adaptive=adaptive_blocked)
+    if adaptive and adaptive_diag_path is not None and adapt_diag_rows:
+        from metagate import append_diagnostics
+        append_diagnostics(adaptive_diag_path, adapt_diag_rows)
     return pd.DataFrame(trades), blocked
 
 
@@ -1344,6 +1570,10 @@ for _, row in pairs.iterrows():
         for _, wfo_row in pair_schedule.iterrows():
             seg_start = wfo_row["oos_start"]
             seg_end = wfo_row["oos_end"]
+            if _oos_start is not None:
+                if seg_end <= _oos_start:
+                    continue
+                seg_start = max(seg_start, _oos_start)
             df_seg = df_sig[(df_sig.index >= seg_start) & (df_sig.index < seg_end)]
             if df_seg.empty:
                 continue
@@ -1530,6 +1760,43 @@ if not final_trades:
 
 df_trades = pd.DataFrame(final_trades).sort_values("exit_time")
 
+# ── Section 7.3: Active Ticker Correlation Throttling ────────────────────────
+# Resamples each pair's intraday spread to a daily series and runs the
+# correlation-overlap filter chronologically.  Configurable via CORR_BLOCK_MODE
+# (DISABLED | SCALE | HARD) — DISABLED is a no-op pass-through.
+if str(CORR_BLOCK_MODE).strip().upper() != "DISABLED" and not df_trades.empty:
+    _daily_spreads_for_corr: dict[str, pd.Series] = {}
+    for _pair, _data in pair_results.items():
+        _sig = _data.get("signals")
+        if _sig is None or "spread" not in _sig.columns:
+            continue
+        try:
+            _daily_spreads_for_corr[str(_pair)] = (
+                _sig["spread"].resample("1D").last().dropna()
+            )
+        except Exception:
+            continue
+    _spread_corr = compute_spread_correlations(
+        _daily_spreads_for_corr,
+        window_days=int(CORR_BLOCK_WINDOW_DAYS),
+    )
+    _overlap_blocker = TickerOverlapBlocker(
+        _spread_corr,
+        threshold=float(CORR_BLOCK_THRESHOLD),
+        mode=str(CORR_BLOCK_MODE),
+        scale=float(CORR_BLOCK_SCALE),
+    )
+    df_trades, _overlap_stats = filter_trade_list(
+        df_trades, _overlap_blocker, size_col=None,
+    )
+    if _overlap_stats.n_dropped or _overlap_stats.n_scaled:
+        print(
+            f"[Section 7.3] TickerOverlap mode={_overlap_blocker.mode} "
+            f"threshold={_overlap_blocker.threshold:.2f}: "
+            f"kept={_overlap_stats.n_kept} dropped={_overlap_stats.n_dropped} "
+            f"scaled={_overlap_stats.n_scaled}"
+        )
+
 # Copy the compounded trades back to pair_results so dollar_pnl and other columns are available
 for pair_name, data in pair_results.items():
     data["trades"] = df_trades[df_trades["pair"] == pair_name].copy()
@@ -1664,9 +1931,8 @@ except Exception as e:
 print(f"\n{'='*60}")
 print("OUT-OF-SAMPLE COMPARISON")
 print(f"{'='*60}")
-test_period = (pd.to_datetime(df_trades['exit_time'].iloc[-1])
-               - pd.to_datetime(df_trades['exit_time'].iloc[0])).days
 _oos_display = _oos_start.date() if _oos_start else closes.index[0].date()
+test_period = (closes.index[-1].date() - _oos_display).days
 print(f"Test period:       {_oos_display} → {closes.index[-1].date()} "
       f"({test_period} days)")
 print(f"Strategy  Sharpe:  {sharpe:.2f}")

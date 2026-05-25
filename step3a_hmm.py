@@ -1,10 +1,12 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from hmmlearn.hmm import GaussianHMM
+from joblib import Parallel, delayed
 from config import (
     CLOSES_FILE,
     ENTRY_Z, ENTRY_Z_VOLATILE, STOP_Z,
@@ -17,6 +19,7 @@ from config import (
 VOL_WINDOW = 20   # bars for rolling features
 N_SEEDS    = 10   # HMM restarts — pick best log-likelihood
 EXIT_Z_CMP = 0.0  # exit threshold used in the comparison backtest
+N_JOBS     = max(1, (os.cpu_count() or 4) - 1)  # leave one core free
 
 # ── Leak-free training parameters ─────────────────────────────────────────────
 # Per-pair HMM:   fit on bars BEFORE test_start_date, predict on test/OOS bars.
@@ -81,52 +84,54 @@ def build_features(spread: pd.Series) -> pd.DataFrame:
 # ── Fit HMM per pair (leak-free) ──────────────────────────────────────────────
 # Train on bars strictly BEFORE TEST_START; predict on bars >= TEST_START.
 # regimes.csv covers the OOS window only — backtest queries dates beyond.
-all_regimes: dict[str, pd.Series] = {}
-
-for _, row in pairs.iterrows():
-    t1, t2 = row["pair"].split("-")
-    beta   = row["beta"]
-
-    if t1 not in closes.columns or t2 not in closes.columns:
-        print(f"  SKIP {row['pair']}: missing ticker")
-        continue
-
-    spread_full = (closes[t1] - beta * closes[t2]).dropna()
-    feat_full   = build_features(spread_full)   # rolling features look back only
-
-    feat_train = feat_full[feat_full.index < TEST_START].tail(PER_PAIR_TRAIN_BARS)
-    feat_test  = feat_full[feat_full.index >= TEST_START]
-
+def _process_pair(pair_name: str, beta: float, s1: pd.Series, s2: pd.Series,
+                  test_start: pd.Timestamp) -> tuple[str, pd.Series | None, str]:
+    """Worker: build features, fit HMM, predict OOS labels. Returns (pair, series_or_None, msg)."""
+    spread_full = (s1 - beta * s2).dropna()
+    feat_full   = build_features(spread_full)
+    feat_train  = feat_full[feat_full.index < test_start].tail(PER_PAIR_TRAIN_BARS)
+    feat_test   = feat_full[feat_full.index >= test_start]
     if len(feat_train) < 200 or len(feat_test) < 50:
-        print(f"  SKIP {row['pair']}: insufficient features "
-              f"(train={len(feat_train)}, test={len(feat_test)})")
-        continue
-
+        return pair_name, None, (f"  SKIP {pair_name}: insufficient features "
+                                 f"(train={len(feat_train)}, test={len(feat_test)})")
     X_train = feat_train.values
     model   = fit_hmm(X_train)
     if model is None:
-        print(f"  SKIP {row['pair']}: HMM did not converge on train")
-        continue
-
-    # Identify volatile state from TRAIN only (no future leak)
+        return pair_name, None, f"  SKIP {pair_name}: HMM did not converge on train"
     states_train = model.predict(X_train)
     vol0 = X_train[states_train == 0, 0].mean()
     vol1 = X_train[states_train == 1, 0].mean()
     volatile_state = 0 if vol0 > vol1 else 1
-
-    # Predict on TEST bars using the train-fitted HMM
     X_test = feat_test.values
     states_test = model.predict(X_test)
     labels_test = (states_test == volatile_state).astype(int)
+    series = pd.Series(labels_test, index=feat_test.index, name=pair_name)
+    n_vol = int(labels_test.sum())
+    msg = (f"  {pair_name:12s}  train={len(X_train)}  test={len(X_test)}  "
+           f"Volatile {n_vol} ({n_vol/len(labels_test)*100:.0f}%)  "
+           f"Normal {len(labels_test)-n_vol} ({(len(labels_test)-n_vol)/len(labels_test)*100:.0f}%)")
+    return pair_name, series, msg
 
-    regime_series = pd.Series(labels_test, index=feat_test.index, name=row["pair"])
-    all_regimes[row["pair"]] = regime_series
 
-    n_vol  = int(labels_test.sum())
-    n_calm = len(labels_test) - n_vol
-    print(f"  {row['pair']:12s}  train={len(X_train)}  test={len(X_test)}  "
-          f"Volatile {n_vol} ({n_vol/len(labels_test)*100:.0f}%)  "
-          f"Normal {n_calm} ({n_calm/len(labels_test)*100:.0f}%)")
+# Pre-slice per-pair data in main process (workers get only what they need)
+_jobs = []
+for _, row in pairs.iterrows():
+    t1, t2 = row["pair"].split("-")
+    if t1 not in closes.columns or t2 not in closes.columns:
+        print(f"  SKIP {row['pair']}: missing ticker")
+        continue
+    _jobs.append((row["pair"], float(row["beta"]), closes[t1], closes[t2]))
+
+print(f"Fitting HMM on {len(_jobs)} pairs in parallel (n_jobs={N_JOBS}) …")
+_results = Parallel(n_jobs=N_JOBS, backend="loky", verbose=0)(
+    delayed(_process_pair)(name, beta, s1, s2, TEST_START) for name, beta, s1, s2 in _jobs
+)
+
+all_regimes: dict[str, pd.Series] = {}
+for pair_name, series, msg in _results:
+    print(msg)
+    if series is not None:
+        all_regimes[pair_name] = series
 
 # ── Save regimes (wide format: timestamp × pair) ──────────────────────────────
 if all_regimes:
@@ -294,28 +299,35 @@ if len(_X_spy) < GLOBAL_MIN_TRAIN_DAYS + GLOBAL_REFIT_EVERY:
     print(f"  Insufficient SPY history ({len(_X_spy)} days) — global HMM skipped")
 else:
     # Walk-forward: fit on past-only, label next REFIT_EVERY days.
+    # Parallelized across refit checkpoints (each independent of others).
+    def _refit_at(i: int, X_full: np.ndarray):
+        X_tr = X_full[:i]
+        m = fit_hmm(X_tr)
+        if m is None:
+            return i, None
+        st_tr = m.predict(X_tr)
+        v0 = X_tr[st_tr == 0, 0].mean()
+        v1 = X_tr[st_tr == 1, 0].mean()
+        panic_s = 0 if v0 > v1 else 1
+        end = min(i + GLOBAL_REFIT_EVERY, len(X_full))
+        st_te = m.predict(X_full[i:end])
+        return i, (end, (st_te == panic_s).astype(int))
+
+    _checkpoints = list(range(GLOBAL_MIN_TRAIN_DAYS, len(_X_spy), GLOBAL_REFIT_EVERY))
+    print(f"  Global SPY HMM: {len(_checkpoints)} refit checkpoints (parallel n_jobs={N_JOBS}) …")
+    _ckpt_results = Parallel(n_jobs=N_JOBS, backend="loky", verbose=0)(
+        delayed(_refit_at)(i, _X_spy) for i in _checkpoints
+    )
+
     _wf_labels = np.full(len(_X_spy), -1, dtype=int)
     _n_refits  = 0
     _n_panic   = 0
-
-    for _i in range(GLOBAL_MIN_TRAIN_DAYS, len(_X_spy), GLOBAL_REFIT_EVERY):
-        _X_train = _X_spy[:_i]
-        _model_t = fit_hmm(_X_train)
-        if _model_t is None:
+    for i, out in _ckpt_results:
+        if out is None:
             continue
-
-        # Determine panic state from TRAIN labels only
-        _states_train = _model_t.predict(_X_train)
-        _vol0 = _X_train[_states_train == 0, 0].mean()
-        _vol1 = _X_train[_states_train == 1, 0].mean()
-        _panic_s = 0 if _vol0 > _vol1 else 1
-
-        # Predict next REFIT_EVERY bars
-        _end = min(_i + GLOBAL_REFIT_EVERY, len(_X_spy))
-        _states_test = _model_t.predict(_X_spy[_i:_end])
-        _labels_test = (_states_test == _panic_s).astype(int)
-        _wf_labels[_i:_end] = _labels_test
-        _n_panic += int(_labels_test.sum())
+        end, labels = out
+        _wf_labels[i:end] = labels
+        _n_panic += int(labels.sum())
         _n_refits += 1
 
     # Keep only labeled rows

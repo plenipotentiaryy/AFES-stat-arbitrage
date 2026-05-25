@@ -87,12 +87,20 @@ def run_backtest(df: pd.DataFrame, t1: str, t2: str, beta: float,
     trades = []
     pair_blocked = False
 
+    # Convert pandas Series to numpy arrays for 100x faster lookup
+    z_arr = df["zscore"].to_numpy()
+    s_arr = df["spread"].to_numpy()
+    p1_arr = df[t1c].to_numpy()
+    p2_arr = df[t2c].to_numpy()
+    sma_arr = df["spread_mean"].to_numpy()
+    std_arr = df["spread_std"].to_numpy()
+
     for i in range(len(df)):
         if pair_blocked: continue
-        z  = df["zscore"].iloc[i]
-        s  = df["spread"].iloc[i]
-        p1 = df[t1c].iloc[i]
-        p2 = df[t2c].iloc[i]
+        z  = z_arr[i]
+        s  = s_arr[i]
+        p1 = p1_arr[i]
+        p2 = p2_arr[i]
         
         z_active = z
         if pos != 0 and entry_std > 0:
@@ -128,15 +136,15 @@ def run_backtest(df: pd.DataFrame, t1: str, t2: str, beta: float,
                     ts = df.index[i]
                     d_prev = (ts - pd.Timedelta(days=1)).normalize()
                     h_tail_daily = spread_daily.loc[:d_prev].tail(HURST_ENTRY_WINDOW - 1)
-                    h_tail = pd.concat([h_tail_daily, pd.Series({ts: df["spread"].iloc[i]})])
+                    h_tail = pd.concat([h_tail_daily, pd.Series({ts: s})])
                     
                     h_blocked, _ = hurst_filter.should_block(h_tail, ts)
                     if h_blocked:
                         pos = 0
                         continue
                 entry_spread = s; entry_t1 = p1; entry_t2 = p2; entry_bar = i
-                entry_sma = df["spread_mean"].iloc[i]
-                entry_std = df["spread_std"].iloc[i]
+                entry_sma = sma_arr[i]
+                entry_std = std_arr[i]
 
     return trades
 
@@ -293,22 +301,17 @@ print("VIX REGIME BREAKDOWN")
 print(f"{'='*70}")
 
 if vix_daily is not None:
-    # Map VIX regime to intraday bars
+    # Map VIX regime to daily series first (vectorized)
     vix_tz = vix_daily.copy()
     if vix_tz.index.tz is None:
         vix_tz.index = vix_tz.index.tz_localize("UTC").tz_convert("US/Eastern")
     else:
         vix_tz.index = vix_tz.index.tz_convert("US/Eastern")
 
-    def vix_regime(date) -> str:
-        d = pd.Timestamp(date).tz_localize("US/Eastern") if date.tzinfo is None else date
-        candidates = vix_tz[vix_tz.index <= d]
-        if candidates.empty:
-            return "normal"
-        v = candidates.iloc[-1]
-        if v < VIX_LOW:   return "calm"
-        if v > VIX_HIGH:  return "elevated"
-        return "normal"
+    # Vectorized mapping of VIX to regimes
+    vix_regimes_daily = pd.Series("normal", index=vix_tz.index)
+    vix_regimes_daily[vix_tz < VIX_LOW] = "calm"
+    vix_regimes_daily[vix_tz > VIX_HIGH] = "elevated"
 
     regime_labels = ["calm", "normal", "elevated"]
 
@@ -321,11 +324,15 @@ if vix_daily is not None:
             continue
         df_sig = build_signals(closes_all, t1, t2, beta, half_life)
         spread_daily = (daily_all[t1] - beta * daily_all[t2]).dropna()
+        
+        # Align VIX regimes to intraday timestamps using forward-fill
+        vix_regimes_intraday = vix_regimes_daily.reindex(df_sig.index, method="ffill").fillna("normal")
+        
         print(f"\n  {pair_name}")
         print(f"  {'Regime':<12} {'Trades':>7} {'WR':>6} {'Sharpe':>8} {'P&L':>10} {'VIX range'}")
         print(f"  {'─'*58}")
         for regime in regime_labels:
-            mask = df_sig.index.map(lambda ts: vix_regime(ts) == regime)
+            mask = (vix_regimes_intraday == regime)
             sub  = df_sig[mask]
             if len(sub) < 50:
                 print(f"  {regime:<12}  (not enough data)")

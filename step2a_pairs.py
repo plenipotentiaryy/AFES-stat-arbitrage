@@ -285,8 +285,12 @@ for t1, t2 in PAIRS:
 
 # ── Results ───────────────────────────────────────────────────────────────────
 
-# ── Universe Consolidation (Top 10 most robust pairs) ─────────────────────────
-# HL <= 15 days (15 * BARS_PER_DAY)
+# ── Universe Consolidation ────────────────────────────────────────────────────
+# Keep every pair that passes the half-life gate (HL <= 15 days).  The legacy
+# ``head(20)`` cap was removed so the downstream pipeline (step3j_wfo, step4a)
+# can scale to the full filtered universe — Section 7.3 (active ticker
+# correlation throttle) and the train-quality gate handle concentration risk
+# at trade time rather than at universe-selection time.
 hl_limit = 15 * BARS_PER_DAY
 df_final = pd.DataFrame(results)
 df_final = df_final[df_final["half_life_bars"] <= hl_limit]
@@ -294,16 +298,15 @@ df_final = df_final[df_final["half_life_bars"] <= hl_limit]
 # Sort by EG daily p-value (primary robustness) and then by Half-Life speed
 df_final = df_final.sort_values(["coint_pvalue_daily", "half_life_bars"])
 
-# Pick top 20
-df_top = df_final.head(20)
+df_top = df_final
 
 if df_top.empty:
     print("\nNo pairs passed the strict consolidation filters (HL <= 15d).")
-    # Fallback: just take top 20 by daily coint regardless of HL
-    df_top = pd.DataFrame(results).sort_values("coint_pvalue_daily").head(20)
+    # Fallback: take every pair by daily coint regardless of HL.
+    df_top = pd.DataFrame(results).sort_values("coint_pvalue_daily")
 
 print("\n" + "=" * 120)
-print("CONSOLIDATED UNIVERSE (Top 20 Robust Pairs)")
+print(f"CONSOLIDATED UNIVERSE ({len(df_top)} Robust Pairs)")
 print("-" * 120)
 print(df_top[["pair", "correlation", "coint_pvalue_daily", "johansen_coint", "beta_daily", "half_life_bars", "hurst"]
         ].to_string(index=False))

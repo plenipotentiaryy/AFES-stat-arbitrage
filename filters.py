@@ -24,10 +24,18 @@ from datetime import date as _date
 from statsmodels.tsa.stattools import coint, adfuller
 from numba import njit
 
+from collections import deque
+
 from config import (
     COINT_WINDOW_DAYS, COINT_BREAK_P, COINT_RECHECK_DAYS,
     BARS_PER_DAY, DATA_DIR,
     HURST_ENTRY_WINDOW, HURST_ENTRY_MAX,
+    ADAPT_ALPHA, ADAPT_GAMMA, ADAPT_ETA, ADAPT_DELTA,
+    ADAPT_W_MIN, ADAPT_W_MAX, ADAPT_B_MAX,
+    ADAPT_CUSUM_K, ADAPT_CUSUM_H,
+    ADAPT_SIGMA_FAST_BARS, ADAPT_SIGMA_SLOW_BARS,
+    ADAPT_ENTRY_Z_CAP, ADAPT_STOP_Z_FLOOR,
+    ADAPT_EPSILON,
 )
 
 # Intraday window for lazy ADF: same calendar span as daily pre-compute
@@ -195,6 +203,35 @@ class CointegrationFilter:
         key = d if isinstance(d, _date) else pd.Timestamp(d).date()
         return self._daily_dict.get(key, True)
 
+    # ── MetaGate hook: continuous confidence score ────────────────────────
+    def get_pvalue(self, spread_tail: pd.Series, d) -> float:
+        """
+        Return the most recent intraday ADF p-value for the spread tail.
+        Cached per calendar day. Used by MetaGate to compute s_ADF = 1 - p.
+        """
+        key = d if isinstance(d, _date) else pd.Timestamp(d).date()
+        cache_attr = "_pval_cache"
+        if not hasattr(self, cache_attr):
+            self._pval_cache: dict[_date, float] = {}
+        if key in self._pval_cache:
+            return self._pval_cache[key]
+        s = spread_tail.dropna()
+        if len(s) < 60:
+            self._pval_cache[key] = 0.5
+            return 0.5
+        try:
+            _, pval, _, _, _, _ = adfuller(s.values, maxlag=1,
+                                           regression="c", autolag=None)
+        except Exception:
+            pval = 0.5
+        self._pval_cache[key] = float(pval)
+        return float(pval)
+
+    def get_confidence_score(self, spread_tail: pd.Series, ts) -> float:
+        """MetaGate score s_ADF = 1 - p_ADF, clipped to [0, 1]."""
+        from metagate import adf_confidence
+        return adf_confidence(self.get_pvalue(spread_tail, ts))
+
     # ── Tier 2: lazy intraday ADF on Z-trigger ────────────────────────────
     def lazy_check(self, spread_tail: pd.Series, d) -> bool:
         """
@@ -262,6 +299,14 @@ class MacroFilter:
                 self._km[_to_date(ts)] = int(v)
 
     # ── Public API ────────────────────────────────────────────────────────
+    def get_hmm_regime(self, ts) -> int:
+        """Return raw global HMM label for ``ts``; missing data defaults to normal."""
+        return int(self._hmm.get(_to_date(ts), 0))
+
+    def get_kmeans_regime(self, ts) -> int:
+        """Return raw K-Means label for ``ts``; missing data defaults to Sideways."""
+        return int(self._km.get(_to_date(ts), 1))
+
     def is_entry_blocked(self, ts) -> bool:
         """True → do not open new positions on this bar.
 
@@ -364,6 +409,12 @@ class HurstFilter:
         self._cache[key] = (blocked, h)
         return blocked, h
 
+    def get_confidence_score(self, spread_tail: pd.Series, ts) -> float:
+        """MetaGate score s_Hurst = clip((h_max - H) / (h_max - 0.5), 0, 1)."""
+        from metagate import hurst_confidence
+        _, h_val = self.should_block(spread_tail, ts)
+        return hurst_confidence(h_val)
+
 
 # ── BreakVelocityDetector ─────────────────────────────────────────────────────
 
@@ -430,6 +481,25 @@ class BreakVelocityDetector:
         is_broken = bt > self.threshold or cusum_val > self.h_cusum
         return float(bt), bool(is_broken)
 
+    def get_confidence_score(self,
+                             nu_t: float,
+                             rolling_var_nu: float,
+                             hl_t: float,
+                             hl_median: float,
+                             d_beta_dt: float,
+                             z_t: float) -> tuple[float, float]:
+        """
+        MetaGate scores (s_Break, s_CUSUM) at the current bar. Uses the
+        same composite Bt and CUSUM Ct as `get_break_score`, but mapped
+        to [0, 1] confidences. Mutates internal CUSUM state — call once
+        per bar in chronological order.
+        """
+        from metagate import break_confidence, cusum_confidence
+        bt, _ = self.get_break_score(nu_t, rolling_var_nu, hl_t, hl_median,
+                                     d_beta_dt, z_t)
+        c_t = max(self.s_pos, abs(self.s_neg))
+        return break_confidence(bt, hi=self.threshold), cusum_confidence(c_t, h_cusum=self.h_cusum)
+
 
 # ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -437,6 +507,385 @@ def _to_date(ts) -> _date:
     if isinstance(ts, _date) and not isinstance(ts, pd.Timestamp):
         return ts
     return pd.Timestamp(ts).date()
+
+# ── Online Parameter Adaptation (between WFO refits) ─────────────────────────
+#
+# Implements three coupled live-adjustment layers:
+#
+#   Layer 1 — Adaptive EWMA window:
+#       W_t  = clip( W_base · (1 - α · min(1, Bt/B_max)),  [W_min, W_max] )
+#       λ_t  = 2 / (W_t + 1)
+#       μ_t  = λ_t·s_t + (1-λ_t)·μ_{t-1}
+#       σ²_t = λ_t·(s_t - μ_t)² + (1-λ_t)·σ²_{t-1}
+#       z_t  = (s_t - μ_t) / sqrt(σ²_t + ε)
+#
+#   Layer 2 — Volatility-adjusted entry threshold:
+#       entry_z_t = entry_z_base · (1 + γ · max(0, σ_fast/σ_slow - 1))
+#                   clipped to  [entry_z_base, ENTRY_Z_CAP]
+#
+#   Layer 3 — Drift-tightened stop threshold:
+#       stop_z_t  = stop_z_base · max( δ, 1 - η · (Ct/h_cusum) )
+#                   clipped to  [STOP_Z_FLOOR, stop_z_base]
+#
+# Two interfaces are exposed:
+#   - OnlineParameterAdapter (state-machine for live / paper trading).
+#   - compute_adaptive_arrays() (numba kernel for vectorised backtest engines).
+
+
+@njit(cache=True)
+def _adaptive_kernel(spread, B_arr, C_arr, sigma_fast_arr, sigma_slow_arr,
+                     w_base, entry_z_base, stop_z_base,
+                     alpha, gamma, eta, delta,
+                     w_min, w_max, b_max, cusum_h,
+                     entry_z_cap, stop_z_floor, epsilon):
+    """
+    Vectorised computation of (W_t, entry_z_t, stop_z_t, μ_t, σ_t, z_t) arrays.
+
+    Pure-numpy/numba so it can be called once per pair-window before the inner
+    bar loop, eliminating Python overhead. Inputs are precomputed numpy
+    arrays of identical length; outputs share that length. The kernel uses
+    exclusively the math specified in the docstring above — no hidden
+    smoothing, look-ahead, or special-casing.
+    """
+    n = spread.shape[0]
+    W_t_arr     = np.empty(n, dtype=np.int64)
+    entry_z_arr = np.empty(n, dtype=np.float64)
+    stop_z_arr  = np.empty(n, dtype=np.float64)
+    mu_arr      = np.empty(n, dtype=np.float64)
+    sigma_arr   = np.empty(n, dtype=np.float64)
+    z_arr       = np.empty(n, dtype=np.float64)
+
+    mu  = 0.0
+    var = 1.0
+    initialised = False
+
+    for i in range(n):
+        # ── Layer 1: adaptive window ─────────────────────────────────────
+        bt = B_arr[i]
+        if not np.isfinite(bt) or bt < 0.0:
+            bt = 0.0
+        ratio = bt / b_max
+        if ratio > 1.0:
+            ratio = 1.0
+        w_continuous = w_base * (1.0 - alpha * ratio)
+        if w_continuous < w_min:
+            w_continuous = w_min
+        elif w_continuous > w_max:
+            w_continuous = w_max
+        # integer-rounded for symmetry with classical rolling windows
+        W_t = int(round(w_continuous))
+        if W_t < w_min:
+            W_t = w_min
+        elif W_t > w_max:
+            W_t = w_max
+        W_t_arr[i] = W_t
+
+        # ── EWMA recursive update ───────────────────────────────────────
+        s = spread[i]
+        if not np.isfinite(s):
+            s = mu  # absorb NaN to prior mean (no-op update)
+        if not initialised:
+            mu  = s
+            var = 1.0
+            initialised = True
+        else:
+            lam = 2.0 / (W_t + 1.0)
+            mu  = lam * s + (1.0 - lam) * mu
+            var = lam * (s - mu) * (s - mu) + (1.0 - lam) * var
+        sigma = (var + epsilon) ** 0.5
+        mu_arr[i]    = mu
+        sigma_arr[i] = sigma
+        z_arr[i]     = (s - mu) / sigma
+
+        # ── Layer 2: volatility-adjusted entry threshold ────────────────
+        sf = sigma_fast_arr[i]
+        ss = sigma_slow_arr[i]
+        if (not np.isfinite(sf)) or (not np.isfinite(ss)) or ss <= 1e-12:
+            r = 0.0
+        else:
+            r = sf / ss - 1.0
+            if r < 0.0:
+                r = 0.0
+        ez = entry_z_base * (1.0 + gamma * r)
+        if ez < entry_z_base:
+            ez = entry_z_base
+        elif ez > entry_z_cap:
+            ez = entry_z_cap
+        entry_z_arr[i] = ez
+
+        # ── Layer 3: drift-tightened stop threshold ─────────────────────
+        ct = C_arr[i]
+        if not np.isfinite(ct) or ct < 0.0:
+            ct = 0.0
+        c_ratio = ct / cusum_h
+        if c_ratio > 1.0:
+            c_ratio = 1.0
+        scale = 1.0 - eta * c_ratio
+        if scale < delta:
+            scale = delta
+        sz = stop_z_base * scale
+        if sz < stop_z_floor:
+            sz = stop_z_floor
+        elif sz > stop_z_base:
+            sz = stop_z_base
+        stop_z_arr[i] = sz
+
+    return W_t_arr, entry_z_arr, stop_z_arr, mu_arr, sigma_arr, z_arr
+
+
+def compute_adaptive_arrays(spread: np.ndarray,
+                            B_arr:   np.ndarray,
+                            C_arr:   np.ndarray,
+                            sigma_fast_arr: np.ndarray,
+                            sigma_slow_arr: np.ndarray,
+                            w_base: int,
+                            entry_z_base: float,
+                            stop_z_base:  float,
+                            alpha:        float = ADAPT_ALPHA,
+                            gamma:        float = ADAPT_GAMMA,
+                            eta:          float = ADAPT_ETA,
+                            delta:        float = ADAPT_DELTA,
+                            w_min:        int   = ADAPT_W_MIN,
+                            w_max:        int   = ADAPT_W_MAX,
+                            b_max:        float = ADAPT_B_MAX,
+                            cusum_h:      float = ADAPT_CUSUM_H,
+                            entry_z_cap:  float = ADAPT_ENTRY_Z_CAP,
+                            stop_z_floor: float = ADAPT_STOP_Z_FLOOR,
+                            epsilon:      float = ADAPT_EPSILON):
+    """
+    Public wrapper around `_adaptive_kernel`. Casts inputs to float64 (numba
+    is strict about dtypes) and returns six aligned arrays.
+
+    Returns
+    -------
+    W_t_arr      : int64[n]   — per-bar adaptive EWMA window
+    entry_z_arr  : float64[n] — per-bar adaptive entry threshold
+    stop_z_arr   : float64[n] — per-bar adaptive stop threshold
+    mu_arr       : float64[n] — recursive EWMA mean of the spread
+    sigma_arr    : float64[n] — recursive EWMA std-dev (with ε floor)
+    z_arr        : float64[n] — adaptive z-score (spread - μ) / σ
+    """
+    spread_f         = np.ascontiguousarray(spread,         dtype=np.float64)
+    B_arr_f          = np.ascontiguousarray(B_arr,          dtype=np.float64)
+    C_arr_f          = np.ascontiguousarray(C_arr,          dtype=np.float64)
+    sigma_fast_arr_f = np.ascontiguousarray(sigma_fast_arr, dtype=np.float64)
+    sigma_slow_arr_f = np.ascontiguousarray(sigma_slow_arr, dtype=np.float64)
+    return _adaptive_kernel(
+        spread_f, B_arr_f, C_arr_f, sigma_fast_arr_f, sigma_slow_arr_f,
+        int(w_base), float(entry_z_base), float(stop_z_base),
+        float(alpha), float(gamma), float(eta), float(delta),
+        int(w_min), int(w_max), float(b_max), float(cusum_h),
+        float(entry_z_cap), float(stop_z_floor), float(epsilon),
+    )
+
+
+class OnlineParameterAdapter:
+    """
+    Bar-by-bar parameter adaptation state machine for live / paper trading.
+
+    Construction
+    ------------
+    Pass the baseline (frozen-WFO) parameters: W_base, entry_z_base,
+    stop_z_base. Adaptation knobs (α, γ, η, δ, …) default to values in
+    config.py — override per-pair if needed.
+
+    Usage
+    -----
+    For every incoming bar:
+        adapter.update(ts, spread_val, break_score, cusum_val)
+        entry_z = adapter.get_adaptive_entry_z()
+        stop_z  = adapter.get_adaptive_stop_z()
+        z       = adapter.get_ewma_zscore()   # or pass a fresh spread
+
+    The adapter maintains a rolling buffer of spread *differences* for
+    σ_fast / σ_slow, plus the running EWMA μ_t / σ²_t.
+
+    Backward-compatibility note
+    ---------------------------
+    Setting α=γ=η=0 freezes all three layers (W_t = W_base, entry_z_t =
+    entry_z_base, stop_z_t = stop_z_base) so the adapter degrades to a
+    constant-window EWMA. Combined with the `adaptive=False` kill-switch
+    in the backtest callers, the rolling-window baseline runs untouched.
+    """
+
+    __slots__ = (
+        "w_base", "entry_z_base", "stop_z_base",
+        "alpha", "gamma", "eta", "delta",
+        "w_min", "w_max", "b_max", "cusum_h", "cusum_k",
+        "entry_z_cap", "stop_z_floor",
+        "sigma_fast_bars", "sigma_slow_bars",
+        "epsilon",
+        "_spread_diffs", "_prev_spread",
+        "_mu", "_var",
+        "_W_t", "_entry_z_t", "_stop_z_t", "_z_t",
+        "_initialised", "_last_ts",
+    )
+
+    def __init__(self,
+                 w_base:        int,
+                 entry_z_base:  float,
+                 stop_z_base:   float,
+                 alpha:        float = ADAPT_ALPHA,
+                 gamma:        float = ADAPT_GAMMA,
+                 eta:          float = ADAPT_ETA,
+                 delta:        float = ADAPT_DELTA,
+                 w_min:        int   = ADAPT_W_MIN,
+                 w_max:        int   = ADAPT_W_MAX,
+                 b_max:        float = ADAPT_B_MAX,
+                 cusum_k:      float = ADAPT_CUSUM_K,
+                 cusum_h:      float = ADAPT_CUSUM_H,
+                 entry_z_cap:  float = ADAPT_ENTRY_Z_CAP,
+                 stop_z_floor: float = ADAPT_STOP_Z_FLOOR,
+                 sigma_fast_bars: int = ADAPT_SIGMA_FAST_BARS,
+                 sigma_slow_bars: int = ADAPT_SIGMA_SLOW_BARS,
+                 epsilon:      float = ADAPT_EPSILON):
+        if w_base < w_min:
+            w_base = w_min
+        if w_base > w_max:
+            w_base = w_max
+        if sigma_slow_bars < sigma_fast_bars:
+            raise ValueError("sigma_slow_bars must be >= sigma_fast_bars")
+        self.w_base          = int(w_base)
+        self.entry_z_base    = float(entry_z_base)
+        self.stop_z_base     = float(stop_z_base)
+        self.alpha           = float(alpha)
+        self.gamma           = float(gamma)
+        self.eta             = float(eta)
+        self.delta           = float(delta)
+        self.w_min           = int(w_min)
+        self.w_max           = int(w_max)
+        self.b_max           = float(b_max)
+        self.cusum_h         = float(cusum_h)
+        self.cusum_k         = float(cusum_k)
+        self.entry_z_cap     = float(entry_z_cap)
+        self.stop_z_floor    = float(stop_z_floor)
+        self.sigma_fast_bars = int(sigma_fast_bars)
+        self.sigma_slow_bars = int(sigma_slow_bars)
+        self.epsilon         = float(epsilon)
+
+        # Rolling buffer for spread DIFFERENCES (Δs_t = s_t − s_{t-1}).
+        # Capped at sigma_slow_bars; σ_fast just slices the tail.
+        self._spread_diffs: deque = deque(maxlen=self.sigma_slow_bars)
+        self._prev_spread: float | None = None
+
+        # EWMA state
+        self._mu:  float | None = None
+        self._var: float | None = None
+        self._initialised = False
+
+        # Adaptive params (initialise to baseline so first-bar callers
+        # always see safe values before any update() call).
+        self._W_t        = self.w_base
+        self._entry_z_t  = self.entry_z_base
+        self._stop_z_t   = self.stop_z_base
+        self._z_t        = 0.0
+        self._last_ts    = None
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def update(self, ts, spread_val: float,
+               break_score: float, cusum_val: float) -> None:
+        """
+        Ingest one new bar. Updates EWMA state and recomputes the three
+        adaptive parameters in order: W_t → entry_z_t → stop_z_t.
+        """
+        self._last_ts = ts
+        s = float(spread_val) if np.isfinite(spread_val) else (self._mu or 0.0)
+
+        # Roll the spread-diff buffer (skipped on the very first bar).
+        if self._prev_spread is not None:
+            self._spread_diffs.append(s - self._prev_spread)
+        self._prev_spread = s
+
+        # σ_fast / σ_slow from buffered diffs.
+        n_buf = len(self._spread_diffs)
+        sigma_fast = float("nan")
+        sigma_slow = float("nan")
+        if n_buf >= self.sigma_fast_bars:
+            tail_fast = list(self._spread_diffs)[-self.sigma_fast_bars:]
+            sigma_fast = float(np.std(tail_fast, ddof=0))
+        if n_buf >= max(2, min(self.sigma_slow_bars, self.sigma_fast_bars + 1)):
+            # Use as much history as we have, up to slow_bars.
+            tail_slow = list(self._spread_diffs)
+            sigma_slow = float(np.std(tail_slow, ddof=0))
+
+        # ── Layer 1: adaptive window ────────────────────────────────────
+        bt = float(break_score) if np.isfinite(break_score) else 0.0
+        if bt < 0.0:
+            bt = 0.0
+        ratio = min(1.0, bt / self.b_max)
+        w_cont = self.w_base * (1.0 - self.alpha * ratio)
+        w_cont = max(self.w_min, min(self.w_max, w_cont))
+        self._W_t = int(round(w_cont))
+        self._W_t = max(self.w_min, min(self.w_max, self._W_t))
+
+        # ── EWMA recursive update ───────────────────────────────────────
+        if not self._initialised:
+            self._mu = s
+            self._var = 1.0
+            self._initialised = True
+        else:
+            lam = 2.0 / (self._W_t + 1.0)
+            self._mu  = lam * s + (1.0 - lam) * self._mu
+            self._var = lam * (s - self._mu) ** 2 + (1.0 - lam) * self._var
+        sigma = (self._var + self.epsilon) ** 0.5
+        self._z_t = (s - self._mu) / sigma
+
+        # ── Layer 2: entry_z adaptation ─────────────────────────────────
+        if (np.isfinite(sigma_fast) and np.isfinite(sigma_slow)
+                and sigma_slow > 1e-12):
+            r = max(0.0, sigma_fast / sigma_slow - 1.0)
+        else:
+            r = 0.0
+        ez = self.entry_z_base * (1.0 + self.gamma * r)
+        self._entry_z_t = max(self.entry_z_base, min(self.entry_z_cap, ez))
+
+        # ── Layer 3: stop_z adaptation ──────────────────────────────────
+        ct = float(cusum_val) if np.isfinite(cusum_val) else 0.0
+        if ct < 0.0:
+            ct = 0.0
+        c_ratio = min(1.0, ct / self.cusum_h)
+        scale = max(self.delta, 1.0 - self.eta * c_ratio)
+        sz = self.stop_z_base * scale
+        self._stop_z_t = max(self.stop_z_floor, min(self.stop_z_base, sz))
+
+    def get_adaptive_window(self) -> int:
+        """Current adaptive EWMA window W_t."""
+        return int(self._W_t)
+
+    def get_adaptive_entry_z(self) -> float:
+        """Current adaptive entry threshold entry_z_t."""
+        return float(self._entry_z_t)
+
+    def get_adaptive_stop_z(self) -> float:
+        """Current adaptive stop threshold stop_z_t."""
+        return float(self._stop_z_t)
+
+    def get_ewma_zscore(self, spread_val: float | None = None) -> float:
+        """
+        Latest EWMA z-score. If `spread_val` is supplied (and EWMA state
+        is initialised) computes (s - μ_t)/σ_t for that fresh spread —
+        useful for "what-if" probes without mutating state.
+        """
+        if spread_val is None or not self._initialised:
+            return float(self._z_t)
+        sigma = (self._var + self.epsilon) ** 0.5
+        return float((float(spread_val) - self._mu) / sigma)
+
+    def state_snapshot(self) -> dict:
+        """Return a JSON-serialisable snapshot of the current state."""
+        return {
+            "ts":               self._last_ts,
+            "W_t":              int(self._W_t),
+            "entry_z_t":        float(self._entry_z_t),
+            "stop_z_t":         float(self._stop_z_t),
+            "ewma_z":           float(self._z_t),
+            "ewma_mu":          None if self._mu is None else float(self._mu),
+            "ewma_var":         None if self._var is None else float(self._var),
+            "buffer_size":      len(self._spread_diffs),
+            "initialised":      bool(self._initialised),
+        }
+
 
 from scipy.stats import gaussian_kde
 
