@@ -121,6 +121,8 @@ def main():
     p.add_argument("--vwap-exec", action="store_true", dest="vwap_exec")
     p.add_argument("--rotation", action="store_true")
     p.add_argument("--voltarget", type=float, default=0.0)
+    p.add_argument("--closes",   type=str, default="closes_daily.csv",
+                   help="Closes file in data/ (extended universe support).")
     p.add_argument("--cusum",  type=float, default=None)
     args = p.parse_args()
 
@@ -128,7 +130,7 @@ def main():
     print(f"  selection on:  {{start}} → {args.split}")
     print(f"  trading on:    {args.split} → {{end}}\n")
 
-    closes = (pd.read_csv(DATA_DIR / "closes_daily.csv",
+    closes = (pd.read_csv(DATA_DIR / args.closes,
                           parse_dates=["Date"]).set_index("Date").sort_index())
     closes_train = closes.loc[:args.split]
     print(f"Train slice:  {closes_train.index.min().date()} → "
@@ -189,6 +191,8 @@ def main():
         cmd.append("--rotation")
     if args.voltarget > 0:
         cmd += ["--voltarget", str(args.voltarget)]
+    if args.closes != "closes_daily.csv":
+        cmd += ["--closes", args.closes]
     if args.cusum is not None:
         cmd += ["--cusum", str(args.cusum)]
     print(" ".join(cmd))

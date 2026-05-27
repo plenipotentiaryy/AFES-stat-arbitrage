@@ -552,6 +552,8 @@ def main():
     p.add_argument("--voltarget", type=float, default=0.0,
                    help="Portfolio vol target (annualised, e.g. 0.10 = 10%%). "
                         "Applied as causal leverage scaling. 0 = off.")
+    p.add_argument("--closes",   type=str, default="closes_daily.csv",
+                   help="Closes file in data/ (extended universe support).")
     p.add_argument("--hmm",    type=str, default="off",
                    choices=["off", "block-panic", "block-calm",
                             "size-panic", "extreme-3state"],
@@ -570,7 +572,7 @@ def main():
             "Set BAR_TIMEFRAME='daily' in config.py."
         )
 
-    closes_path = DATA_DIR / "closes_daily.csv"
+    closes_path = DATA_DIR / args.closes
     closes = pd.read_csv(closes_path, parse_dates=["Date"]).set_index("Date").sort_index()
     pairs  = pd.read_csv(DATA_DIR / args.pairs)["pair"].tolist()
 
