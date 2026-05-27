@@ -19,11 +19,16 @@ from pathlib import Path
 
 from config import (
     DATA_DIR, RTH_START, RTH_END,
-    CLOSES_FILE, VOLUMES_FILE, BAR_MINUTES
+    CLOSES_FILE, VOLUMES_FILE, BAR_MINUTES, BAR_TIMEFRAME,
 )
 
-CLOSES_PARQUET  = DATA_DIR / f"closes_{BAR_MINUTES}min.parquet"
-VOLUMES_PARQUET = DATA_DIR / f"volumes_{BAR_MINUTES}min.parquet"
+_IS_DAILY = (BAR_TIMEFRAME == "daily")
+if _IS_DAILY:
+    CLOSES_PARQUET  = DATA_DIR / "closes_daily.parquet"
+    VOLUMES_PARQUET = DATA_DIR / "volumes_daily.parquet"
+else:
+    CLOSES_PARQUET  = DATA_DIR / f"closes_{BAR_MINUTES}min.parquet"
+    VOLUMES_PARQUET = DATA_DIR / f"volumes_{BAR_MINUTES}min.parquet"
 CLOSES_CSV      = DATA_DIR / CLOSES_FILE
 VOLUMES_CSV     = DATA_DIR / VOLUMES_FILE
 
@@ -46,6 +51,9 @@ def _load_csv(path: Path, columns: list[str] | None) -> pd.DataFrame:
 
 
 def _normalise_tz(df: pd.DataFrame) -> pd.DataFrame:
+    if _IS_DAILY:
+        # Daily bars carry no time-of-day; keep tz-naive midnight index.
+        return df
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC").tz_convert(_TZ)
     else:
@@ -58,6 +66,13 @@ def _apply_filters(df: pd.DataFrame,
                    end:   str | None,
                    rth:   bool,
                    freq:  str | None) -> pd.DataFrame:
+    if _IS_DAILY:
+        # No RTH / tz / resample for daily bars; just slice by date.
+        if start:
+            df = df[df.index >= pd.Timestamp(start)]
+        if end:
+            df = df[df.index <= pd.Timestamp(end)]
+        return df
     if rth:
         df = df.between_time(RTH_START, RTH_END)
     if start:

@@ -80,6 +80,7 @@ from config import (
     CORR_BLOCK_SCALE, CORR_BLOCK_WINDOW_DAYS,
     SBR_GUARD_ENABLED, SBR_GUARD_THRESHOLD, SBR_GUARD_STOP_MULT,
     WFO_MIN_TRAIN_SHARPE, WFO_MIN_TRAIN_PNL,
+    HMM_HARD_BLOCK_ALWAYS,
 )
 from risk.ticker_overlap import (
     TickerOverlapBlocker, compute_spread_correlations, filter_trade_list,
@@ -87,7 +88,16 @@ from risk.ticker_overlap import (
 
 # Cap on shadow-trade holding length (bars). Prevents shadow positions from
 # living forever when no exit signal fires.
-_SHADOW_MAX_HOLD_BARS = 26 * 10  # ≈ 10 trading days at 15-min cadence
+_SHADOW_MAX_HOLD_BARS = BARS_PER_DAY * 10  # 10 trading days regardless of bar size
+
+# Timeframe-aware timestamp helper: daily-mode uses tz-naive midnight timestamps
+# (matching closes_daily.csv); intraday uses US/Eastern.
+from config import BAR_TIMEFRAME as _BAR_TF
+def _ts(d):
+    t = pd.Timestamp(d)
+    if _BAR_TF == "daily":
+        return t.tz_localize(None) if t.tz is not None else t
+    return t if t.tz is not None else t.tz_localize("US/Eastern")
 
 # Grid definition (same as grid.py)
 ENTRY_Z_GRID = [1.65, 1.7, 1.8, 2.0, 2.2]
@@ -278,13 +288,16 @@ def build_signals(closes, volumes, t1, t2, beta, half_life):
         
     zscore = (spread - vw_mean) / spread_std
     
-    return pd.DataFrame({
+    df = pd.DataFrame({
         f"{t1}_close": c1,
         f"{t2}_close": c2,
         "spread": spread, "zscore": zscore,
         "spread_mean": vw_mean, "spread_std": spread_std,
         "vr": vr
-    }).dropna().between_time(SIGNAL_START, RTH_END)
+    }).dropna()
+    if _BAR_TF != "daily":
+        df = df.between_time(SIGNAL_START, RTH_END)
+    return df
 
 
 def trim_oos_signal_warmup(sig: pd.DataFrame,
@@ -416,7 +429,10 @@ def _precompute_adf_pvalues(spread_daily: pd.Series,
 
 def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
                  hmm_regime=None, hurst_filter=None, spread_daily=None,
-                 limit_rebate=0.05, limit_ttl=3,
+                 # Daily mode: 3-bar TTL = 3 days, which kills most mean-revert
+                 # entries waiting for a 0.05σ bounce. Use market entry instead.
+                 limit_rebate=(0.0 if _BAR_TF == "daily" else 0.05),
+                 limit_ttl=(1 if _BAR_TF == "daily" else 3),
                  score_frame: pd.DataFrame | None = None,
                  metagate_model: MetaGateModel | None = None,
                  training_mode: bool = False,
@@ -477,8 +493,11 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
     pending_s_perf = 1.0
     e_features = None
 
+    # Force-disable MetaGate in daily mode: the model is trained on
+    # intraday features and gives noisy probabilities on daily — re-enabled
+    # in Phase 4 after daily-specific retraining.
     meta_active = (metagate_model is not None and metagate_model.usable
-                   and not training_mode)
+                   and not training_mode and _BAR_TF != "daily")
     bypass_legacy_gates = training_mode or meta_active
 
     # ── Post-Trade Learning state ───────────────────────────────────────
@@ -700,7 +719,12 @@ def backtest_oos(df, t1, t2, beta, entry_z, exit_z, stop_z,
             detect_short = z > cur_entry_z
             if not (detect_long or detect_short):
                 continue
-            legacy_panic_blocked = (not bypass_legacy_gates) and regime_state.is_panic()
+            # HMM panic block: when HMM_HARD_BLOCK_ALWAYS is on, applies even
+            # under an active MetaGate; otherwise honours the legacy bypass.
+            if HMM_HARD_BLOCK_ALWAYS and regime_state.hmm_regime == 1:
+                legacy_panic_blocked = True
+            else:
+                legacy_panic_blocked = (not bypass_legacy_gates) and regime_state.is_panic()
 
             # Compute live Hurst (used for legacy soft sizing AND for
             # diagnostic recording even when MetaGate is active).
@@ -1114,22 +1138,33 @@ def _trades_to_daily_pnl(trades: list, dates: pd.DatetimeIndex) -> pd.Series:
 
 
 def load_closes():
+    from config import BAR_TIMEFRAME
     path = DATA_DIR / CLOSES_FILE
     closes = pd.read_csv(path, index_col=0)
-    closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
-    closes = closes.between_time(RTH_START, RTH_END)
+    if BAR_TIMEFRAME == "daily":
+        # Daily CSV has plain dates; keep tz-naive and skip RTH filter.
+        closes.index = pd.to_datetime(closes.index)
+    else:
+        closes.index = pd.to_datetime(closes.index, utc=True).tz_convert("US/Eastern")
+        closes = closes.between_time(RTH_START, RTH_END)
 
     vol_path = DATA_DIR / VOLUMES_FILE
     volumes = None
     if vol_path.exists():
         volumes = pd.read_csv(vol_path, index_col=0)
-        volumes.index = pd.to_datetime(volumes.index, utc=True).tz_convert("US/Eastern")
+        if BAR_TIMEFRAME == "daily":
+            volumes.index = pd.to_datetime(volumes.index)
+        else:
+            volumes.index = pd.to_datetime(volumes.index, utc=True).tz_convert("US/Eastern")
         volumes = volumes.reindex(closes.index).fillna(0.0)
 
     daily_path = DATA_DIR / "closes_daily.csv"
     if daily_path.exists():
         daily = pd.read_csv(daily_path, index_col=0)
-        daily.index = pd.to_datetime(daily.index, utc=True).tz_convert("US/Eastern")
+        if BAR_TIMEFRAME == "daily":
+            daily.index = pd.to_datetime(daily.index)
+        else:
+            daily.index = pd.to_datetime(daily.index, utc=True).tz_convert("US/Eastern")
     else:
         daily = None
 
@@ -1242,12 +1277,12 @@ def main():
 
     # optional date filter
     if args.start:
-        start_ts = pd.Timestamp(args.start).tz_localize("US/Eastern")
+        start_ts = _ts(args.start)
         closes = closes[closes.index >= start_ts]
         daily  = daily[daily.index  >= start_ts]
         print(f"Date filter applied: start={args.start}")
     if args.end:
-        end_ts = pd.Timestamp(args.end).tz_localize("US/Eastern")
+        end_ts = _ts(args.end)
         closes = closes[closes.index <= end_ts]
         daily  = daily[daily.index  <= end_ts]
         print(f"Date filter applied: end={args.end}")
@@ -1293,10 +1328,10 @@ def main():
     )
 
     for w_idx, (tr_s, tr_e, te_s, te_e) in enumerate(windows):
-        tr_s_ts = pd.Timestamp(tr_s).tz_localize("US/Eastern")
-        tr_e_ts = pd.Timestamp(tr_e).tz_localize("US/Eastern")
-        te_s_ts = pd.Timestamp(te_s).tz_localize("US/Eastern")
-        te_e_ts = pd.Timestamp(te_e).tz_localize("US/Eastern")
+        tr_s_ts = _ts(tr_s)
+        tr_e_ts = _ts(tr_e)
+        te_s_ts = _ts(te_s)
+        te_e_ts = _ts(te_e)
 
         closes_train = closes[(closes.index >= tr_s_ts) & (closes.index < tr_e_ts)]
         closes_test  = closes[(closes.index >= te_s_ts) & (closes.index < te_e_ts)]
@@ -1308,10 +1343,18 @@ def main():
         # mode — long histories mask structural breaks like COST-WMT.
         _joh_lookback = relativedelta(years=3)
         joh_start = max(tr_s, (tr_e - _joh_lookback))
-        joh_start_ts = pd.Timestamp(joh_start).tz_localize("US/Eastern")
+        joh_start_ts = _ts(joh_start)
         daily_train = daily[(daily.index >= joh_start_ts) & (daily.index < tr_e_ts)]
 
-        if len(closes_train) < 500 or len(closes_test) < 100 or len(daily_train) < 100:
+        # Min-bar gates: 500/100 designed for intraday density (≈ a few days of
+        # 5-min bars).  In daily mode that means 500 days = 2y of train and
+        # 100 days = 5m of test, killing every early window — relax to 50/20.
+        if _BAR_TF == "daily":
+            _min_train, _min_test, _min_daily = 50, 20, 50
+        else:
+            _min_train, _min_test, _min_daily = 500, 100, 100
+        if (len(closes_train) < _min_train or len(closes_test) < _min_test
+                or len(daily_train) < _min_daily):
             continue
 
         days_train = (tr_e - tr_s).days
@@ -1343,10 +1386,22 @@ def main():
             if t1 not in daily_train.columns or t2 not in daily_train.columns:
                 continue
 
-            # 1. Dynamic Cointegration Test (Johansen on daily train slice)
-            is_coint, dynamic_beta = check_coint_johansen(daily_train, t1, t2, crit_level=0.95)
-            if not is_coint or dynamic_beta < 0 or not (0.1 <= dynamic_beta <= 15.0):
-                continue
+            # 1. Dynamic β estimation.
+            # Intraday: Johansen on rolling 3y train slice (statistical gate).
+            # Daily: Johansen on 750 obs is too noisy; trust the universe
+            # pre-selection in pairs_selected.csv and use OLS β directly.
+            if _BAR_TF == "daily":
+                _pc = daily_train[[t1, t2]].dropna()
+                if len(_pc) < 100:
+                    continue
+                _x, _y = np.log(_pc[t2].values), np.log(_pc[t1].values)
+                dynamic_beta = float(np.cov(_y, _x, ddof=0)[0, 1] / np.var(_x))
+                if not (0.1 <= dynamic_beta <= 15.0):
+                    continue
+            else:
+                is_coint, dynamic_beta = check_coint_johansen(daily_train, t1, t2, crit_level=0.95)
+                if not is_coint or dynamic_beta < 0 or not (0.1 <= dynamic_beta <= 15.0):
+                    continue
 
             # 2. Dynamic Half-life
             spread_daily = daily_train[t1] - dynamic_beta * daily_train[t2]
@@ -1392,10 +1447,15 @@ def main():
             # Only applied to grid results; EV-profile entries are
             # pre-curated by the upstream profiler and may carry a
             # placeholder total_pnl == 0 that would otherwise gate them.
+            # In daily mode disable the train-quality floor entirely: the
+            # WFO is the only diagnostic surface and we want raw signal
+            # behaviour with no extra gates (matches daily_sanity).
+            _min_sh = float("-inf") if _BAR_TF == "daily" else WFO_MIN_TRAIN_SHARPE
+            _min_pnl = float("-inf") if _BAR_TF == "daily" else WFO_MIN_TRAIN_PNL
             if source == "grid" and not pair_train_quality_ok(
                 best,
-                min_sharpe=WFO_MIN_TRAIN_SHARPE,
-                min_pnl=WFO_MIN_TRAIN_PNL,
+                min_sharpe=_min_sh,
+                min_pnl=_min_pnl,
             ):
                 print(
                     f"  {pair_name:<10} TRAIN: SKIP — Sharpe={best.get('sharpe')} "

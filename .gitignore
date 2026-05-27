@@ -11,3 +11,4 @@ __pycache__/
 *.csv
 data
 layer1
+log_*.txt
