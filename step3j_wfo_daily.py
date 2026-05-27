@@ -82,6 +82,7 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                   vol_tight_stop: bool = False,
                   vol_tight_threshold: float = 1.5,
                   vol_tight_stop_z: float = 2.5,
+                  exec_spread: pd.Series | None = None,
                   ) -> pd.DataFrame:
     """Generate mean-reversion trades on a daily spread.
 
@@ -172,9 +173,19 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                 mg_size = metagate.size_multiplier(p_win)
                 if mg_size <= 0.0:
                     continue
+            # If exec_spread given, fill uses next-day VWAP price.
+            # exec_spread is assumed pre-shifted: exec_spread.iloc[i] holds
+            # the spread that would be realised by an order entered at the
+            # end of bar i (i.e. day i+1 VWAP). NaN → skip (no fill yet).
+            fill_spread_at_entry = (
+                exec_spread.iloc[i] if exec_spread is not None
+                else spread_full.iloc[i]
+            )
+            if exec_spread is not None and pd.isna(fill_spread_at_entry):
+                continue
             side = prov_side
             in_pos = True
-            entry_idx, entry_spread = i, spread_full.iloc[i]
+            entry_idx, entry_spread = i, fill_spread_at_entry
             entry_size = this_size * mg_size
             cur_stop_z = stop_z
             if vol_tight_stop and i >= 60:
@@ -188,7 +199,19 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             hit_stop   = abs(zi) >= cur_stop_z
             timeout    = held >= max_hold
             if hit_target or hit_stop or timeout:
-                exit_spread = spread_full.iloc[i]
+                fill_spread_at_exit = (
+                    exec_spread.iloc[i] if exec_spread is not None
+                    else spread_full.iloc[i]
+                )
+                if exec_spread is not None and pd.isna(fill_spread_at_exit):
+                    # Roll forward one bar — if last bar of OOS, force-close
+                    # at last available exec price (no future data leakage
+                    # because exec_spread is pre-shifted).
+                    last_known = exec_spread.iloc[:i + 1].dropna()
+                    if last_known.empty:
+                        continue
+                    fill_spread_at_exit = last_known.iloc[-1]
+                exit_spread = fill_spread_at_exit
                 held_bars  = i - entry_idx
                 borrow_cost = held_bars * borrow_per_day
                 gross = side * (exit_spread - entry_spread)
@@ -356,6 +379,106 @@ def summarise(tr: pd.DataFrame, label: str, n_windows: int, n_pairs: int,
         print(f"... + {len(by_pair) - 15} more pairs")
 
 
+def apply_quarterly_rotation(trades: pd.DataFrame,
+                              sr_prior: float = 0.5,
+                              k_shrink: float = 5.0,
+                              sr_target: float = 1.2,
+                              sr_floor:  float = 0.0,
+                              drop_sr6m_below: float = 0.0) -> pd.DataFrame:
+    """Per-pair quarterly rescaling and drop policy (§5 of upgrade spec).
+
+    For each trade, look at the pair's CLOSED trades that ended strictly
+    before this trade's entry. Compute realised Sharpe over the last 6
+    months of those closed trades, apply Bayesian shrinkage, derive an
+    S_perf size multiplier, and drop the trade entirely if 6m-Sharpe of
+    the pair stays below `drop_sr6m_below`.
+    """
+    if trades.empty:
+        return trades
+    t = trades.sort_values("entry").reset_index(drop=False).copy()
+    t["entry"] = pd.to_datetime(t["entry"])
+    t["exit"]  = pd.to_datetime(t["exit"])
+
+    drop_idx, mults = [], []
+    for pair, grp in t.groupby("pair"):
+        grp = grp.sort_values("entry")
+        for _, row in grp.iterrows():
+            # Same-pair trades with exit STRICTLY before this entry.
+            past = grp[(grp["exit"] < row["entry"])]
+            mult = 1.0
+            keep = True
+            if len(past) >= 3:
+                # 6-month window for SR, 3-month window for drop check
+                cutoff_6m = row["entry"] - pd.DateOffset(months=6)
+                cutoff_3m = row["entry"] - pd.DateOffset(months=3)
+                past_6m = past[past["exit"] >= cutoff_6m]
+                past_3m = past[past["exit"] >= cutoff_3m]
+                if len(past_6m) >= 3:
+                    pnl_6m = past_6m["pnl"]
+                    if pnl_6m.std() > 0:
+                        sr_raw = pnl_6m.mean() / pnl_6m.std() * np.sqrt(252)
+                        n = len(pnl_6m)
+                        sr = (n * sr_raw + k_shrink * sr_prior) / (n + k_shrink)
+                        mult = float(np.clip(
+                            0.2 + (sr - sr_floor) / (sr_target - sr_floor),
+                            0.2, 1.2))
+                        # Drop rule: SR_6m below threshold AND SR_3m also weak
+                        if sr_raw < drop_sr6m_below and len(past_3m) >= 3:
+                            pnl_3m = past_3m["pnl"]
+                            if pnl_3m.std() > 0:
+                                sr_3m = pnl_3m.mean() / pnl_3m.std() * np.sqrt(252)
+                                if sr_3m < drop_sr6m_below:
+                                    keep = False
+            if not keep:
+                drop_idx.append(row["index"])
+            mults.append((row["index"], mult))
+    mult_map = dict(mults)
+    surviving_mask = ~t["index"].isin(drop_idx)
+    t = t[surviving_mask]
+    multipliers = t["index"].map(mult_map).fillna(1.0).values
+    trades_out = trades.loc[t["index"]].copy().reset_index(drop=True)
+    trades_out["pnl"] = trades_out["pnl"].values * multipliers
+    if "size" in trades_out.columns:
+        trades_out["size"] = trades_out["size"].values * multipliers
+    return trades_out
+
+
+def apply_vol_target(trades: pd.DataFrame, target_vol: float,
+                      oos_index: pd.DatetimeIndex,
+                      lookback: int = 20,
+                      max_lev: float = 2.0, min_lev: float = 0.5,
+                      smooth_alpha: float = 0.20) -> pd.DataFrame:
+    """Causal portfolio-level vol targeting.
+
+    For each day in the OOS window, compute realised vol from the previous
+    `lookback` days of portfolio PnL. Leverage_t = target / realised_t,
+    clipped and smoothed.  Scale each trade's PnL by the leverage that was
+    available at its entry date (causal — no future info).
+    """
+    if trades.empty or target_vol <= 0:
+        return trades
+    t = trades.copy()
+    t["entry"] = pd.to_datetime(t["entry"])
+    t["exit"]  = pd.to_datetime(t["exit"])
+    # Daily portfolio PnL, indexed by exit date.
+    daily = t.groupby(t["exit"].dt.normalize())["pnl"].sum()
+    daily = daily.reindex(pd.DatetimeIndex(oos_index).normalize(), fill_value=0.0)
+    rolling_std = daily.shift(1).rolling(lookback, min_periods=lookback).std()
+    realised_vol = rolling_std * np.sqrt(252)
+    raw_lev = (target_vol / realised_vol).clip(lower=min_lev, upper=max_lev)
+    raw_lev = raw_lev.fillna(1.0)
+    # EWMA smoothing
+    smooth = raw_lev.ewm(alpha=smooth_alpha, adjust=False).mean()
+    smooth = smooth.clip(lower=min_lev, upper=max_lev)
+    # Look up leverage at each trade's entry date.
+    entry_dates = t["entry"].dt.normalize()
+    lev = entry_dates.map(smooth).fillna(1.0).values
+    t["pnl"] = t["pnl"].values * lev
+    if "size" in t.columns:
+        t["size"] = t["size"].values * lev
+    return t
+
+
 def save_equity_chart(tr: pd.DataFrame, path: Path):
     if tr.empty:
         return
@@ -419,6 +542,16 @@ def main():
                    help="Max trades per pair per calendar quarter (0 = no cap).")
     p.add_argument("--vol-tight-stop", action="store_true",
                    help="Tighten stop_z to 2.5 when entry's 20d/60d vol ratio > 1.5.")
+    p.add_argument("--vwap-exec", action="store_true",
+                   help="Use next-day VWAP for entry/exit fills (signal still "
+                        "computed on close). Requires data/vwap_daily.csv.")
+    p.add_argument("--rotation", action="store_true",
+                   help="Quarterly per-pair S_perf rescaling (§5): trades sized by "
+                        "rolling pair-Sharpe with Bayesian shrinkage. Drop pairs "
+                        "with SR_6m < 0 for the current quarter.")
+    p.add_argument("--voltarget", type=float, default=0.0,
+                   help="Portfolio vol target (annualised, e.g. 0.10 = 10%%). "
+                        "Applied as causal leverage scaling. 0 = off.")
     p.add_argument("--hmm",    type=str, default="off",
                    choices=["off", "block-panic", "block-calm",
                             "size-panic", "extreme-3state"],
@@ -452,6 +585,14 @@ def main():
         else:
             spy_returns = np.log(closes).diff().mean(axis=1)
             print(f"  hmm mode: {args.hmm}   macro proxy: EW mean of {closes.shape[1]} names")
+
+    vwap_daily = None
+    if args.vwap_exec:
+        vp = DATA_DIR / "vwap_daily.csv"
+        if not vp.exists():
+            raise SystemExit("vwap_daily.csv missing — run build_vwap_daily.py")
+        vwap_daily = pd.read_csv(vp, parse_dates=["Date"]).set_index("Date").sort_index()
+        print(f"  vwap-exec: ON ({vwap_daily.shape[0]} days × {vwap_daily.shape[1]} tickers)")
 
     volumes = None
     if args.vwz:
@@ -606,6 +747,17 @@ def main():
                 sp = spread_series(full, t1, t2, beta)
                 hurst_sp = (mg_rolling_hurst(sp, window=Z_WIN)
                              if mg_model is not None and mg_model.usable else None)
+
+                # Build exec_spread (next-day VWAP) if requested.
+                exec_sp = None
+                if vwap_daily is not None:
+                    if t1 in vwap_daily.columns and t2 in vwap_daily.columns:
+                        vw = vwap_daily.loc[full.index.min():full.index.max(),
+                                              [t1, t2]].reindex(full.index)
+                        vw_spread = np.log(vw[t1]) - beta * np.log(vw[t2])
+                        # Order signalled at end of bar i fills at vw of bar i+1.
+                        exec_sp = vw_spread.shift(-1)
+
                 tr = backtest_pair(
                     sp, oos_s, oos_e, cost_log,
                     cusum_h=args.cusum,
@@ -616,6 +768,7 @@ def main():
                     metagate=mg_model if (mg_model is not None and mg_model.usable) else None,
                     hurst_series=hurst_sp,
                     vol_tight_stop=args.vol_tight_stop,
+                    exec_spread=exec_sp,
                 )
             if not tr.empty:
                 # HRP / inverse-vol: scale the entire trade (pnl is linear in
@@ -743,6 +896,18 @@ def main():
     first_oos = windows[0][2]
     last_oos  = windows[-1][3]
     oos_idx = closes.loc[first_oos:last_oos].index
+
+    # ── Quarterly per-pair rotation (Option B §5) ─────────────────────────
+    if args.rotation:
+        n_before = len(trades)
+        trades = apply_quarterly_rotation(trades)
+        print(f"  → rotation: kept {len(trades)}/{n_before} trades after "
+              "Sharpe-based pair drop + per-trade S_perf rescaling")
+
+    # ── Portfolio vol targeting (Option B §7) ─────────────────────────────
+    if args.voltarget > 0:
+        trades = apply_vol_target(trades, args.voltarget, oos_idx)
+        print(f"  → voltarget={args.voltarget*100:.1f}%: causal leverage applied")
 
     summarise(trades, label=f"NET {args.cost} bps/leg",
               n_windows=len(windows), n_pairs=len(pairs),
