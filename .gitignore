@@ -12,3 +12,9 @@ __pycache__/
 data
 layer1
 log_*.txt
+live.db
+
+# live runtime artifacts
+live/afes_live.db
+live/log.txt
+live/__pycache__/
