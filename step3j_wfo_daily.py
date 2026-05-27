@@ -57,6 +57,50 @@ MAX_HOLD  = 30        # days (cap on holding period)
 
 # ── Engine ──────────────────────────────────────────────────────────────────
 
+_AUSSIE_JP_SUFFIXES = (".AX_USD", "_AX_USD", ".T_USD", "_T_USD")
+
+
+def is_aussie_jp_pair(pair: str) -> bool:
+    return any(s in pair for s in _AUSSIE_JP_SUFFIXES)
+
+
+def aussie_blackout_series(spread: pd.Series) -> pd.Series:
+    """Return boolean Series aligned to `spread`: True = skip entry.
+
+    Gates (cumulative — any True triggers blackout):
+      1. Vol-spike: 5d rolling std of spread > 95th-pct of trailing 252d.
+      2. Half-life: rolling 60d AR(1) half-life > 5 trading days, NaN, or non-mean-reverting.
+    """
+    s = spread.astype(float)
+    diffs = s.diff()
+    vol5  = diffs.rolling(5).std()
+    vol_p95 = vol5.rolling(252, min_periods=63).quantile(0.95)
+    spike = (vol5 > vol_p95)
+
+    # Rolling AR(1) on first-differences vs lagged level (Engle-Granger style).
+    def _hl(window):
+        if len(window) < 30:
+            return np.nan
+        d = np.diff(window)
+        lag = window[:-1]
+        # OLS: d = a + phi * lag
+        x = lag - lag.mean()
+        y = d  - d.mean()
+        denom = (x * x).sum()
+        if denom <= 0:
+            return np.nan
+        phi = (x * y).sum() / denom
+        if phi >= 0:
+            return np.nan  # non-reverting
+        return -np.log(2) / np.log1p(phi)
+
+    hl = s.rolling(60, min_periods=30).apply(_hl, raw=True)
+    hl_bad = (hl.isna()) | (hl > 5.0)
+
+    blackout = spike.fillna(True) | hl_bad.fillna(True)
+    return blackout
+
+
 def estimate_beta(p1: pd.Series, p2: pd.Series) -> float:
     x, y = np.log(p2.values), np.log(p1.values)
     return float(np.cov(y, x, ddof=0)[0, 1] / np.var(x))
@@ -83,6 +127,7 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                   vol_tight_threshold: float = 1.5,
                   vol_tight_stop_z: float = 2.5,
                   exec_spread: pd.Series | None = None,
+                  entry_blackout: pd.Series | None = None,
                   ) -> pd.DataFrame:
     """Generate mean-reversion trades on a daily spread.
 
@@ -161,6 +206,11 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                     if panic_size_mult <= 0.0:
                         continue
                     this_size = panic_size_mult
+            # External blackout (e.g., Aussie filter: vol-spike / HL gate).
+            if entry_blackout is not None:
+                bo = entry_blackout.iloc[i]
+                if pd.notna(bo) and bool(bo):
+                    continue
             # Pre-compute provisional side for MetaGate scoring; we still
             # need a hard z-threshold cross to consider entering.
             prov_side = -1 if zi > entry_z else (+1 if zi < -entry_z else 0)
@@ -564,6 +614,10 @@ def main():
                    help="CUSUM break threshold h (e.g. 5.0). If unset, CUSUM off.")
     p.add_argument("--tag",    type=str, default="",
                    help="Suffix for output filenames (e.g. 'kalman_cusum').")
+    p.add_argument("--aussie-filter", action="store_true", dest="aussie_filter",
+                   help="Conditional gate for Aussie/JP ADR pairs: entry_z>=2.5, "
+                        "blackout when 5d realized spread vol > 95th-pct of trailing 252d, "
+                        "require rolling 60d AR(1) half-life < 5 days.")
     args = p.parse_args()
 
     if BAR_TIMEFRAME != "daily":
@@ -760,8 +814,16 @@ def main():
                         # Order signalled at end of bar i fills at vw of bar i+1.
                         exec_sp = vw_spread.shift(-1)
 
+                # Aussie/JP conditional gate.
+                pair_entry_z = ENTRY_Z
+                pair_blackout = None
+                if args.aussie_filter and is_aussie_jp_pair(pair):
+                    pair_entry_z = max(ENTRY_Z, 2.5)
+                    pair_blackout = aussie_blackout_series(sp)
+
                 tr = backtest_pair(
                     sp, oos_s, oos_e, cost_log,
+                    entry_z=pair_entry_z,
                     cusum_h=args.cusum,
                     panic_series=(panic_full.reindex(sp.index)
                                    if panic_full is not None else None),
@@ -771,6 +833,7 @@ def main():
                     hurst_series=hurst_sp,
                     vol_tight_stop=args.vol_tight_stop,
                     exec_spread=exec_sp,
+                    entry_blackout=pair_blackout,
                 )
             if not tr.empty:
                 # HRP / inverse-vol: scale the entire trade (pnl is linear in
