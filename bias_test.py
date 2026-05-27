@@ -118,6 +118,9 @@ def main():
     p.add_argument("--ticker-overlap", action="store_true", dest="ticker_overlap")
     p.add_argument("--per-pair-quarter-cap", type=int, default=0, dest="per_pair_quarter_cap")
     p.add_argument("--vol-tight-stop", action="store_true", dest="vol_tight_stop")
+    p.add_argument("--vwap-exec", action="store_true", dest="vwap_exec")
+    p.add_argument("--rotation", action="store_true")
+    p.add_argument("--voltarget", type=float, default=0.0)
     p.add_argument("--cusum",  type=float, default=None)
     args = p.parse_args()
 
@@ -180,6 +183,12 @@ def main():
         cmd += ["--per-pair-quarter-cap", str(args.per_pair_quarter_cap)]
     if args.vol_tight_stop:
         cmd.append("--vol-tight-stop")
+    if args.vwap_exec:
+        cmd.append("--vwap-exec")
+    if args.rotation:
+        cmd.append("--rotation")
+    if args.voltarget > 0:
+        cmd += ["--voltarget", str(args.voltarget)]
     if args.cusum is not None:
         cmd += ["--cusum", str(args.cusum)]
     print(" ".join(cmd))
