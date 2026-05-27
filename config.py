@@ -383,12 +383,24 @@ RTH_START = "09:30"
 RTH_END = "16:00"
 SIGNAL_START = "09:30"  # Opened up to catch Price Discovery (Morning Gaps)
 
-BAR_MINUTES  = 5                              # 5-min bars
-BARS_PER_DAY = int(6.5 * 60 / BAR_MINUTES)   
+# ── Bar-timeframe switch ────────────────────────────────────────────────────
+# "5min"  → intraday pipeline (legacy default; uses closes_5min.csv etc.)
+# "daily" → daily pipeline (uses closes_daily.csv, BARS_PER_DAY=1)
+# All downstream constants derived below are timeframe-aware.
+BAR_TIMEFRAME = "daily"
 
-CLOSES_FILE  = f"closes_{BAR_MINUTES}min.csv"
-VOLUMES_FILE = f"volumes_{BAR_MINUTES}min.csv"
-VWAPS_FILE   = f"vwaps_{BAR_MINUTES}min.csv"
+if BAR_TIMEFRAME == "daily":
+    BAR_MINUTES  = 0                            # sentinel: not applicable
+    BARS_PER_DAY = 1
+    CLOSES_FILE  = "closes_daily.csv"
+    VOLUMES_FILE = "volumes_daily.csv"          # may not exist for daily mode
+    VWAPS_FILE   = "vwaps_daily.csv"            # may not exist for daily mode
+else:
+    BAR_MINUTES  = 5                            # 5-min bars
+    BARS_PER_DAY = int(6.5 * 60 / BAR_MINUTES)
+    CLOSES_FILE  = f"closes_{BAR_MINUTES}min.csv"
+    VOLUMES_FILE = f"volumes_{BAR_MINUTES}min.csv"
+    VWAPS_FILE   = f"vwaps_{BAR_MINUTES}min.csv"
 
 RECENT_BARS  = BARS_PER_DAY * 92             # ~4.6 months regardless of bar size
 TRAIN_RATIO  = 0.70   # first 70% → find pairs; last 30% → out-of-sample test
@@ -512,6 +524,12 @@ MAX_PAIR_WEIGHT   = 0.15        # cap: no single pair gets more than 15% of capi
 # to -inf disables the gate entirely.
 WFO_MIN_TRAIN_SHARPE = 0.0
 WFO_MIN_TRAIN_PNL    = 0.0
+
+# When True, the global HMM panic state (==1) hard-blocks new entries even
+# if MetaGate is active.  MetaGate embeds HMM as a soft feature s_HMM, but
+# its calibration sometimes lets through panic-day entries; this flag adds
+# a non-negotiable kill switch on top.
+HMM_HARD_BLOCK_ALWAYS = False
 
 # ── Single-Bullet Entry Guard (Section 7.4) ─────────────────────────────────
 # When the per-bar RegimeState.sbr exceeds SBR_GUARD_THRESHOLD the trading
