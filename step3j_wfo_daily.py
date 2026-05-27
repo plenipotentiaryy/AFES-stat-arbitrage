@@ -35,6 +35,12 @@ from metagate_daily import (
     harvest_train_trades as mg_harvest,
 )
 from hrp_weights import hrp_weights
+from almgren_chriss_repricing import (
+    classify_ticker as ac_classify,
+    leg_cost_log as ac_leg_cost,
+    borrow_log_per_day as ac_borrow_per_day,
+    TIER_TABLE as AC_TIER_TABLE,
+)
 
 # Local import (HMM is optional dep but already used elsewhere in the repo).
 try:
@@ -618,6 +624,15 @@ def main():
                    help="Conditional gate for Aussie/JP ADR pairs: entry_z>=2.5, "
                         "blackout when 5d realized spread vol > 95th-pct of trailing 252d, "
                         "require rolling 60d AR(1) half-life < 5 days.")
+    p.add_argument("--execution-model", type=str, default="almgren",
+                   choices=["flat", "almgren"], dest="execution_model",
+                   help="flat = commission+slip+borrow scalars (--cost --slip --borrow). "
+                        "almgren = per-pair tiered cost: half_spread + κ·σ·√(notional/ADV), "
+                        "plus tier-specific borrow on short leg.  Default: almgren.")
+    p.add_argument("--notional", type=float, default=100_000,
+                   dest="notional",
+                   help="USD notional per leg, used by Almgren-Chriss impact term. "
+                        "Higher notional → larger impact cost.  Default $100k.")
     args = p.parse_args()
 
     if BAR_TIMEFRAME != "daily":
@@ -660,10 +675,51 @@ def main():
     windows = make_windows(closes, args.train, args.oos, args.step,
                             start=args.start, end=args.end)
     # Cost breakdown:
-    #   commission+slippage on round-trip = 2 × (cost + slip) bps
-    #   borrow on short leg, accrued daily, applied per holding-bar at exit
-    cost_log         = 2 * (args.cost + args.slip) / 1e4
-    borrow_per_day   = args.borrow / (252 * 1e4)   # bps/year → log per day on short leg
+    #   flat:    commission+slippage round-trip = 2 × (cost + slip) bps
+    #   almgren: per-pair tiered cost, computed inside per-pair loop
+    cost_log_flat       = 2 * (args.cost + args.slip) / 1e4
+    borrow_per_day_flat = args.borrow / (252 * 1e4)
+
+    # Pre-load $ ADV (price × share-volume) for Almgren-Chriss impact term.
+    ac_dollar_vol = None
+    if args.execution_model == "almgren":
+        vol_path = DATA_DIR / "volumes_daily.csv"
+        if vol_path.exists():
+            vols = pd.read_csv(vol_path, parse_dates=["Date"]).set_index("Date").sort_index()
+            common = [c for c in vols.columns if c in closes.columns]
+            ac_dollar_vol = (closes[common] * vols[common]).rolling(20, min_periods=10).mean()
+        else:
+            print(f"  almgren: volumes_daily.csv missing, falling back to tier-default ADV")
+
+    AC_FALLBACK_ADV = {
+        "us_large_cap":     2.0e9, "us_mid_cap":     3.0e8, "us_small_cap": 2.5e7,
+        "canadian_us_list": 1.5e8, "canadian_local": 1.0e8,
+        "european_adr_us":  2.0e8, "european_local": 6.0e7,
+        "aussie_adr_us":    2.5e8, "aussie_local":   3.0e7,
+    }
+
+    def ac_pair_cost(t1: str, t2: str, train_df: pd.DataFrame) -> tuple[float, float]:
+        """Return (round-trip cost_log, per-day borrow_log) for an Almgren-Chriss pair."""
+        rets = np.log(train_df).diff()
+        sig1 = float(rets[t1].std()) if t1 in rets.columns else 0.015
+        sig2 = float(rets[t2].std()) if t2 in rets.columns else 0.015
+        if not np.isfinite(sig1) or sig1 <= 0: sig1 = 0.015
+        if not np.isfinite(sig2) or sig2 <= 0: sig2 = 0.015
+
+        def _adv(tk: str) -> float:
+            if ac_dollar_vol is not None and tk in ac_dollar_vol.columns:
+                v = ac_dollar_vol.loc[train_df.index.max() if train_df.index.max() in ac_dollar_vol.index
+                                       else ac_dollar_vol.index[-1], tk]
+                if pd.notna(v) and v > 0:
+                    return float(v)
+            return AC_FALLBACK_ADV[ac_classify(tk)]
+
+        c1 = ac_leg_cost(t1, sig1, args.notional, _adv(t1))
+        c2 = ac_leg_cost(t2, sig2, args.notional, _adv(t2))
+        round_trip = 2 * (c1 + c2)   # 2 legs × 2 sides (enter+exit)
+        # Borrow on the short leg (leg2 by convention).
+        borrow_per_d = ac_borrow_per_day(t2)
+        return round_trip, borrow_per_d
 
     print(f"DAILY WFO  (BAR_TIMEFRAME={BAR_TIMEFRAME})")
     print(f"  closes:     {closes.shape[0]} days × {closes.shape[1]} tickers")
@@ -671,10 +727,15 @@ def main():
     print(f"  pairs:      {len(pairs)} from {args.pairs}")
     print(f"  windows:    {len(windows)}  (init={args.train}m / oos={args.oos}m / step={args.step}m)")
     print(f"  z-window:   {Z_WIN}d  | entry/exit/stop = {ENTRY_Z}/{EXIT_Z}/{STOP_Z}  | hold≤{MAX_HOLD}d")
-    print(f"  costs:      commission+slip = 2×({args.cost}+{args.slip}) bps = "
-          f"{cost_log*1e4:.1f} bps round-trip")
-    print(f"              borrow on short = {args.borrow} bps/year "
-          f"= {borrow_per_day*1e4:.3f} bps/day")
+    if args.execution_model == "flat":
+        print(f"  costs:      FLAT — commission+slip = 2×({args.cost}+{args.slip}) bps = "
+              f"{cost_log_flat*1e4:.1f} bps round-trip")
+        print(f"              borrow on short = {args.borrow} bps/year "
+              f"= {borrow_per_day_flat*1e4:.3f} bps/day")
+    else:
+        print(f"  costs:      ALMGREN-CHRISS — tiered per-pair, notional=${args.notional:,.0f}/leg")
+        print(f"              half_spread + κ·σ·√(notional/ADV) per leg, "
+              f"borrow per-tier (50-300 bps/yr)")
     print(f"  kalman:     {'ON' if args.kalman else 'off'}   "
           f"vwz:       {'ON' if args.vwz else 'off'}   "
           f"hmm:       {args.hmm}   "
@@ -776,6 +837,12 @@ def main():
             full = closes.loc[tr_s:oos_e, [t1, t2]].dropna()
             if len(full) < Z_WIN + 10:
                 continue
+
+            # Per-pair cost: flat scalars OR Almgren-Chriss tiered.
+            if args.execution_model == "almgren":
+                cost_log, borrow_per_day = ac_pair_cost(t1, t2, train)
+            else:
+                cost_log, borrow_per_day = cost_log_flat, borrow_per_day_flat
 
             if args.kalman:
                 sp, z_kal = kalman_spread_z(full, t1, t2)
