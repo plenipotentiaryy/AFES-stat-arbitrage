@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import os
 from numba import njit
 import matplotlib
 matplotlib.use("Agg")
@@ -73,6 +74,37 @@ except Exception:
 
 BARS_PER_TRADING_DAY = BARS_PER_DAY
 _LAZY_WINDOW_BARS = COINT_WINDOW_DAYS * BARS_PER_DAY
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+_TAIL_EV_GATE_ACTIVE = _env_bool("AFES_TAIL_EV_GATE", bool(TAIL_EV_GATE))
+# Coint entry gating. 2026-05 ablation showed strict coint entry-block
+# destroys ~90% of trades AND most of the alpha — trades that fail the EG
+# p<0.15 test enter at the deepest z-score dislocations and produce the
+# largest spread reversions. Default `off` = no entry-side coint check;
+# strict exit-side COINT_BREAK still active for true coint breakdowns.
+#   hard        — block entry when coint_valid_entry=False (alpha-destructive)
+#   off         — no entry-side check (recommended, Sharpe 2.05)
+#   kmeans_risk — hard except in K-Means Sideways regime
+#   scale       — instead of blocking, multiply size by AFES_COINT_INVALID_MULT.
+#                 Linearly preserves Sharpe; useful as production ramp-up
+#                 (smaller $-deployment for the same risk-adjusted return).
+_COINT_ENTRY_MODE = os.environ.get("AFES_COINT_ENTRY_MODE", "off").strip().lower()
+if _COINT_ENTRY_MODE not in {"hard", "off", "kmeans_risk", "scale"}:
+    raise ValueError(
+        "AFES_COINT_ENTRY_MODE must be one of: hard, off, kmeans_risk, scale"
+    )
+_COINT_INVALID_MULT = float(os.environ.get("AFES_COINT_INVALID_MULT", "0.3"))
+# Entry/exit p-thresholds for the optional non-off modes. Default both to
+# the strict COINT_BREAK_P; soften via env if running hard/scale modes.
+_COINT_ENTRY_P = float(os.environ.get("AFES_COINT_ENTRY_P", str(COINT_BREAK_P)))
+_COINT_EXIT_P = float(os.environ.get("AFES_COINT_EXIT_P", str(COINT_BREAK_P)))
 
 
 def _data_path() -> str:
@@ -1185,12 +1217,23 @@ else:
     print("No closes_daily.csv — rolling coint check disabled (run step0_download.py)")
 
 # Pre-compute CointegrationFilter per pair (daily EG, O(1) lookup + lazy ADF)
+# Strict filter (p < COINT_BREAK_P) drives exits / suspension.
+# Entry filter (p < _COINT_ENTRY_P) is softer and drives the entry gate.
 _coint_filters: dict[str, CointegrationFilter] = {}
+_coint_filters_entry: dict[str, CointegrationFilter] = {}
 print("Building CointegrationFilters …", end=" ", flush=True)
 for _, _row in pairs.iterrows():
     _t1, _t2 = _row["pair"].split("-")
-    _coint_filters[_row["pair"]] = CointegrationFilter(_daily, _t1, _t2)
-print(f"{len(_coint_filters)} pairs")
+    _coint_filters[_row["pair"]] = CointegrationFilter(
+        _daily, _t1, _t2, p_thresh=_COINT_EXIT_P,
+    )
+    if _COINT_ENTRY_P != _COINT_EXIT_P:
+        _coint_filters_entry[_row["pair"]] = CointegrationFilter(
+            _daily, _t1, _t2, p_thresh=_COINT_ENTRY_P,
+        )
+    else:
+        _coint_filters_entry[_row["pair"]] = _coint_filters[_row["pair"]]
+print(f"{len(_coint_filters)} pairs (entry p<{_COINT_ENTRY_P}, exit p<{_COINT_EXIT_P})")
 
 # Phase 4: load K-Means macro regime
 _kmeans_regime = load_kmeans_regime()
@@ -1665,7 +1708,9 @@ cusum_val_matrix = np.zeros((N_bars, N_pairs))
 time_since_break_matrix = np.zeros((N_bars, N_pairs))
 active_mask_matrix = np.zeros((N_bars, N_pairs), dtype=bool)
 coint_valid_matrix = np.zeros((N_bars, N_pairs), dtype=bool)
+coint_valid_entry_matrix = np.zeros((N_bars, N_pairs), dtype=bool)
 is_panic_matrix = np.zeros((N_bars, N_pairs), dtype=bool)
+kmeans_regime_matrix = np.ones((N_bars, N_pairs), dtype=int)
 
 for p_idx, (pair_name, t1, t2, beta, half_life, pair_weight) in enumerate(pairs_to_trade):
     df_sig = pair_dfs[pair_name]
@@ -1673,9 +1718,19 @@ for p_idx, (pair_name, t1, t2, beta, half_life, pair_weight) in enumerate(pairs_
     
     # Compute base indicators on df_sig.index first
     if _coint_filters.get(pair_name) is not None:
-        coint_valid_arr = np.array([_coint_filters[pair_name]._daily_dict.get(dt, True) for dt in df_sig.index.date], dtype=bool)
+        coint_valid_arr = np.array(
+            [_coint_filters[pair_name]._daily_dict.get(dt, True) for dt in df_sig.index.date],
+            dtype=bool,
+        )
     else:
         coint_valid_arr = np.ones(len(df_sig), dtype=bool)
+    if _coint_filters_entry.get(pair_name) is not None:
+        coint_valid_entry_arr = np.array(
+            [_coint_filters_entry[pair_name]._daily_dict.get(dt, True) for dt in df_sig.index.date],
+            dtype=bool,
+        )
+    else:
+        coint_valid_entry_arr = coint_valid_arr.copy()
 
     if pair_regime:
         is_volatile_arr = np.array([pair_regime.get(t, 0) == 1 for t in df_sig.index], dtype=bool)
@@ -1833,11 +1888,13 @@ for p_idx, (pair_name, t1, t2, beta, half_life, pair_weight) in enumerate(pairs_
     temp_df["cusum_val"] = regime_c_arr
     temp_df["time_since_break"] = regime_t_since_break_arr
     temp_df["coint_valid"] = coint_valid_arr
+    temp_df["coint_valid_entry"] = coint_valid_entry_arr
 
     # Resolve macro regime/panic:
     hmm_vals = np.array([_macro_filter.get_hmm_regime(t) for t in df_sig.index])
     kmeans_vals = np.array([_macro_filter.get_kmeans_regime(t) for t in df_sig.index])
     temp_df["is_panic"] = (hmm_vals == 1) | (kmeans_vals == 2)
+    temp_df["kmeans_regime"] = kmeans_vals
 
     # Active mask:
     temp_df["active_mask"] = False
@@ -1853,11 +1910,11 @@ for p_idx, (pair_name, t1, t2, beta, half_life, pair_weight) in enumerate(pairs_
     continuous_cols = [
         "close_t1", "close_t2", "spread", "beta", "alpha", "spread_std", "zscore", "z_m15",
         "vol_ratio", "rvol", "toxicity", "entry_z", "exit_z", "stop_z", "max_hold", "sizing_mult",
-        "hurst_val", "break_score", "cusum_val", "time_since_break"
+        "hurst_val", "break_score", "cusum_val", "time_since_break", "kmeans_regime"
     ]
     indicator_cols = [
         "is_m15", "is_broken_pos", "is_broken_neg", "is_broken", "tail_signal_ok",
-        "hurst_blocked", "is_volatile", "active_mask", "coint_valid", "is_panic"
+        "hurst_blocked", "is_volatile", "active_mask", "coint_valid", "coint_valid_entry", "is_panic"
     ]
 
     df_cont = temp_df[continuous_cols].reindex(global_timeline, method="ffill").bfill()
@@ -1897,7 +1954,9 @@ for p_idx, (pair_name, t1, t2, beta, half_life, pair_weight) in enumerate(pairs_
     time_since_break_matrix[:, p_idx] = df_aligned["time_since_break"].to_numpy()
     active_mask_matrix[:, p_idx] = df_aligned["active_mask"].to_numpy()
     coint_valid_matrix[:, p_idx] = df_aligned["coint_valid"].to_numpy()
+    coint_valid_entry_matrix[:, p_idx] = df_aligned["coint_valid_entry"].to_numpy()
     is_panic_matrix[:, p_idx] = df_aligned["is_panic"].to_numpy()
+    kmeans_regime_matrix[:, p_idx] = df_aligned["kmeans_regime"].to_numpy(dtype=int)
 
 # Load sectors map:
 pair_sector_map = {}
@@ -1914,11 +1973,22 @@ if prod_path.exists():
             pair_sector_map[p] = p
 
 # Tail risk governor:
-# We parse the config values if present or use standard defaults:
+# Parse config values if present, or use standard defaults:
 max_portfolio_es_pct = 0.02
 max_portfolio_leverage = 2.0
 max_pair_tail_contribution = 0.25
 tail_contribution_mode = "BUDGET_RELATIVE"
+# Module 2/3/4/5 extended parameters
+_tail_mult_floor = 0.2
+_vol_ratio_high_vol_trigger = 1.2
+_vol_ratio_crisis_trigger = 1.5
+_sbr_crisis_trigger = 0.5
+_kill_switch_l1_pct = 0.02
+_kill_switch_l2_pct = 0.04
+_cooldown_bars_l2 = 5
+_l2_liquidate_worst_pct = 0.40
+_haircut_blacklist_ratio = 5.0
+_haircut_mult_floor = 0.2
 try:
     from config import max_portfolio_es_pct as _cfg_portfolio_es_pct
     from config import max_portfolio_leverage as _cfg_portfolio_leverage
@@ -1930,22 +2000,83 @@ try:
     tail_contribution_mode = str(_cfg_tail_contrib_mode)
 except Exception:
     pass
+try:
+    from config import (
+        tail_mult_floor as _cfg_tail_mult_floor,
+        vol_ratio_high_vol_trigger as _cfg_vr_high,
+        vol_ratio_crisis_trigger as _cfg_vr_crisis,
+        sbr_crisis_trigger as _cfg_sbr_crisis,
+        kill_switch_l1_pct as _cfg_ks_l1,
+        kill_switch_l2_pct as _cfg_ks_l2,
+        cooldown_bars_l2 as _cfg_cooldown,
+        l2_liquidate_worst_pct as _cfg_l2_liq,
+        haircut_blacklist_ratio as _cfg_haircut_bl,
+        haircut_mult_floor as _cfg_haircut_floor,
+    )
+    _tail_mult_floor = float(_cfg_tail_mult_floor)
+    _vol_ratio_high_vol_trigger = float(_cfg_vr_high)
+    _vol_ratio_crisis_trigger = float(_cfg_vr_crisis)
+    _sbr_crisis_trigger = float(_cfg_sbr_crisis)
+    _kill_switch_l1_pct = float(_cfg_ks_l1)
+    _kill_switch_l2_pct = float(_cfg_ks_l2)
+    _cooldown_bars_l2 = int(_cfg_cooldown)
+    _l2_liquidate_worst_pct = float(_cfg_l2_liq)
+    _haircut_blacklist_ratio = float(_cfg_haircut_bl)
+    _haircut_mult_floor = float(_cfg_haircut_floor)
+except Exception:
+    pass
 
 tail_governor = TailEVRiskGovernor(
     max_portfolio_es_pct=max_portfolio_es_pct,
     max_pair_tail_contribution=max_pair_tail_contribution,
     contribution_mode=tail_contribution_mode,
+    tail_mult_floor=_tail_mult_floor,
+    vol_ratio_high_vol_trigger=_vol_ratio_high_vol_trigger,
+    vol_ratio_crisis_trigger=_vol_ratio_crisis_trigger,
+    sbr_crisis_trigger=_sbr_crisis_trigger,
+    kill_switch_l1_pct=_kill_switch_l1_pct,
+    kill_switch_l2_pct=_kill_switch_l2_pct,
+    cooldown_bars_l2=_cooldown_bars_l2,
+    l2_liquidate_worst_pct=_l2_liquidate_worst_pct,
+    haircut_blacklist_ratio=_haircut_blacklist_ratio,
+    haircut_mult_floor=_haircut_mult_floor,
 )
 exposure_caps = ExposureCapsController(max_portfolio_leverage=max_portfolio_leverage)
 
-# Fit tail risk governor on the pre-OOS train period:
+# Fit tail risk governor on the pre-OOS train period.
+# Module 3: Regime-Conditional GPD — partition by vol_ratio + break_score regimes.
 for p_idx, (pair_name, t1, t2, beta, half_life, pair_weight) in enumerate(pairs_to_trade):
     df_sig = pair_dfs[pair_name]
     if _oos_start is not None:
-        train_z = df_sig.loc[df_sig.index < _oos_start, "zscore"].dropna()
+        train_mask = df_sig.index < _oos_start
+        train_z = df_sig.loc[train_mask, "zscore"].dropna()
+        # vol_ratio and break_score for conditioning
+        if "vol_ratio" in df_sig.columns:
+            train_vr = df_sig.loc[train_mask, "vol_ratio"].reindex(train_z.index).ffill().fillna(1.0)
+        else:
+            train_vr = pd.Series(1.0, index=train_z.index)
+        if "break_score" in df_sig.columns:
+            train_bs = df_sig.loc[train_mask, "break_score"].reindex(train_z.index).ffill().fillna(0.0)
+        else:
+            train_bs = pd.Series(0.0, index=train_z.index)
     else:
-        train_z = df_sig["zscore"].dropna().iloc[:int(len(df_sig) * TRAIN_RATIO)]
-    tail_governor.fit_pair_gpd(pair_name, train_z.to_numpy(dtype=float))
+        n_train = int(len(df_sig) * TRAIN_RATIO)
+        train_z = df_sig["zscore"].dropna().iloc[:n_train]
+        if "vol_ratio" in df_sig.columns:
+            train_vr = df_sig["vol_ratio"].reindex(train_z.index).ffill().fillna(1.0)
+        else:
+            train_vr = pd.Series(1.0, index=train_z.index)
+        if "break_score" in df_sig.columns:
+            train_bs = df_sig["break_score"].reindex(train_z.index).ffill().fillna(0.0)
+        else:
+            train_bs = pd.Series(0.0, index=train_z.index)
+    # Regime-conditional fit (also populates legacy gpd_parameters as fallback)
+    tail_governor.fit_pair_gpd_conditional(
+        pair_name,
+        train_z.to_numpy(dtype=float),
+        train_vr.to_numpy(dtype=float),
+        train_bs.to_numpy(dtype=float),
+    )
 
 # State:
 running_equity = INITIAL_CAPITAL
@@ -1954,12 +2085,27 @@ pending_entries = [None] * N_pairs
 suspended_dict = [False] * N_pairs
 
 completed_trades = []
-blocked_stats = {"macro": 0, "size": 0, "tail": 0, "rvol": 0, "vel": 0, "coint": 0, "hurst": 0, "toxicity": 0}
+blocked_stats = {
+    "macro": 0,
+    "size": 0,
+    "tail": 0,
+    "tail_ev_gate": 0,
+    "tail_blacklist": 0,
+    "tail_governor": 0,
+    "rvol": 0,
+    "vel": 0,
+    "coint": 0,
+    "hurst": 0,
+    "toxicity": 0,
+    "kill_switch": 0,
+}
 blocked_margin_entries = 0 # compat
 p_mc_threshold = 0.05 # reporting fallback for legacy margin-call diagnostics
 
 insurance_premium_daily = 0.0001
 toxicity_filter = HawkesToxicityFilter()
+# Module 5: kill switch state — pair→PnL accumulator for haircut computation
+_pair_trade_pnls: dict[str, list] = {pn: [] for pn, *_ in pairs_to_trade}
 
 for t_idx, ts in enumerate(global_timeline):
     # Step 1: Execute pending liquidations at the next available close-bar.
@@ -2012,6 +2158,8 @@ for t_idx, ts in enumerate(global_timeline):
                 "exit_z": round(exit_spread / pos_state.entry_std, 2) if pos_state.entry_std > 0 else 0.0,
                 "beta": pos_state.entry_beta,
                 "size_mult": pos_state.size_multiplier,
+                "base_size_mult": getattr(pos_state, "base_size_multiplier", pos_state.size_multiplier),
+                "tail_mult": getattr(pos_state, "tail_multiplier", 1.0),
                 "s_perf": pos_state.s_perf,
                 "dollar_pnl": round(dollar_net, 2),
                 "dollar_gross": round(dollar_gross, 2),
@@ -2019,6 +2167,8 @@ for t_idx, ts in enumerate(global_timeline):
                 "insurance_cost": 0.0,
                 "convex_payout": 0.0,
             })
+            # Module 4: accumulate trade PnL for pair haircut refit
+            _pair_trade_pnls.setdefault(pair_name, []).append(float(dollar_net))
             del active_positions[p_idx]
 
     # Step 2: Check normal exits, stops, and circuit breakers
@@ -2128,6 +2278,8 @@ for t_idx, ts in enumerate(global_timeline):
                 "exit_z": round(z_active, 2),
                 "beta": pos_state.entry_beta,
                 "size_mult": pos_state.size_multiplier,
+                "base_size_mult": getattr(pos_state, "base_size_multiplier", pos_state.size_multiplier),
+                "tail_mult": getattr(pos_state, "tail_multiplier", 1.0),
                 "s_perf": pos_state.s_perf,
                 "dollar_pnl": round(dollar_net_final, 2),
                 "dollar_gross": round(dollar_gross, 2),
@@ -2135,12 +2287,17 @@ for t_idx, ts in enumerate(global_timeline):
                 "insurance_cost": round(insurance_cost, 2),
                 "convex_payout": round(payout, 2),
             })
+            # Module 4: accumulate trade PnL for pair haircut refit (online)
+            _pair_trade_pnls.setdefault(pair_name, []).append(float(dollar_net_final))
             del active_positions[p_idx]
 
     # Step 3: Compute current portfolio-level exposures and tail Expected Shortfall
     open_position_dicts = []
     for p_idx, pos_state in active_positions.items():
         pair_name = pairs_to_trade[p_idx][0]
+        _cur_vr = float(vol_ratio_matrix[t_idx, p_idx])
+        _cur_bs = float(break_score_matrix[t_idx, p_idx])
+        _cur_regime = tail_governor.get_regime_label(_cur_vr, _cur_bs)
         open_position_dicts.append({
             "pair_name": pair_name,
             "pair": pair_name,
@@ -2150,11 +2307,37 @@ for t_idx, ts in enumerate(global_timeline):
             "nominal_size_usd": pos_state.nominal_size_usd,
             "nominal_usd": pos_state.nominal_size_usd,
             "sector": pair_sector_map.get(pair_name, "UNKNOWN"),
+            "regime": _cur_regime,
         })
-        
+
+    # Module 5: Two-tier Kill Switch — evaluate BEFORE processing new entries.
+    # Returns pairs to liquidate at NEXT bar open (pending_liquidation flag).
+    _ks_decision = tail_governor.evaluate_kill_switch(
+        open_position_dicts,
+        running_equity,
+        current_bar_index=t_idx,
+    )
+    kill_switch_entries_blocked = _ks_decision.block_new_entries
+    if _ks_decision.level > 0:
+        blocked_stats["kill_switch"] += 1
+    # Mark kill-switch-nominated pairs for next-bar liquidation:
+    if _ks_decision.pairs_to_liquidate:
+        for _ks_pair_name in _ks_decision.pairs_to_liquidate:
+            for _ks_pidx, _ks_pos in active_positions.items():
+                if pairs_to_trade[_ks_pidx][0] == _ks_pair_name and not _ks_pos.pending_liquidation:
+                    _ks_pos.pending_liquidation = True
+
+    # Module 4: Incremental haircut refit every 50 bars (causal — uses past trades only)
+    if t_idx > 0 and t_idx % 50 == 0:
+        for _pn, _pnls in _pair_trade_pnls.items():
+            if len(_pnls) >= 10:  # minimum sample for meaningful haircut
+                tail_governor.calculate_pair_tail_haircut(_pn, _pnls)
+
+    # Legacy evaluate_portfolio_risk for contribution-based sequential de-risking
+    # (still active in parallel to kill switch — provides finer-grained control)
     portfolio_safe = True
-    derisk_order = []
-    if open_position_dicts:
+    derisk_order: list[str] = []
+    if open_position_dicts and not kill_switch_entries_blocked:
         try:
             portfolio_safe, derisk_order = tail_governor.evaluate_portfolio_risk(
                 open_position_dicts,
@@ -2176,7 +2359,11 @@ for t_idx, ts in enumerate(global_timeline):
     for p_idx in range(N_pairs):
         pending = pending_entries[p_idx]
         if pending is not None:
-            direction, size_mult, active_exit_thresh, active_stop_thresh = pending
+            if len(pending) == 6:
+                direction, size_mult, active_exit_thresh, active_stop_thresh, base_size_mult, tail_mult = pending
+            else:
+                direction, size_mult, active_exit_thresh, active_stop_thresh = pending
+                base_size_mult, tail_mult = size_mult, 1.0
             pair_name, t1, t2, beta, half_life, pair_weight = pairs_to_trade[p_idx]
             
             pos_state = PositionState(
@@ -2198,6 +2385,8 @@ for t_idx, ts in enumerate(global_timeline):
             pos_state.max_hold = max_hold_matrix[t_idx, p_idx]
             pos_state.s_perf = 1.0
             pos_state.current_z = zscore_matrix[t_idx, p_idx]
+            pos_state.base_size_multiplier = base_size_mult
+            pos_state.tail_multiplier = tail_mult
             
             notl_raw = pos_state.entry_t1_price + abs(pos_state.entry_beta) * pos_state.entry_t2_price
             pos_state.units = (pos_state.entry_capital_alloc / max(notl_raw, 1.0)) * size_mult
@@ -2246,9 +2435,19 @@ for t_idx, ts in enumerate(global_timeline):
                 direction = 0
                 
             if direction != 0:
-                # check gates:
-                if TAIL_EV_GATE and not tail_signal_ok_matrix[t_idx, p_idx]:
+                # Module 5: Kill switch blocks all new entries during breach/cooldown
+                if kill_switch_entries_blocked:
+                    blocked_stats["kill_switch"] += 1
+                    continue
+                # Module 4: Block blacklisted pairs outright
+                if tail_governor.is_pair_blacklisted(pair_name):
                     blocked_stats["tail"] += 1
+                    blocked_stats["tail_blacklist"] += 1
+                    continue
+                # check gates:
+                if _TAIL_EV_GATE_ACTIVE and not tail_signal_ok_matrix[t_idx, p_idx]:
+                    blocked_stats["tail"] += 1
+                    blocked_stats["tail_ev_gate"] += 1
                     continue
                 if toxicity_matrix[t_idx, p_idx] > toxicity_filter.threshold:
                     blocked_stats["toxicity"] += 1
@@ -2264,6 +2463,20 @@ for t_idx, ts in enumerate(global_timeline):
                     if direction == -1 and entry_z_val >= z_prev:
                         blocked_stats["vel"] += 1
                         continue
+                coint_entry_hard = _COINT_ENTRY_MODE == "hard"
+                coint_entry_hard = coint_entry_hard or (
+                    _COINT_ENTRY_MODE == "kmeans_risk"
+                    and int(kmeans_regime_matrix[t_idx, p_idx]) != 1
+                )
+                _coint_ok_entry = bool(coint_valid_entry_matrix[t_idx, p_idx])
+                if coint_entry_hard and not _coint_ok_entry:
+                    blocked_stats["coint"] += 1
+                    continue
+                # scale mode: don't block, scale size when coint check fails
+                coint_size_penalty = 1.0
+                if _COINT_ENTRY_MODE == "scale" and not _coint_ok_entry:
+                    coint_size_penalty = _COINT_INVALID_MULT
+                    blocked_stats["coint_scaled"] = blocked_stats.get("coint_scaled", 0) + 1
                 if _coint_filters.get(pair_name) is not None:
                     spread_tail = pd.Series(spread_matrix[max(0, t_idx - _LAZY_WINDOW_BARS): t_idx + 1, p_idx])
                     if not _coint_filters[pair_name].lazy_check(spread_tail, ts):
@@ -2274,8 +2487,24 @@ for t_idx, ts in enumerate(global_timeline):
                     continue
                     
                 # check exposure caps and governor:
-                size_mult = sizing_multiplier_matrix[t_idx, p_idx]
+                base_size_mult = sizing_multiplier_matrix[t_idx, p_idx] * coint_size_penalty
                 capital_alloc = running_equity * pair_weight
+                notional_raw = close_t1_matrix[t_idx, p_idx] + abs(beta_matrix[t_idx, p_idx]) * close_t2_matrix[t_idx, p_idx]
+                base_units = (capital_alloc / max(notional_raw, 1.0)) * base_size_mult
+                # Module 3: get current regime label for regime-conditional GPD sizing
+                _entry_vr = float(vol_ratio_matrix[t_idx, p_idx])
+                _entry_bs = float(break_score_matrix[t_idx, p_idx])
+                _entry_regime = tail_governor.get_regime_label(_entry_vr, _entry_bs)
+                # Module 2: EVT-Aware Sizing with regime-conditional GPD + haircut
+                tail_mult = tail_governor.calculate_evt_size_multiplier(
+                    pair_name=pair_name,
+                    current_z=entry_z_val,
+                    spread_std_usd=spread_std_matrix[t_idx, p_idx],
+                    base_units=base_units,
+                    current_capital=running_equity,
+                    regime=_entry_regime,
+                )
+                size_mult = base_size_mult * tail_mult
                 nominal_size_usd = capital_alloc * size_mult
                 
                 allowed_exp, exp_reason = exposure_caps.check_entry_allowed(
@@ -2290,16 +2519,17 @@ for t_idx, ts in enumerate(global_timeline):
                     blocked_stats["size"] += 1
                     continue
                     
-                notional_raw = close_t1_matrix[t_idx, p_idx] + abs(beta_matrix[t_idx, p_idx]) * close_t2_matrix[t_idx, p_idx]
                 candidate_position = {
                     "pair_name": pair_name,
                     "pair": pair_name,
                     "current_z": entry_z_val,
                     "spread_std_usd": spread_std_matrix[t_idx, p_idx],
-                    "position_size_units": (capital_alloc / max(notional_raw, 1.0)) * size_mult,
+                    "position_size_units": base_units * tail_mult,
                     "nominal_size_usd": nominal_size_usd,
                     "nominal_usd": nominal_size_usd,
                     "sector": pair_sector_map.get(pair_name, "UNKNOWN"),
+                    "tail_mult": tail_mult,
+                    "base_size_mult": base_size_mult,
                 }
                 
                 allowed_tail, tail_reason, projected_es = tail_governor.check_candidate_entry(
@@ -2309,10 +2539,18 @@ for t_idx, ts in enumerate(global_timeline):
                 )
                 if not allowed_tail or not portfolio_safe:
                     blocked_stats["tail"] += 1
+                    blocked_stats["tail_governor"] += 1
                     continue
                     
                 # Store pending:
-                pending_entries[p_idx] = (direction, size_mult, exit_thresh_live, stop_thresh_live)
+                pending_entries[p_idx] = (
+                    direction,
+                    size_mult,
+                    exit_thresh_live,
+                    stop_thresh_live,
+                    base_size_mult,
+                    tail_mult,
+                )
 
 # Compile results:
 df_trades = pd.DataFrame(completed_trades)
@@ -2334,7 +2572,15 @@ for p_idx, (pair_name, t1, t2, beta, half_life, pair_weight) in enumerate(pairs_
         "signals": df_sig
     }
     t_count = len(pair_results[pair_name]["trades"])
-    print(f"  {pair_name:12s}  trades={t_count:3d}  | blocked (global sum of filters: macro={blocked_stats['macro']} size={blocked_stats['size']} tail={blocked_stats['tail']} rvol={blocked_stats['rvol']} vel={blocked_stats['vel']} coint={blocked_stats['coint']} hurst={blocked_stats['hurst']} tox={blocked_stats['toxicity']})")
+    print(
+        f"  {pair_name:12s}  trades={t_count:3d}  | blocked "
+        f"(global sum of filters: macro={blocked_stats['macro']} size={blocked_stats['size']} "
+        f"tail={blocked_stats['tail']} tail_ev={blocked_stats['tail_ev_gate']} "
+        f"tail_bl={blocked_stats['tail_blacklist']} tail_gov={blocked_stats['tail_governor']} "
+        f"kill={blocked_stats['kill_switch']} rvol={blocked_stats['rvol']} "
+        f"vel={blocked_stats['vel']} coint={blocked_stats['coint']} "
+        f"hurst={blocked_stats['hurst']} tox={blocked_stats['toxicity']})"
+    )
 
 
 pnl             = df_trades["net_pnl"]
@@ -2446,6 +2692,33 @@ for pair_name, data in pair_results.items():
 
 df_trades.to_csv(DATA_DIR / "trades.csv", index=False)
 print(f"\nSaved {len(df_trades)} trades to {DATA_DIR / 'trades.csv'}")
+
+summary_label = os.environ.get("AFES_RUN_LABEL", "last")
+exit_counts = df_trades["exit_reason"].value_counts().to_dict()
+summary_row = {
+    "label": summary_label,
+    "tail_ev_gate_active": bool(_TAIL_EV_GATE_ACTIVE),
+    "coint_entry_mode": _COINT_ENTRY_MODE,
+    "pairs": len(pair_results),
+    "trades": int(len(df_trades)),
+    "win_rate": float((pnl > 0).mean()) if len(df_trades) else 0.0,
+    "sharpe": float(sharpe),
+    "net_pnl": float(pnl.sum()) if len(df_trades) else 0.0,
+    "dollar_net": float(dollar_net),
+    "profit_factor": float(profit_factor),
+    "max_drawdown": float(max_drawdown),
+    "dollar_drawdown": float(dollar_drawdown),
+    "avg_hold_bars": float(df_trades["holding_bars"].mean()) if len(df_trades) else 0.0,
+    "exit_signal": int(exit_counts.get("SIGNAL", 0)),
+    "exit_stop": int(exit_counts.get("STOP", 0)),
+    "exit_coint_break": int(exit_counts.get("COINT_BREAK", 0)),
+    "exit_force_close": int(exit_counts.get("FORCE_CLOSE", 0)),
+    "exit_panic": int(exit_counts.get("PANIC", 0)),
+    **{f"blocked_{k}": int(v) for k, v in blocked_stats.items()},
+}
+summary_path = OUTPUT_DIR / f"backtest_summary_{summary_label}.csv"
+pd.DataFrame([summary_row]).to_csv(summary_path, index=False)
+print(f"Summary saved to {summary_path}")
 
 # compare vs spy
 spy_return = None
