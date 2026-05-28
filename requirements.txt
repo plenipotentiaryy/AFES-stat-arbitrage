@@ -8,3 +8,5 @@ scipy
 statsmodels
 hmmlearn
 yfinance
+ib_insync
+requests

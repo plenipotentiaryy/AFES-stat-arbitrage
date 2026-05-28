@@ -1,73 +1,125 @@
-# AFES Live Execution (MVP)
+# AFES Live Execution
 
-Automated MOC-order execution against IBKR via `ib_insync`.
+Production-oriented IBKR paper/live automation for the AFES production stack.
+
+Default behavior is conservative:
+
+- `daily_signal.py --dry-run` performs no DB writes.
+- `ibkr_executor.py --dry-run` performs no broker connection.
+- `ibkr_executor.py` does not transmit live orders unless `--transmit` is passed.
+- `run_daily.sh` only transmits when `AFES_TRANSMIT=1`.
 
 ## Files
 
 | File | Role |
 |---|---|
-| `state.py` | SQLite schema: positions, orders, pnl_daily |
-| `daily_signal.py` | Pulls yfinance closes → computes z → stages orders in DB |
-| `ibkr_executor.py` | Reads pending orders → submits MOC to IBKR → records fills |
-| `reconcile.py` | SOD sanity check: DB positions vs IBKR account |
-| `run_daily.sh` | Cron orchestrator (reconcile → signal → execute) |
+| `state.py` | SQLite source of truth: positions, orders, daily PnL, events |
+| `daily_signal.py` | Production universe signal generation, exit logic, kill switch, risk gates |
+| `ibkr_executor.py` | IBKR MOC routing, margin/borrow best-effort checks, fill updates |
+| `reconcile.py` | DB-vs-IBKR position reconciliation |
+| `alerts.py` | Optional Telegram/Slack alerts |
+| `run_daily.sh` | Cron/launchd orchestrator |
 
 ## Setup
 
 ```bash
-pip install ib_insync yfinance
-# Start IB Gateway or TWS, enable API in settings:
-#   File → Global Configuration → API → Settings → "Enable ActiveX and Socket Clients" ON
-#   Socket port: 7497 (paper) or 7496 (live)
-#   Master API client ID: leave blank
+pip install -r requirements.txt
+python3 build_production_universe.py
+python3 build_production_live_state.py
 ```
 
-## First-time sanity check (no orders sent)
+Start TWS or IB Gateway:
+
+```text
+Paper port: 7497
+Live port:  7496
+API setting: Enable ActiveX and Socket Clients
+```
+
+## Local Dry Run
 
 ```bash
-# Inspect signals on today's data
-python -m live.daily_signal --pairs data/pairs_bias_test.csv --dry-run
+python -m live.daily_signal \
+  --universe data/production_universe.csv \
+  --live-state output/live_state_production.pkl \
+  --dry-run
+```
 
-# Submit-stage with dry-run executor (prints what would go to IB)
-python -m live.daily_signal --pairs data/pairs_bias_test.csv
+To stage orders in SQLite but not send them:
+
+```bash
+python -m live.daily_signal \
+  --universe data/production_universe.csv \
+  --live-state output/live_state_production.pkl \
+  --notional 1000
+
 python -m live.ibkr_executor --dry-run
 ```
 
-## Schedule
+## IBKR Paper Run
 
-```cron
-# 15:50 ET weekdays — adjust for your timezone
-50 15 * * 1-5  cd /path/to/AFES_1 && live/run_daily.sh >> live/log.txt 2>&1
+Non-transmitting IBKR orders:
+
+```bash
+python -m live.ibkr_executor --host 127.0.0.1 --port 7497 --client-id 7
 ```
 
-## Known MVP limitations
+Transmitting paper orders:
 
-1. **No FX leg for cross-listings.** USD-normalized synthetic legs (e.g. `RY.TO_USD`)
-   are skipped — `daily_signal.py` works only on US-listed names for now. To trade
-   cross-listings you need a parallel FX fetcher and contract routing per the
-   `EXCHANGE_OVERRIDES` table in `ibkr_executor.py` (which is wired but unused).
+```bash
+python -m live.ibkr_executor --host 127.0.0.1 --port 7497 --client-id 7 --transmit
+```
 
-2. **No borrow-availability check.** Real production should call
-   `ib.reqMktData(contract, '236')` for shortable shares + fee rate before
-   submitting any short leg. If unborrowable, skip the pair for the day.
+## Daily Orchestration
 
-3. **No margin pre-check.** Add `ib.accountSummary()` lookup of `AvailableFunds`
-   before submitting; require ≥30% buffer.
+```bash
+AFES_DRY_RUN=1 live/run_daily.sh
+```
 
-4. **No kill switch.** Add daily-DD circuit breaker (e.g., if cumulative net PnL
-   over last 5 days < −5% of NAV, close all and halt).
+Paper order transmission:
 
-5. **No alerting.** Add Telegram/Slack webhook on fills, rejects, mismatches.
+```bash
+AFES_TRANSMIT=1 AFES_IBKR_PORT=7497 live/run_daily.sh
+```
 
-6. **Single-broker, single-account.** No failover, no multi-account splitting.
+Suggested launchd/cron timing is around 15:50 ET for signal generation and MOC
+submission. IBKR MOC cutoffs vary by venue; verify with paper trading before
+using live capital.
 
-## Pre-production checklist
+## Environment Variables
 
-- [ ] 30+ days paper trading on port 7497, all metrics match backtest expectation
-- [ ] Reconcile clean every morning for 2+ weeks straight
-- [ ] Borrow check + skip-on-unborrowable implemented
-- [ ] Margin pre-check + 30% buffer enforced
-- [ ] Kill switch: −5% 5-day DD → halt + alert
-- [ ] Telegram alert on every fill, error, mismatch
-- [ ] Disaster-recovery: how do you flatten if the laptop dies during market hours?
-- [ ] Tax planning: cross-border FX events bookkeeping (CPA consultation)
+| Variable | Default | Meaning |
+|---|---:|---|
+| `AFES_PRODUCTION_UNIVERSE` | `data/production_universe.csv` | Production whitelist |
+| `AFES_LIVE_STATE` | `output/live_state_production.pkl` | WFO/live params |
+| `AFES_LIVE_DB` | `live/afes_live.db` | SQLite state file |
+| `AFES_NOTIONAL` | `1000` | Per-pair max notional before weight/risk caps |
+| `AFES_MAX_CONCURRENT` | `10` | Max concurrent open pairs |
+| `AFES_IBKR_HOST` | `127.0.0.1` | TWS/Gateway host |
+| `AFES_IBKR_PORT` | `7497` | Paper by default |
+| `AFES_TRANSMIT` | `0` | Must be `1` to transmit |
+| `AFES_DRY_RUN` | `0` | If `1`, signal/executor dry-run |
+| `AFES_KILL_DD_PCT` | `0.05` | Kill switch drawdown threshold |
+| `AFES_KILL_WINDOW_DAYS` | `5` | Kill switch lookback |
+| `AFES_SLACK_WEBHOOK_URL` | empty | Optional Slack alerts |
+| `AFES_TELEGRAM_BOT_TOKEN` | empty | Optional Telegram alerts |
+| `AFES_TELEGRAM_CHAT_ID` | empty | Optional Telegram chat |
+
+## Current Controls
+
+- Production whitelist: baseline US pairs + Europe/US ADR-local pairs.
+- `_USD` synthetic legs are reconstructed from local listing close times and FX.
+- Entry, exit, stop, and max-hold are staged daily.
+- SQLite persists open positions, pending orders, fills, and event logs.
+- Exposure caps and Tail EV governor block candidate entries.
+- Kill switch: recent net PnL drawdown triggers close-all staging and blocks entries.
+- IBKR executor includes best-effort margin and borrow checks.
+- Reconciliation halts daily run on DB-vs-IBKR mismatch when requested.
+
+## Remaining Pre-Live Checks
+
+- Run at least 30 market days on paper with `AFES_TRANSMIT=1` and `AFES_IBKR_PORT=7497`.
+- Verify every MOC venue accepts the submitted order type before close.
+- Confirm borrow check behavior on the actual IBKR account permissions.
+- Confirm tax and FX bookkeeping for foreign listings.
+- Define manual flatten procedure if TWS/Gateway or the machine fails near close.

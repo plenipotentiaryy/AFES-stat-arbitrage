@@ -577,6 +577,13 @@ TAIL_RR_THRESHOLD = 0.5
 TAIL_CONFIDENCE_LEVEL = 0.95
 TAIL_REFIT_FREQ = "W"
 
+# Tail EV Governor / contribution budgeting.  Lower-case aliases are used by
+# the legacy backtest scripts, so keep these names stable.
+max_portfolio_es_pct = 0.02
+max_portfolio_leverage = 2.0
+max_pair_tail_contribution = 0.25
+tail_contribution_mode = "BUDGET_RELATIVE"
+
 # rMT / regularized allocation
 # Enable by setting ALLOCATION_METHOD = "regularized".
 PORTFOLIO_OPT_MAX_GROSS = 1.0

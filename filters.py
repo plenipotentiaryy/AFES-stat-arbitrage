@@ -887,6 +887,22 @@ class OnlineParameterAdapter:
         }
 
 
+from dataclasses import dataclass
+
+@dataclass
+class PositionState:
+    pair_name: str
+    position: int = 0                  # -1 (Short), 0 (Flat), 1 (Long)
+    entry_spread: float = 0.0
+    entry_t1_price: float = 0.0
+    entry_t2_price: float = 0.0
+    entry_beta: float = 1.0
+    entry_alpha: float = 0.0
+    entry_std: float = 0.0
+    entry_bar_idx: int = 0
+    size_multiplier: float = 1.0
+    pending_liquidation: bool = False
+
 from scipy.stats import gaussian_kde
 
 def validate_kde_density(z_series: pd.Series, entry_z: float, threshold_ratio: float = 0.5) -> bool:

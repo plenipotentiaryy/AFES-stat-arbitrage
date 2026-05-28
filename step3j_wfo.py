@@ -85,6 +85,55 @@ from config import (
 from risk.ticker_overlap import (
     TickerOverlapBlocker, compute_spread_correlations, filter_trade_list,
 )
+from risk import ExposureCapsController, TailEVRiskGovernor
+
+class WFOPositionState:
+    def __init__(self, pair_name, position=0, entry_spread=0.0, entry_t1_price=0.0,
+                 entry_t2_price=0.0, entry_beta=1.0, entry_alpha=0.0, entry_std=0.0,
+                 entry_bar_idx=0, size_multiplier=1.0, pending_liquidation=False):
+        self.pair_name = pair_name
+        self.position = position
+        self.entry_spread = entry_spread
+        self.entry_t1_price = entry_t1_price
+        self.entry_t2_price = entry_t2_price
+        self.entry_beta = entry_beta
+        self.entry_alpha = entry_alpha
+        self.entry_std = entry_std
+        self.entry_bar_idx = entry_bar_idx
+        self.size_multiplier = size_multiplier
+        self.pending_liquidation = pending_liquidation
+        
+        # extra fields
+        self.units = 0.0
+        self.nominal_size_usd = 0.0
+        self.entry_capital_alloc = 0.0
+        self.current_z = 0.0
+        self.entry_sma = 0.0
+        self.h_multiplier = 1.0
+        self.meta_multiplier = 1.0
+        self.p_win = 0.5
+        self.s_perf = 1.0
+        self.max_hold = 0
+        self.features = None
+
+class PendingOrder:
+    def __init__(self, position=0, ttl=0, limit_z=0.0, h_multiplier=1.0,
+                 meta_multiplier=1.0, p_win=0.5, s_perf=1.0, max_hold=0, features=None):
+        self.position = position
+        self.ttl = ttl
+        self.limit_z = limit_z
+        self.h_multiplier = h_multiplier
+        self.meta_multiplier = meta_multiplier
+        self.p_win = p_win
+        self.s_perf = s_perf
+        self.max_hold = max_hold
+        self.features = features
+
+def normalize_to_date(ts):
+    t = ts.normalize()
+    if t.tz is not None:
+        return t.tz_localize(None)
+    return t
 
 # Cap on shadow-trade holding length (bars). Prevents shadow positions from
 # living forever when no exit signal fires.
@@ -1312,6 +1361,20 @@ def main():
     hurst_label = f"ACTIVE (H>{HURST_ENTRY_MAX})" if use_hurst else "OFF"
     print(f"Hurst gate: {hurst_label}\n")
 
+    running_equity = INITIAL_CAPITAL
+    pair_sector_map = {}
+    prod_path = DATA_DIR / "production_universe.csv"
+    if prod_path.exists():
+        prod_df = pd.read_csv(prod_path)
+        for _, row in prod_df.iterrows():
+            p = str(row["pair"])
+            sl = str(row.get("source_layer", ""))
+            curr = str(row.get("currency", "USD"))
+            if sl == "adr_local_structural":
+                pair_sector_map[p] = f"ADR_{curr}"
+            else:
+                pair_sector_map[p] = p
+
     all_oos_trades = []   # accumulate across all windows
     pair_spreads_for_corr: dict[str, pd.Series] = {}  # for Section 7.3
     wfo_params     = []   # best params log per pair per window
@@ -1557,152 +1620,670 @@ def main():
         else:
             optimal_weights = {}
 
-        # 7. OOS Execution (Second Pass with Weights)
+        # 7. OOS Execution (Second Pass with Unified Timeline Loop)
+        completed_trades_window = []
+        diag_sink = []
+        adapt_diag_sink = []
+
+        global_timeline = closes_test.index
+        N_bars = len(global_timeline)
+
+        pairs_to_trade = []
         for pair_name in active_pairs:
-            t1, t2 = pair_name.split("-")
-            best = window_best[pair_name]
             weight = optimal_weights.get(pair_name, 0.0)
-            if weight <= 0: continue
+            if weight > 0:
+                best = window_best[pair_name]
+                t1, t2 = pair_name.split("-")
+                pairs_to_trade.append((pair_name, t1, t2, best["dynamic_beta"], best["dynamic_hl"], weight))
 
-            # Re-build sig_test (or use cached if memory allowed, but for simplicity we rebuild)
-            sig_test = trim_oos_signal_warmup(
-                build_signals(closes_test_with_warmup, volumes, t1, t2, best["dynamic_beta"], best["dynamic_hl"]),
-                te_s_ts,
-                te_e_ts,
+        N_pairs = len(pairs_to_trade)
+
+        if N_pairs > 0:
+            close_t1_matrix = np.zeros((N_bars, N_pairs))
+            close_t2_matrix = np.zeros((N_bars, N_pairs))
+            spread_matrix = np.zeros((N_bars, N_pairs))
+            spread_mean_matrix = np.zeros((N_bars, N_pairs))
+            spread_std_matrix = np.zeros((N_bars, N_pairs))
+            zscore_matrix = np.zeros((N_bars, N_pairs))
+            vr_matrix = np.zeros((N_bars, N_pairs))
+
+            is_panic_matrix = np.zeros((N_bars, N_pairs), dtype=bool)
+            hurst_blocked_matrix = np.zeros((N_bars, N_pairs), dtype=bool)
+            hurst_val_matrix = np.zeros((N_bars, N_pairs))
+            break_score_matrix = np.zeros((N_bars, N_pairs))
+            cusum_val_matrix = np.zeros((N_bars, N_pairs))
+            time_since_break_matrix = np.zeros((N_bars, N_pairs))
+
+            entry_z_matrix = np.zeros((N_bars, N_pairs))
+            exit_z_matrix = np.zeros((N_bars, N_pairs))
+            stop_z_matrix = np.zeros((N_bars, N_pairs))
+            max_hold_matrix = np.zeros((N_bars, N_pairs))
+
+            for p_idx, (pair_name, t1, t2, beta, half_life, weight) in enumerate(pairs_to_trade):
+                best = window_best[pair_name]
+                sig_test = trim_oos_signal_warmup(
+                    build_signals(closes_test_with_warmup, volumes, t1, t2, beta, half_life),
+                    te_s_ts,
+                    te_e_ts,
+                )
+
+                spread_daily_full = (daily[t1] - beta * daily[t2]).dropna()
+                if not spread_daily_full.empty:
+                    pair_spreads_for_corr[pair_name] = spread_daily_full
+
+                use_adaptive = bool(best.get("adaptive", ADAPT_ENABLED))
+
+                z_arr = sig_test["zscore"].to_numpy().astype(float)
+                if use_adaptive:
+                    _w_base_default = max(20, min(int(max(20, beta)), 200)) if False else 60
+                    adaptive_arrays = _precompute_adaptive_series(
+                        sig_test,
+                        w_base=int(sig_test.attrs.get("w_base", _w_base_default)),
+                        entry_z_base=float(best["entry_z"]),
+                        stop_z_base=float(best["stop_z"]),
+                    )
+                    adapt_entry_z = adaptive_arrays["entry_z_t"].to_numpy()
+                    adapt_stop_z  = adaptive_arrays["stop_z_t"].to_numpy()
+                    adapt_B       = adaptive_arrays["B_t"].to_numpy()
+                    adapt_C       = adaptive_arrays["C_t"].to_numpy()
+                else:
+                    adapt_entry_z = np.full(len(sig_test), float(best["entry_z"]))
+                    adapt_stop_z  = np.full(len(sig_test), float(best["stop_z"]))
+                    from metagate import rolling_cusum, simple_break_score
+                    adapt_C = rolling_cusum(z_arr, k=ADAPT_CUSUM_K, h=ADAPT_CUSUM_H)
+                    adapt_B = simple_break_score(z_arr, adapt_C, h_cusum=ADAPT_CUSUM_H)
+
+                time_since_break_arr = time_since_break_series(adapt_B)
+
+                effective_entry_z_arr = np.copy(adapt_entry_z)
+                effective_stop_z_arr = np.copy(adapt_stop_z)
+                effective_max_hold_arr = np.full(len(sig_test), int(max(best["dynamic_hl"] * 2, 1)))
+
+                for idx in range(len(sig_test)):
+                    ts_bar = sig_test.index[idx]
+                    hmm_val = 0
+                    if global_hmm is not None:
+                        d = normalize_to_date(ts_bar)
+                        try:
+                            val = global_hmm.asof(d)
+                            hmm_val = 0 if pd.isna(val) else int(val)
+                        except Exception:
+                            hmm_val = 0
+
+                    r_state = RegimeState(
+                        timestamp=ts_bar,
+                        hmm_regime=hmm_val,
+                        kmeans_regime=1,
+                        break_score=adapt_B[idx],
+                        cusum_val=adapt_C[idx],
+                        hurst_val=0.5,
+                        adf_p_value=0.0,
+                        rcdp_score=0.5,
+                        vol_ratio=1.0,
+                        time_since_break=time_since_break_arr[idx]
+                    )
+
+                    if use_adaptive:
+                        knobs = compute_effective_trade_knobs(
+                            r_state,
+                            entry_z_base=best["entry_z"],
+                            stop_z_base=best["stop_z"],
+                            max_hold_base=int(max(best["dynamic_hl"] * 2, 1))
+                        )
+                        effective_entry_z_arr[idx] = knobs.entry_z_eff
+                        effective_stop_z_arr[idx] = knobs.stop_z_eff
+                        effective_max_hold_arr[idx] = knobs.max_hold_eff
+
+                    effective_stop_z_arr[idx] = apply_sbr_guard(
+                        r_state,
+                        entry_z_base=best["entry_z"],
+                        current_stop_z=effective_stop_z_arr[idx],
+                        threshold=SBR_GUARD_THRESHOLD,
+                        stop_mult=SBR_GUARD_STOP_MULT,
+                        enabled=SBR_GUARD_ENABLED
+                    )
+
+                hurst_blocked_arr = np.zeros(len(sig_test), dtype=bool)
+                hurst_val_arr = np.zeros(len(sig_test), dtype=float)
+                if use_hurst:
+                    pair_hurst_f = HurstFilter()
+                    for idx in range(len(sig_test)):
+                        ts_bar = sig_test.index[idx]
+                        d_prev = (ts_bar - pd.Timedelta(days=1)).normalize()
+                        h_tail_daily = spread_daily_full.loc[:d_prev].tail(HURST_ENTRY_WINDOW - 1)
+                        h_tail = pd.concat([h_tail_daily, pd.Series({ts_bar: sig_test["spread"].iloc[idx]})])
+                        h_blocked, h_val = pair_hurst_f.should_block(h_tail, ts_bar)
+                        hurst_blocked_arr[idx] = h_blocked
+                        hurst_val_arr[idx] = h_val
+
+                is_panic_arr = np.zeros(len(sig_test), dtype=bool)
+                if global_hmm is not None:
+                    for idx in range(len(sig_test)):
+                        ts_bar = sig_test.index[idx]
+                        d = normalize_to_date(ts_bar)
+                        try:
+                            val = global_hmm.asof(d)
+                            is_panic_arr[idx] = (not pd.isna(val) and int(val) == 1)
+                        except Exception:
+                            is_panic_arr[idx] = False
+
+                temp_df = pd.DataFrame(index=sig_test.index)
+                temp_df["close_t1"] = sig_test[f"{t1}_close"]
+                temp_df["close_t2"] = sig_test[f"{t2}_close"]
+                temp_df["spread"] = sig_test["spread"]
+                temp_df["spread_mean"] = sig_test["spread_mean"]
+                temp_df["spread_std"] = sig_test["spread_std"]
+                temp_df["zscore"] = sig_test["zscore"]
+                temp_df["vr"] = sig_test["vr"]
+                temp_df["is_panic"] = is_panic_arr
+                temp_df["hurst_blocked"] = hurst_blocked_arr
+                temp_df["hurst_val"] = hurst_val_arr
+                temp_df["break_score"] = adapt_B
+                temp_df["cusum_val"] = adapt_C
+                temp_df["time_since_break"] = time_since_break_arr
+                temp_df["effective_entry_z"] = effective_entry_z_arr
+                temp_df["effective_stop_z"] = effective_stop_z_arr
+                temp_df["effective_max_hold"] = effective_max_hold_arr
+
+                df_aligned = temp_df.reindex(global_timeline, method="ffill").bfill()
+
+                close_t1_matrix[:, p_idx] = df_aligned["close_t1"].to_numpy()
+                close_t2_matrix[:, p_idx] = df_aligned["close_t2"].to_numpy()
+                spread_matrix[:, p_idx] = df_aligned["spread"].to_numpy()
+                spread_mean_matrix[:, p_idx] = df_aligned["spread_mean"].to_numpy()
+                spread_std_matrix[:, p_idx] = df_aligned["spread_std"].to_numpy()
+                zscore_matrix[:, p_idx] = df_aligned["zscore"].to_numpy()
+                vr_matrix[:, p_idx] = df_aligned["vr"].to_numpy()
+
+                is_panic_matrix[:, p_idx] = df_aligned["is_panic"].to_numpy().astype(bool)
+                hurst_blocked_matrix[:, p_idx] = df_aligned["hurst_blocked"].to_numpy().astype(bool)
+                hurst_val_matrix[:, p_idx] = df_aligned["hurst_val"].to_numpy()
+                break_score_matrix[:, p_idx] = df_aligned["break_score"].to_numpy()
+                cusum_val_matrix[:, p_idx] = df_aligned["cusum_val"].to_numpy()
+                time_since_break_matrix[:, p_idx] = df_aligned["time_since_break"].to_numpy()
+
+                entry_z_matrix[:, p_idx] = df_aligned["effective_entry_z"].to_numpy()
+                exit_z_matrix[:, p_idx] = np.full(N_bars, float(best["exit_z"]))
+                stop_z_matrix[:, p_idx] = df_aligned["effective_stop_z"].to_numpy()
+                max_hold_matrix[:, p_idx] = df_aligned["effective_max_hold"].to_numpy()
+
+            try:
+                from config import max_portfolio_es_pct
+            except ImportError:
+                max_portfolio_es_pct = 0.02
+            try:
+                from config import max_portfolio_leverage
+            except ImportError:
+                max_portfolio_leverage = 2.0
+            try:
+                from config import max_pair_tail_contribution
+            except ImportError:
+                max_pair_tail_contribution = 0.25
+            try:
+                from config import tail_contribution_mode
+            except ImportError:
+                tail_contribution_mode = "BUDGET_RELATIVE"
+
+            tail_governor = TailEVRiskGovernor(
+                max_portfolio_es_pct=max_portfolio_es_pct,
+                max_pair_tail_contribution=max_pair_tail_contribution,
+                contribution_mode=tail_contribution_mode,
             )
-            
-            pair_hurst_f = HurstFilter() if use_hurst else None
-            spread_daily_full = (daily[t1] - best["dynamic_beta"] * daily[t2]).dropna() if use_hurst else None
-            # Section 7.3: stash the OOS-window spread for the post-hoc
-            # correlation throttle.  Latest write wins, so the final stored
-            # series reflects the most-recent dynamic beta.
-            if spread_daily_full is not None and not spread_daily_full.empty:
-                pair_spreads_for_corr[pair_name] = spread_daily_full
+            exposure_caps = ExposureCapsController(max_portfolio_leverage=max_portfolio_leverage)
 
-            # Score frame for OOS bars (uses the SAME hurst/adf precomputes
-            # as training so live-vs-train feature distributions match).
-            hurst_daily_oos = _precompute_hurst_series(spread_daily_full) \
-                if spread_daily_full is not None else pd.Series(dtype=float)
-            adf_pvals_oos = _precompute_adf_pvalues(spread_daily_full) \
-                if spread_daily_full is not None else pd.Series(dtype=float)
-            scores_test = build_score_frame(
-                sig_test, hurst_daily_oos, adf_pvals_oos, global_hmm,
-            )
+            for p_idx, (pair_name, t1, t2, beta, half_life, weight) in enumerate(pairs_to_trade):
+                sig_train_p = build_signals(closes_train, volumes, t1, t2, beta, half_life)
+                train_z = sig_train_p["zscore"].dropna()
+                tail_governor.fit_pair_gpd(pair_name, train_z.to_numpy(dtype=float))
 
-            mg_model = best.get("metagate_model")
-            diag_sink: list = []
-            adapt_diag_sink: list = []
+            active_positions = {}
+            pending_orders = {}
+            pair_blocked = [False] * N_pairs
+            pair_shadow_positions = {p_idx: [] for p_idx in range(N_pairs)}
 
-            # Decide whether to enable online parameter adaptation for this
-            # OOS pair-window. ADAPT_ENABLED is the global default; callers
-            # can override per-window via best["adaptive"].
-            use_adaptive = bool(best.get("adaptive", ADAPT_ENABLED))
-            use_post_trade = bool(best.get("post_trade", POSTTRADE_ENABLED))
+            limit_rebate = (0.0 if _BAR_TF == "daily" else 0.05)
+            limit_ttl = (1 if _BAR_TF == "daily" else 3)
 
-            # Reuse the shadow buffer + tracker across windows when present
-            # in `best` (lets them accumulate state from prior OOS slices).
-            pair_shadow = None
-            pair_perf   = None
-            if use_post_trade:
-                pair_shadow = best.get("shadow_buffer") or ShadowBuffer()
-                pair_perf   = best.get("perf_tracker")  or PairPerformanceTracker()
-                best["shadow_buffer"] = pair_shadow
-                best["perf_tracker"]  = pair_perf
+            for t_idx, ts in enumerate(global_timeline):
+                # Step 1: Execute pending liquidations
+                for p_idx in list(active_positions.keys()):
+                    pos_state = active_positions[p_idx]
+                    if pos_state.pending_liquidation:
+                        pair_name, t1, t2, beta, half_life, pair_weight = pairs_to_trade[p_idx]
+                        # The liquidation flag is set after the portfolio
+                        # risk check on the prior loop iteration.  The first
+                        # causally available execution point in this close-bar
+                        # engine is the current bar, not t_idx-1.
+                        exit_spread = spread_matrix[t_idx, p_idx]
+                        exit_t1 = close_t1_matrix[t_idx, p_idx]
+                        exit_t2 = close_t2_matrix[t_idx, p_idx]
 
-            oos_trades, pair_hmm_blocked, pair_hurst_blocked, pair_meta_blocked, pair_adapt_blocked = backtest_oos(
-                sig_test, t1, t2, best["dynamic_beta"],
-                best["entry_z"], best["exit_z"], best["stop_z"],
-                hmm_regime=global_hmm,
-                hurst_filter=pair_hurst_f,
-                spread_daily=spread_daily_full,
-                score_frame=scores_test,
-                metagate_model=mg_model,
-                training_mode=False,
-                diag_sink=diag_sink,
-                adaptive=use_adaptive,
-                adaptive_diag_sink=adapt_diag_sink if use_adaptive else None,
-                post_trade=use_post_trade,
-                shadow_buffer=pair_shadow,
-                perf_tracker=pair_perf,
-                feedback_tracker=feedback_tracker_global,
-                pair_name=pair_name,
-                max_hold_bars=int(max(best["dynamic_hl"] * 2, 1)),
-            )
+                        pnl_raw = pos_state.position * (exit_spread - pos_state.entry_spread)
+                        notional_raw = pos_state.entry_t1_price + abs(pos_state.entry_beta) * pos_state.entry_t2_price
+                        tx_cost_raw = notional_raw * (COST_MAKER + COST_TAKER)
 
-            # (pair_shadow / pair_perf are mutated in-place by backtest_oos
-            #  since `best` already holds the same references.)
-            window_hmm_blocks += pair_hmm_blocked
-            window_hurst_blocks += pair_hurst_blocked
-            window_meta_blocks += pair_meta_blocked
-            window_adapt_blocks += pair_adapt_blocked
+                        holding_days = (t_idx - pos_state.entry_bar_idx) / BARS_PER_DAY
+                        short_notl_raw = (abs(pos_state.entry_beta) * pos_state.entry_t2_price) if pos_state.position == 1 else pos_state.entry_t1_price
+                        borrow_raw = short_notl_raw * BORROW_RATE_ANNUAL * holding_days / 252
 
-            # Emit diagnostics (features, P, decision) for this pair-window.
-            if diag_sink:
-                for r in diag_sink:
-                    r["pair"] = pair_name
-                    r["window"] = w_idx + 1
-                append_diagnostics(DATA_DIR / METAGATE_DIAG_CSV, diag_sink)
+                        spread_net_pnl = pnl_raw - tx_cost_raw - borrow_raw
+                        final_pnl_scaled = spread_net_pnl * pos_state.size_multiplier * pair_weight
 
-            # Emit adaptive-parameter trace for this pair-window.
-            if adapt_diag_sink:
-                for r in adapt_diag_sink:
-                    r["pair"] = pair_name
-                    r["window"] = w_idx + 1
-                append_diagnostics(DATA_DIR / ADAPT_DIAG_CSV, adapt_diag_sink)
+                        dollar_net = spread_net_pnl * pos_state.units
+                        running_equity += dollar_net
 
-            if len(oos_trades) < WFO_MIN_TRADES:
-                continue
+                        completed_trades_window.append({
+                            "pair": pair_name,
+                            "entry_time": global_timeline[pos_state.entry_bar_idx],
+                            "exit_time": ts,
+                            "direction": "LONG" if pos_state.position == 1 else "SHORT",
+                            "net_pnl": round(final_pnl_scaled, 4),
+                            "exit_reason": "GOVERNOR_LIQUIDATION",
+                            "holding_bars": t_idx - pos_state.entry_bar_idx,
+                            "gross_pnl": round(pnl_raw, 4),
+                            "tx_cost": round(tx_cost_raw, 4),
+                            "notional": round(notional_raw, 4),
+                            "features": pos_state.features,
+                            "metagate_p": pos_state.p_win,
+                            "size_mult": pos_state.size_multiplier,
+                            "s_perf": pos_state.s_perf,
+                        })
+                        del active_positions[p_idx]
 
-            # ── Position-size scaling (MVO weight only — MetaGate already
-            # applied probabilistic sizing inside backtest_oos). ─────────
-            for t in oos_trades:
-                t["net_pnl"]   *= weight
-                t["gross_pnl"] *= weight
-                t["tx_cost"]   *= weight
+                # Step 2: Check normal exits, stops, and circuit breakers
+                for p_idx in list(active_positions.keys()):
+                    pos_state = active_positions[p_idx]
+                    pair_name, t1, t2, beta, half_life, pair_weight = pairs_to_trade[p_idx]
 
-            oos_trades = [t for t in oos_trades if t["net_pnl"] != 0 or t["tx_cost"] != 0]
-            if len(oos_trades) == 0:
-                continue
+                    p1 = close_t1_matrix[t_idx, p_idx]
+                    p2 = close_t2_matrix[t_idx, p_idx]
+                    spread_val = spread_matrix[t_idx, p_idx]
 
-            oos_pnl = sum(t["net_pnl"] for t in oos_trades)
+                    if pos_state.entry_std > 0:
+                        z_active = (spread_val - pos_state.entry_sma) / pos_state.entry_std
+                    else:
+                        z_active = zscore_matrix[t_idx, p_idx]
 
-            for t in oos_trades:
-                t["pair"]     = pair_name
+                    pos_state.current_z = z_active
+
+                    exit_z_val = exit_z_matrix[t_idx, p_idx]
+                    stop_z_val = stop_z_matrix[t_idx, p_idx]
+
+                    ex = (pos_state.position == 1 and z_active >= exit_z_val) or (pos_state.position == -1 and z_active <= -exit_z_val)
+                    st = (pos_state.position == 1 and z_active <= -stop_z_val) or (pos_state.position == -1 and z_active >= stop_z_val)
+                    bars_held = t_idx - pos_state.entry_bar_idx
+                    tm = bars_held >= pos_state.max_hold
+                    cb = abs(z_active) >= CIRCUIT_BREAKER_Z
+
+                    is_last_bar = (t_idx == len(global_timeline) - 1)
+
+                    if cb or tm or ex or st or is_last_bar:
+                        if cb:
+                            pair_blocked[p_idx] = True
+                            st = True
+
+                        pnl_raw = pos_state.position * (spread_val - pos_state.entry_spread)
+                        notional_raw = pos_state.entry_t1_price + abs(pos_state.entry_beta) * pos_state.entry_t2_price
+                        tx_cost_raw = notional_raw * COST_MAKER + notional_raw * (COST_MAKER if ex and not cb else COST_TAKER)
+
+                        holding_days = bars_held / BARS_PER_DAY
+                        short_notl_raw = (abs(pos_state.entry_beta) * pos_state.entry_t2_price) if pos_state.position == 1 else pos_state.entry_t1_price
+                        borrow_raw = short_notl_raw * BORROW_RATE_ANNUAL * holding_days / 252
+
+                        spread_net_pnl = pnl_raw - tx_cost_raw - borrow_raw
+                        final_pnl_scaled = spread_net_pnl * pos_state.size_multiplier * pair_weight
+
+                        dollar_net = spread_net_pnl * pos_state.units
+                        running_equity += dollar_net
+
+                        best = window_best[pair_name]
+                        use_post_trade = bool(best.get("post_trade", POSTTRADE_ENABLED))
+                        pair_shadow = best.get("shadow_buffer")
+                        pair_perf = best.get("perf_tracker")
+
+                        reason = "STOP" if (st or cb) else ("TIME_STOP" if tm else "SIGNAL")
+                        completed_trades_window.append({
+                            "pair": pair_name,
+                            "entry_time": global_timeline[pos_state.entry_bar_idx],
+                            "exit_time": ts,
+                            "direction": "LONG" if pos_state.position == 1 else "SHORT",
+                            "net_pnl": round(final_pnl_scaled, 4),
+                            "exit_reason": reason,
+                            "holding_bars": bars_held,
+                            "gross_pnl": round(pnl_raw, 4),
+                            "tx_cost": round(tx_cost_raw, 4),
+                            "notional": round(notional_raw, 4),
+                            "features": pos_state.features,
+                            "metagate_p": pos_state.p_win,
+                            "size_mult": pos_state.size_multiplier,
+                            "s_perf": pos_state.s_perf,
+                        })
+
+                        if feedback_tracker_global is not None:
+                            feedback_tracker_global.add_trade(pair_name, final_pnl_scaled, notional_raw)
+                        if use_post_trade and pair_perf is not None:
+                            pair_perf.record_trade(final_pnl_scaled)
+
+                        del active_positions[p_idx]
+
+                    # Update shadow trades exits
+                    best = window_best[pair_name]
+                    use_post_trade = bool(best.get("post_trade", POSTTRADE_ENABLED))
+                    pair_shadow = best.get("shadow_buffer")
+                    if use_post_trade and pair_shadow_positions[p_idx]:
+                        still_open = []
+                        for sp in pair_shadow_positions[p_idx]:
+                            sp_z_active = zscore_matrix[t_idx, p_idx]
+                            if sp["std"] > 0:
+                                sp_z_active = (spread_val - sp["sma"]) / sp["std"]
+                            d = sp["direction"]
+                            sh_bars_held = t_idx - sp["bar"]
+                            sp_exit = (d == 1 and sp_z_active >= exit_z_matrix[t_idx, p_idx]) or (d == -1 and sp_z_active <= -exit_z_matrix[t_idx, p_idx])
+                            sp_stop = (d == 1 and sp_z_active <= -sp["stop_z"]) or (d == -1 and sp_z_active >= sp["stop_z"])
+                            sp_time = sh_bars_held >= int(sp.get("max_hold", _SHADOW_MAX_HOLD_BARS))
+                            if sp_exit or sp_stop or sp_time:
+                                sp_gross = d * (spread_val - sp["spread"])
+                                sp_notl  = sp["t1"] + beta * sp["t2"]
+                                sp_tx    = sp_notl * COST_MAKER + sp_notl * (COST_MAKER if sp_exit else COST_TAKER)
+                                sp_hd    = sh_bars_held / BARS_PER_DAY
+                                sp_brw   = (beta * sp["t2"] if d == 1 else sp["t1"]) * BORROW_RATE_ANNUAL * sp_hd / 252
+                                sp_net   = sp_gross - sp_tx - sp_brw
+                                pair_shadow.push(sp["features"], sp_net)
+                            else:
+                                still_open.append(sp)
+                        pair_shadow_positions[p_idx] = still_open
+
+                # Step 3: Compute portfolio-level exposures and tail ES
+                open_position_dicts = []
+                for active_p_idx, pos_state in active_positions.items():
+                    pair_name = pairs_to_trade[active_p_idx][0]
+                    open_position_dicts.append({
+                        "pair_name": pair_name,
+                        "pair": pair_name,
+                        "current_z": pos_state.current_z,
+                        "spread_std_usd": pos_state.entry_std,
+                        "position_size_units": pos_state.units,
+                        "nominal_size_usd": pos_state.nominal_size_usd,
+                        "nominal_usd": pos_state.nominal_size_usd,
+                        "sector": pair_sector_map.get(pair_name, pair_name),
+                    })
+
+                portfolio_safe = True
+                derisk_order = []
+                if open_position_dicts:
+                    try:
+                        portfolio_safe, derisk_order = tail_governor.evaluate_portfolio_risk(
+                            open_position_dicts,
+                            running_equity
+                        )
+                    except Exception:
+                        pass
+
+                # Step 4: Governor breach check
+                if not portfolio_safe:
+                    for p_name in derisk_order:
+                        for active_p_idx, pos_state in active_positions.items():
+                            if pairs_to_trade[active_p_idx][0] == p_name:
+                                pos_state.pending_liquidation = True
+
+                # Step 5: Process entries
+                # 5.1 Fills for pending limit orders
+                for p_idx in list(pending_orders.keys()):
+                    pending = pending_orders[p_idx]
+                    pending.ttl -= 1
+                    z = zscore_matrix[t_idx, p_idx]
+                    is_filled = ((pending.position == -1 and z <= pending.limit_z) or (pending.position == 1 and z >= pending.limit_z))
+                    if is_filled:
+                        pair_name, t1, t2, beta, half_life, pair_weight = pairs_to_trade[p_idx]
+                        pos_state = WFOPositionState(
+                            pair_name=pair_name,
+                            position=pending.position,
+                            entry_spread=spread_matrix[t_idx, p_idx],
+                            entry_t1_price=close_t1_matrix[t_idx, p_idx],
+                            entry_t2_price=close_t2_matrix[t_idx, p_idx],
+                            entry_beta=beta,
+                            entry_std=spread_std_matrix[t_idx, p_idx],
+                            entry_bar_idx=t_idx,
+                            size_multiplier=pending.meta_multiplier,
+                            pending_liquidation=False
+                        )
+                        pos_state.entry_sma = spread_mean_matrix[t_idx, p_idx]
+                        pos_state.h_multiplier = pending.h_multiplier
+                        pos_state.meta_multiplier = pending.meta_multiplier
+                        pos_state.p_win = pending.p_win
+                        pos_state.s_perf = pending.s_perf
+                        pos_state.max_hold = pending.max_hold
+                        pos_state.features = pending.features
+
+                        pos_state.entry_capital_alloc = running_equity * pair_weight
+                        notl_raw = pos_state.entry_t1_price + abs(beta) * pos_state.entry_t2_price
+                        pos_state.units = (pos_state.entry_capital_alloc / max(notl_raw, 1.0)) * pos_state.size_multiplier
+                        pos_state.nominal_size_usd = pos_state.entry_capital_alloc * pos_state.size_multiplier
+                        pos_state.current_z = z
+                        active_positions[p_idx] = pos_state
+                        del pending_orders[p_idx]
+                    elif pending.ttl <= 0:
+                        del pending_orders[p_idx]
+
+                # 5.2 Generate new entry signals
+                for p_idx in range(N_pairs):
+                    if p_idx not in active_positions and p_idx not in pending_orders and not pair_blocked[p_idx]:
+                        vr = vr_matrix[t_idx, p_idx]
+                        if vr >= 0.5:
+                            z = zscore_matrix[t_idx, p_idx]
+                            cur_entry_z = entry_z_matrix[t_idx, p_idx]
+                            detect_long = z < -cur_entry_z
+                            detect_short = z > cur_entry_z
+
+                            if detect_long or detect_short:
+                                pair_name, t1, t2, beta, half_life, pair_weight = pairs_to_trade[p_idx]
+                                best = window_best[pair_name]
+
+                                hmm_val = 1 if is_panic_matrix[t_idx, p_idx] else 0
+                                mg_model = best.get("metagate_model")
+                                meta_active = (mg_model is not None and mg_model.usable and _BAR_TF != "daily")
+                                bypass_legacy_gates = meta_active
+
+                                if HMM_HARD_BLOCK_ALWAYS and hmm_val == 1:
+                                    legacy_panic_blocked = True
+                                else:
+                                    legacy_panic_blocked = (not bypass_legacy_gates) and hmm_val == 1
+
+                                legacy_hurst_blocked = hurst_blocked_matrix[t_idx, p_idx] and not bypass_legacy_gates
+
+                                regime_state = RegimeState(
+                                    timestamp=ts,
+                                    hmm_regime=hmm_val,
+                                    kmeans_regime=1,
+                                    break_score=break_score_matrix[t_idx, p_idx],
+                                    cusum_val=cusum_val_matrix[t_idx, p_idx],
+                                    hurst_val=hurst_val_matrix[t_idx, p_idx],
+                                    adf_p_value=0.0,
+                                    rcdp_score=0.5,
+                                    vol_ratio=1.0,
+                                    time_since_break=time_since_break_matrix[t_idx, p_idx]
+                                )
+
+                                feat = regime_state.to_features(abs(z), vr)
+
+                                use_post_trade = bool(best.get("post_trade", POSTTRADE_ENABLED))
+                                pair_shadow = best.get("shadow_buffer")
+                                pair_perf = best.get("perf_tracker")
+                                pt_active = use_post_trade
+
+                                if pt_active:
+                                    pair_shadow_positions[p_idx].append({
+                                        "bar": t_idx,
+                                        "direction": 1 if detect_long else -1,
+                                        "spread": spread_matrix[t_idx, p_idx],
+                                        "t1": close_t1_matrix[t_idx, p_idx],
+                                        "t2": close_t2_matrix[t_idx, p_idx],
+                                        "sma": spread_mean_matrix[t_idx, p_idx],
+                                        "std": spread_std_matrix[t_idx, p_idx],
+                                        "features": feat,
+                                        "stop_z": stop_z_matrix[t_idx, p_idx],
+                                        "max_hold": int(max(best["dynamic_hl"] * 2, 1)),
+                                    })
+
+                                if legacy_panic_blocked:
+                                    window_hmm_blocks += 1
+                                    continue
+                                if legacy_hurst_blocked:
+                                    window_hurst_blocks += 1
+                                    continue
+
+                                p_win = 0.5
+                                meta_size = 1.0
+                                if pt_active and pair_shadow is not None and pair_shadow.classifier is not None:
+                                    p_win = pair_shadow.predict_proba(feat)
+                                    meta_size = pair_shadow.size_multiplier(p_win)
+                                    diag_sink.append({
+                                        "pair":      pair_name,
+                                        "window":    w_idx + 1,
+                                        "ts":        ts,
+                                        **{name: feat[k] for k, name in enumerate(FEATURE_NAMES)},
+                                        "p_win":     p_win,
+                                        "size_mult": meta_size,
+                                        "decision":  "ENTER" if meta_size > 0 else "BLOCK",
+                                        "kind":      f"shadow_theta={pair_shadow.theta:.3f}",
+                                    })
+                                    if meta_size <= 0:
+                                        window_meta_blocks += 1
+                                        continue
+                                elif meta_active:
+                                    p_win = mg_model.predict_proba(feat)
+                                    meta_size = mg_model.size_multiplier(p_win)
+                                    diag_sink.append({
+                                        "pair":      pair_name,
+                                        "window":    w_idx + 1,
+                                        "ts":        ts,
+                                        **{name: feat[k] for k, name in enumerate(FEATURE_NAMES)},
+                                        "p_win":     p_win,
+                                        "size_mult": meta_size,
+                                        "decision":  "ENTER" if meta_size > 0 else "BLOCK",
+                                        "kind":      mg_model.kind,
+                                    })
+                                    if meta_size <= 0:
+                                        window_meta_blocks += 1
+                                        continue
+
+                                s_perf = 1.0
+                                if pt_active and pair_perf is not None:
+                                    s_perf *= pair_perf.s_perf
+                                if feedback_tracker_global is not None:
+                                    s_perf *= feedback_tracker_global.get_multiplier(pair_name)
+
+                                size_mult = meta_size * s_perf if (meta_active or pt_active) else get_hurst_multiplier(hurst_val_matrix[t_idx, p_idx])
+                                capital_alloc = running_equity * pair_weight
+                                nominal_size_usd = capital_alloc * size_mult
+
+                                allowed_exp, exp_reason = exposure_caps.check_entry_allowed(
+                                    pair_name=pair_name,
+                                    direction="LONG" if detect_long else "SHORT",
+                                    nominal_size_usd=nominal_size_usd,
+                                    open_positions=open_position_dicts,
+                                    current_capital=running_equity,
+                                    pair_sector_map=pair_sector_map
+                                )
+                                if not allowed_exp:
+                                    continue
+
+                                notl_raw = close_t1_matrix[t_idx, p_idx] + abs(beta) * close_t2_matrix[t_idx, p_idx]
+                                candidate_position = {
+                                    "pair_name": pair_name,
+                                    "pair": pair_name,
+                                    "current_z": z,
+                                    "spread_std_usd": spread_std_matrix[t_idx, p_idx],
+                                    "position_size_units": (capital_alloc / max(notl_raw, 1.0)) * size_mult,
+                                    "nominal_size_usd": nominal_size_usd,
+                                    "nominal_usd": nominal_size_usd,
+                                    "sector": pair_sector_map.get(pair_name, pair_name),
+                                }
+                                allowed_tail, tail_reason, projected_es = tail_governor.check_candidate_entry(
+                                    candidate_position=candidate_position,
+                                    open_positions=open_position_dicts,
+                                    current_capital=running_equity
+                                )
+                                if not allowed_tail or not portfolio_safe:
+                                    continue
+
+                                pending_orders[p_idx] = PendingOrder(
+                                    position=1 if detect_long else -1,
+                                    ttl=limit_ttl,
+                                    limit_z=(-cur_entry_z + limit_rebate) if detect_long else (cur_entry_z - limit_rebate),
+                                    h_multiplier=get_hurst_multiplier(hurst_val_matrix[t_idx, p_idx]),
+                                    meta_multiplier=size_mult,
+                                    p_win=p_win,
+                                    s_perf=s_perf,
+                                    max_hold=int(max(best["dynamic_hl"] * 2, 1)),
+                                    features=feat
+                                )
+
+                                if use_adaptive and adaptive_diag_sink is not None:
+                                    adaptive_diag_sink.append({
+                                        "pair":            pair_name,
+                                        "window":          w_idx + 1,
+                                        "ts":              ts,
+                                        "raw_spread":      float(spread_matrix[t_idx, p_idx]),
+                                        "break_score":     float(break_score_matrix[t_idx, p_idx]),
+                                        "cusum":           float(cusum_val_matrix[t_idx, p_idx]),
+                                        "adaptive_window": int(df_aligned["effective_max_hold"].iloc[t_idx]),
+                                        "adaptive_entry_z": cur_entry_z,
+                                        "adaptive_stop_z":  stop_z_matrix[t_idx, p_idx],
+                                        "adaptive_max_hold": max_hold_matrix[t_idx, p_idx],
+                                        "realized_zscore": float(z),
+                                    })
+
+            for t in completed_trades_window:
                 t["window"]   = w_idx + 1
-                t["entry_z"]  = best["entry_z"]
-                t["exit_z"]   = best["exit_z"]
-                t["stop_z"]   = best["stop_z"]
-                t["source"]   = best["source"]
-            all_oos_trades.extend(oos_trades)
+                t["entry_z"]  = window_best[t["pair"]]["entry_z"]
+                t["exit_z"]   = window_best[t["pair"]]["exit_z"]
+                t["stop_z"]   = window_best[t["pair"]]["stop_z"]
+                t["source"]   = window_best[t["pair"]]["source"]
+            all_oos_trades.extend(completed_trades_window)
 
-            oos_arr = np.array([t["net_pnl"] for t in oos_trades])
-            oos_sh  = (oos_arr.mean() / oos_arr.std() *
-                       np.sqrt(len(oos_arr) / max(days_test / 365.25, 0.01))
-                       ) if oos_arr.std() > 0 else 0.0
+            for pair_name in active_pairs:
+                best = window_best[pair_name]
+                weight = optimal_weights.get(pair_name, 0.0)
+                if weight <= 0: continue
 
-            wfo_params.append({
-                "window":      w_idx + 1,
-                "train_start": str(tr_s), "train_end": str(tr_e),
-                "oos_start":   str(te_s), "oos_end":   str(te_e),
-                "pair":        pair_name,
-                "beta":        round(best["dynamic_beta"], 4),
-                "half_life":   round(best["dynamic_hl"], 1),
-                "entry_z":     best["entry_z"],
-                "exit_z":      best["exit_z"],
-                "stop_z":      best["stop_z"],
-                "theta_calibrated": best.get("theta_calibrated"),
-                "theta_utility": best.get("theta_utility"),
-                "theta_n_oof": best.get("theta_n_oof"),
-                "metagate_kind": best.get("metagate_kind"),
-                "metagate_n_train": best.get("metagate_n_train"),
-                "train_sharpe": best["sharpe"],
-                "oos_sharpe":  round(oos_sh, 3),
-                "oos_trades":  len(oos_trades),
-                "oos_pnl":     round(oos_pnl, 4),
-            })
+                pair_oos_trades = [t for t in completed_trades_window if t["pair"] == pair_name]
+                if len(pair_oos_trades) < WFO_MIN_TRADES:
+                    continue
 
-            window_oos_pnl += oos_pnl
-            window_trades  += len(oos_trades)
+                pair_oos_pnl = sum(t["net_pnl"] for t in pair_oos_trades)
+                oos_arr = np.array([t["net_pnl"] for t in pair_oos_trades])
+                oos_sh  = (oos_arr.mean() / oos_arr.std() *
+                           np.sqrt(len(oos_arr) / max(days_test / 365.25, 0.01))
+                           ) if oos_arr.std() > 0 else 0.0
+
+                wfo_params.append({
+                    "window":      w_idx + 1,
+                    "train_start": str(tr_s), "train_end": str(tr_e),
+                    "oos_start":   str(te_s), "oos_end":   str(te_e),
+                    "pair":        pair_name,
+                    "beta":        round(best["dynamic_beta"], 4),
+                    "half_life":   round(best["dynamic_hl"], 1),
+                    "entry_z":     best["entry_z"],
+                    "exit_z":      best["exit_z"],
+                    "stop_z":      best["stop_z"],
+                    "theta_calibrated": best.get("theta_calibrated"),
+                    "theta_utility": best.get("theta_utility"),
+                    "theta_n_oof": best.get("theta_n_oof"),
+                    "metagate_kind": best.get("metagate_kind"),
+                    "metagate_n_train": best.get("metagate_n_train"),
+                    "train_sharpe": best["sharpe"],
+                    "oos_sharpe":  round(oos_sh, 3),
+                    "oos_trades":  len(pair_oos_trades),
+                    "oos_pnl":     round(pair_oos_pnl, 4),
+                })
+                window_oos_pnl += pair_oos_pnl
+                window_trades  += len(pair_oos_trades)
+
+            if diag_sink:
+                append_diagnostics(DATA_DIR / METAGATE_DIAG_CSV, diag_sink)
+            if adapt_diag_sink:
+                append_diagnostics(DATA_DIR / ADAPT_DIAG_CSV, adapt_diag_sink)
 
         total_hmm_blocked += window_hmm_blocks
         total_hurst_blocked += window_hurst_blocks
