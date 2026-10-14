@@ -27,6 +27,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from cross_listing import align_to_ref_calendar, build_cross_listed_usd
+
 DATA = Path("data")
 START = "2006-01-01"
 END   = "2026-05-01"
@@ -95,11 +97,7 @@ def align_to_us_calendar(df: pd.DataFrame, ref_index: pd.DatetimeIndex,
                           max_stale: int = 3) -> pd.DataFrame:
     """Reindex foreign-market data to US trading calendar.
     Forward-fill up to `max_stale` days for foreign holidays / late prints."""
-    df = df.copy()
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    df = df.reindex(ref_index).ffill(limit=max_stale)
-    return df
+    return align_to_ref_calendar(df, ref_index, max_stale)
 
 
 def main():
@@ -136,16 +134,12 @@ def main():
 
     # Currency-normalise local prices to USD.
     tier_b_local_usd = pd.DataFrame(index=ref_index)
-    fx_aligned = align_to_us_calendar(tier_b_fx, ref_index) if not tier_b_fx.empty else None
-    if fx_aligned is not None:
-        local_aligned = align_to_us_calendar(tier_b_local, ref_index)
-        for adr, (loc, fx) in TIER_B_ADRS.items():
-            if loc not in local_aligned.columns or fx not in fx_aligned.columns:
-                continue
-            # Local price × (1 / FX-rate) → USD. YF FX uses local/USD direction
-            # e.g. AUDUSD=X = AUD-quoted-in-USD → multiply by it to get USD.
-            usd = local_aligned[loc] * fx_aligned[fx]
-            tier_b_local_usd[f"{loc}_USD"] = usd
+    if not tier_b_fx.empty:
+        # Local price × (1 / FX-rate) → USD. YF FX uses local/USD direction
+        # e.g. AUDUSD=X = AUD-quoted-in-USD → multiply by it to get USD.
+        tier_b_local_usd = build_cross_listed_usd(
+            tier_b_local, tier_b_fx, TIER_B_ADRS, ref_index,
+            fx_quote="usd_per_local")
         print(f"\n  USD-normalised local listings: "
               f"{[c for c in tier_b_local_usd.columns]}")
 

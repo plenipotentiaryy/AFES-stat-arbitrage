@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from cross_listing import align_to_ref_calendar, build_cross_listed_usd
+
 DATA = Path("data")
 START = "2006-01-01"
 END   = "2026-05-01"
@@ -97,10 +99,7 @@ def batched_download(tickers: list[str], start: str, end: str,
 
 
 def align(df: pd.DataFrame, ref_index: pd.DatetimeIndex, max_stale: int = 3) -> pd.DataFrame:
-    df = df.copy()
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    return df.reindex(ref_index).ffill(limit=max_stale)
+    return align_to_ref_calendar(df, ref_index, max_stale)
 
 
 def main():
@@ -147,17 +146,14 @@ def main():
         print("\nDownloading local + FX …")
         local_df = batched_download(local_missing, START, END) if local_missing else pd.DataFrame()
         fx_df    = batched_download(fx_missing, START, END) if fx_missing else pd.DataFrame()
-        if not fx_df.empty:
-            fx_df = align(fx_df, ref_index)
         if not local_df.empty:
-            local_df = align(local_df, ref_index)
+            # USDCAD=X is "1 USD = X CAD", so CAD-price-in-USD = CAD / USDCAD.
+            local_usd_df = build_cross_listed_usd(
+                local_df, fx_df, CANADIAN_DUAL, ref_index, fx_quote="local_per_usd")
             for adr, (loc, fx) in CANADIAN_DUAL.items():
                 if loc not in local_df.columns or fx not in fx_df.columns:
                     print(f"  skip {adr}: missing {loc} or {fx}")
                     continue
-                # USDCAD=X is "1 USD = X CAD", so CAD-price-in-USD = CAD / USDCAD.
-                usd_price = local_df[loc] / fx_df[fx]
-                local_usd_df[f"{loc}_USD"] = usd_price
                 cov = local_usd_df[f"{loc}_USD"].notna().mean() * 100
                 print(f"  {loc}_USD: {cov:.1f}% history")
             parts.append(local_usd_df)

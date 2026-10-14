@@ -18,3 +18,6 @@ live.db
 live/afes_live.db
 live/log.txt
 live/__pycache__/
+
+# committed test fixtures (audit T0 golden trades)
+!tests/fixtures/**/*.csv
