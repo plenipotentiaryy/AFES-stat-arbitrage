@@ -99,9 +99,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max trades per pair per calendar quarter (0 = no cap).")
     p.add_argument("--vol-tight-stop", action="store_true",
                    help="Tighten stop_z to 2.5 when entry's 20d/60d vol ratio > 1.5.")
-    p.add_argument("--vwap-exec", action="store_true",
-                   help="Use next-day VWAP for entry/exit fills (signal still "
-                        "computed on close). Requires data/vwap_daily.csv.")
+    p.add_argument("--exec", type=str, default="next_close",
+                   choices=["next_close", "vwap"], dest="exec_mode",
+                   help="Fill of an order decided at close t: next_close = close "
+                        "t+1 (default); vwap = next-day VWAP (signal still computed "
+                        "on close). vwap requires data/vwap_daily.csv.")
+    p.add_argument("--vwap-exec", action="store_const", const="vwap", dest="exec_mode",
+                   help="Alias of --exec vwap.")
+    p.add_argument("--legacy-same-close", action="store_true", dest="legacy_same_close",
+                   help="LEGACY: restore the pre-audit fills at the close that made "
+                        "the signal (impossible fills). For before/after comparison "
+                        "only; never use for headline results.")
     p.add_argument("--rotation", action="store_true",
                    help="Quarterly per-pair S_perf rescaling (§5): trades sized by "
                         "rolling pair-Sharpe with Bayesian shrinkage. Drop pairs "
@@ -151,7 +159,7 @@ def main():
     pairs  = pd.read_csv(DATA_DIR / args.pairs)["pair"].tolist()
 
     vwap_daily = None
-    if args.vwap_exec:
+    if args.exec_mode == "vwap":
         vp = DATA_DIR / "vwap_daily.csv"
         if not vp.exists():
             raise SystemExit("vwap_daily.csv missing — run build_vwap_daily.py")

@@ -6,6 +6,10 @@ of commit 46ffdfb wrote for small synthetic panels (see make_golden.py).
 the same arguments, must reproduce every fixture byte for byte.  Later tasks
 run these cases with their legacy_* flags on (LEGACY_FLAGS), so the legacy
 path keeps reproducing the pre-audit code.
+
+The same inputs also run in the default (corrected) mode (audit T1): every
+fill on the pair's next row after its decision, nothing after cfg.end, and
+the booked PnL equal to the spread change between the fill dates.
 """
 import contextlib
 import dataclasses
@@ -24,16 +28,16 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from step3j_wfo_daily import build_parser  # noqa: E402
-from wfo_daily_core import WfoConfig, run_wfo_daily  # noqa: E402
+from wfo_daily_core import WfoConfig, estimate_beta, make_windows, run_wfo_daily  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "t0_make_golden", os.path.join(_HERE, "fixtures", "t0_golden", "make_golden.py"))
 make_golden = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(make_golden)
 
-# WfoConfig fields that select the pre-audit behaviour.  Empty at T0; each
-# later task adds its legacy_* flag here.
-LEGACY_FLAGS: dict = {}
+# WfoConfig fields that select the pre-audit behaviour; each audit task adds
+# its legacy_* flag here.
+LEGACY_FLAGS: dict = {"legacy_same_close": True}
 
 
 def as_cli_reads(df: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -51,11 +55,16 @@ def cli_config(args: list[str]) -> WfoConfig:
 
 def run_case(case: str, **overrides):
     inp = make_golden.case_inputs(case)
-    cfg = dataclasses.replace(cli_config(inp["args"]), **LEGACY_FLAGS, **overrides)
+    cfg = dataclasses.replace(cli_config(inp["args"]), **{**LEGACY_FLAGS, **overrides})
     with contextlib.redirect_stdout(io.StringIO()):
         return run_wfo_daily(as_cli_reads(inp["closes"]), inp["pairs"], cfg,
                              volumes=as_cli_reads(inp["volumes"]),
                              vwap=as_cli_reads(inp["vwap"]))
+
+
+def fixture_columns(case: str) -> list[str]:
+    """Header of a fixture: the trade columns of the pre-refactor CLI."""
+    return make_golden.fixture_path(case).read_text().partition("\n")[0].split(",")
 
 
 @pytest.mark.parametrize("case", list(make_golden.CASES))
@@ -63,15 +72,30 @@ def test_core_reproduces_pre_refactor_cli(case):
     res = run_case(case)
     fixture = make_golden.fixture_path(case)
     if fixture.exists():
-        assert res.trades.to_csv(index=False).encode() == fixture.read_bytes()
+        # Compared on the fixture's columns: later tasks add columns.
+        cols = fixture_columns(case)
+        assert res.trades[cols].to_csv(index=False).encode() == fixture.read_bytes()
+        # Legacy fills are on the decision dates.
+        assert res.trades["entry_signal"].equals(res.trades["entry"])
+        assert res.trades["exit_signal"].equals(res.trades["exit"])
     else:                                   # the pre-refactor CLI found no trades
         assert res.trades.empty
         assert res.stats["n_trades"] == 0 and np.isnan(res.stats["sharpe_full"])
         assert len(res.daily_pnl) > 0 and (res.daily_pnl == 0).all()
 
 
-def test_result_daily_pnl_and_stats_match_trades():
-    res = run_case("flat")
+@pytest.mark.parametrize("case", ["flat", "vwap_exec"])
+def test_default_next_bar_fills_do_not_reproduce_the_pre_audit_trades(case):
+    # The legacy flag matters: without it the case's trades change.
+    res = run_case(case, legacy_same_close=False)
+    cols = fixture_columns(case)
+    assert res.trades[cols].to_csv(index=False).encode() != make_golden.fixture_path(case).read_bytes()
+
+
+@pytest.mark.parametrize("legacy", [True, False], ids=["legacy", "default"])
+def test_result_daily_pnl_and_stats_match_trades(legacy):
+    # default: one exit decided on the last OOS bar fills on the next row.
+    res = run_case("flat", legacy_same_close=legacy)
     tr, daily = res.trades, res.daily_pnl
     assert daily.index.is_monotonic_increasing and daily.index.is_unique
     assert daily.sum() == pytest.approx(tr["pnl"].sum(), abs=1e-12)
@@ -96,8 +120,109 @@ def test_metagate_and_hrp_keep_pre_existing_unbound_local_error(flag):
         run_case("flat", **{flag: True})
 
 
-@pytest.mark.parametrize("flag", ["vwz", "vwap_exec"])
-def test_flags_needing_aux_frames_raise_without_them(flag):
+@pytest.mark.parametrize("flags", [{"vwz": True}, {"exec_mode": "vwap"}], ids=["vwz", "vwap"])
+def test_flags_needing_aux_frames_raise_without_them(flags):
     inp = make_golden.case_inputs("flat")
     with pytest.raises(ValueError):
-        run_wfo_daily(inp["closes"], inp["pairs"], WfoConfig(**{flag: True}))
+        run_wfo_daily(inp["closes"], inp["pairs"], WfoConfig(**flags))
+
+
+def test_unknown_exec_mode_raises():
+    inp = make_golden.case_inputs("flat")
+    with pytest.raises(ValueError):
+        run_wfo_daily(inp["closes"], inp["pairs"], WfoConfig(exec_mode="same_close"))
+
+
+# ── The same inputs in the default (corrected) mode (audit T1) ──────────────
+
+def run_quiet(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig, **frames):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return run_wfo_daily(closes, pairs, cfg, **frames)
+
+
+@pytest.mark.parametrize("case", list(make_golden.CASES))
+def test_default_mode_fills_on_the_pairs_next_row(case):
+    # Every option case: each fill is the pair's next row with both legs after
+    # its decision (never after cfg.end); an end_of_data exit fills on its
+    # decision date, where no such row is left; a pair's positions never
+    # overlap; daily_pnl holds every trade's PnL.
+    res = run_case(case, legacy_same_close=False)
+    tr = res.trades
+    if tr.empty:                    # only where the pre-refactor CLI had none either
+        assert not make_golden.fixture_path(case).exists()
+        return
+    inp = make_golden.case_inputs(case)
+    closes = as_cli_reads(inp["closes"])
+    end = cli_config(inp["args"]).end
+    data_end = pd.Timestamp(end) if end else closes.index.max()
+    for pair, g in tr.sort_values("entry_signal").groupby("pair"):
+        rows = closes[pair.split("-")].dropna().index
+        rows = rows[rows <= data_end]
+        nxt_in = rows.searchsorted(g["entry_signal"], side="right")
+        nxt_out = rows.searchsorted(g["exit_signal"], side="right")
+        eod = (g["reason"] == "end_of_data").to_numpy()
+        assert (nxt_in < len(rows)).all() and (nxt_out[~eod] < len(rows)).all()
+        assert (rows[nxt_in] == g["entry"].to_numpy()).all()
+        assert (rows[nxt_out[~eod]] == g["exit"].to_numpy()[~eod]).all()
+        assert (nxt_out[eod] == len(rows)).all()
+        assert (g["exit"] == g["exit_signal"])[eod].all()
+        prev_exit = g["exit"].shift()
+        assert (g["entry"] >= prev_exit).iloc[1:].all()
+        assert (g["entry"] > prev_exit)[g["window"] == g["window"].shift()].all()
+    assert res.daily_pnl.sum() == pytest.approx(tr["pnl"].sum(), abs=1e-9)
+    assert set(tr["exit"].dt.normalize()) <= set(res.daily_pnl.index)
+
+
+@pytest.mark.parametrize("window,days_after", [(3, 0), (9, 0), (15, 0), (21, 0), (20, 1), (20, 3)],
+                         ids=["w3", "w9", "w15", "w21", "w20+1d", "w20+3d"])
+def test_no_data_after_cfg_end_is_used(window, days_after):
+    # Ruling R15: the fill-only bar is never after cfg.end.  With cfg.end set,
+    # the run on the full panel equals the run on the panel cut at cfg.end, and
+    # no output date is after it.  Ends: OOS ends of windows (no row lies in
+    # (oos_e, end], so an exit decided on the last bar is end_of_data) and
+    # dates just after one (the fill-only bar lies in (oos_e, end]).
+    inp = make_golden.case_inputs("flat")
+    closes = as_cli_reads(inp["closes"])
+    cfg = cli_config(inp["args"])
+    end = (make_windows(closes, cfg.train, cfg.oos, cfg.step)[window - 1][3]
+           + pd.Timedelta(days=days_after))
+    cfg = dataclasses.replace(cfg, end=str(end.date()))
+    full = run_quiet(closes, inp["pairs"], cfg)
+    cut = run_quiet(closes.loc[:end], inp["pairs"], cfg)
+    pd.testing.assert_frame_equal(full.trades, cut.trades, check_exact=True)
+    pd.testing.assert_series_equal(full.daily_pnl, cut.daily_pnl, check_exact=True)
+    assert (full.trades[["entry", "exit"]] <= end).all().all()
+    assert full.daily_pnl.index.max() <= end
+
+
+@pytest.mark.parametrize("exec_mode", ["next_close", "vwap"])
+def test_booked_pnl_is_the_spread_change_between_the_fill_dates(exec_mode):
+    # Zero costs: each trade books side × size × (spread on its exit fill date
+    # − spread on its entry fill date), the spread being log P1 − β·log P2
+    # with the window's train β, of closes or (vwap mode) of VWAPs — an exit
+    # without a VWAP or at the end of the data at the close.  So every fill
+    # price belongs to its fill date, the fill-only bar included.
+    inp = make_golden.case_inputs("vwap_exec")
+    closes, vwap = inp["closes"], inp["vwap"]
+    cfg = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0, exec_mode=exec_mode)
+    tr = run_quiet(closes, inp["pairs"], cfg, vwap=vwap).trades
+    windows = make_windows(closes, cfg.train, cfg.oos, cfg.step)
+    rebuilt, exits_after_window = [], 0
+    for _, t in tr.iterrows():
+        a, b = t["pair"].split("-")
+        tr_s, tr_e, _, oos_e = windows[t["window"] - 1]
+        train = closes.loc[tr_s:tr_e, [a, b]].dropna()
+        beta = estimate_beta(train[a], train[b])
+
+        def spread(px: pd.DataFrame, day) -> float:
+            return np.log(px.at[day, a]) - beta * np.log(px.at[day, b])
+
+        use_vwap = exec_mode == "vwap"
+        entry = spread(vwap if use_vwap else closes, t["entry"])
+        exit_ = spread(vwap, t["exit"]) if use_vwap and t["reason"] != "end_of_data" else np.nan
+        if np.isnan(exit_):
+            exit_ = spread(closes, t["exit"])
+        rebuilt.append(t["size"] * t["side"] * (exit_ - entry))
+        exits_after_window += t["exit"] > oos_e
+    assert len(tr) > 100 and exits_after_window > 0
+    np.testing.assert_allclose(tr["pnl"].to_numpy(), rebuilt, rtol=0, atol=1e-12)

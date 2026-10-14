@@ -14,7 +14,7 @@ import math
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import numpy as np
@@ -33,11 +33,11 @@ from wfo_daily_core import WfoConfig, run_wfo_daily  # noqa: E402
 GROSS = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0)
 
 # Variant table — the single place later tasks edit: name → (cfg, builder of
-# the async panel from AsyncRaw).  At T0 no --legacy-* flags exist yet, so both
-# variants are the current (pre-audit) behaviour.  T1+ add their legacy_* cfg
-# fields to "legacy" and switch the defaults; T2 gives "fixed" its builder.
+# the async panel from AsyncRaw).  "legacy" = GROSS with every legacy_* flag
+# on (the pre-audit behaviour); "fixed" = GROSS with the corrected defaults.
+# Each task adds its legacy_* cfg field to "legacy"; T2 gives "fixed" its builder.
 VARIANTS: dict[str, tuple[WfoConfig, Callable]] = {
-    "legacy": (GROSS, synthetic.build_async_panel),
+    "legacy": (replace(GROSS, legacy_same_close=True), synthetic.build_async_panel),
     "fixed":  (GROSS, synthetic.build_async_panel),
 }
 

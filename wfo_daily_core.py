@@ -4,8 +4,9 @@ Extracted from `step3j_wfo_daily.py` (audit task T0) so the backtest can run
 on in-memory data: `run_wfo_daily(closes, pairs, cfg)` takes a close panel,
 a pair list and a `WfoConfig`, and returns a `WfoResult`.  The CLI in
 `step3j_wfo_daily.py` keeps all file IO, builds the `WfoConfig` from its
-arguments and calls `run_wfo_daily`.  Behaviour is identical to the
-pre-refactor CLI (commit 46ffdfb).
+arguments and calls `run_wfo_daily`.  The defaults carry the audit fixes
+(AUDIT_FIX_LOG.md); with every `legacy_*` flag on, behaviour is identical
+to the pre-refactor CLI (commit 46ffdfb).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -122,6 +123,8 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                   vol_tight_stop_z: float = 2.5,
                   exec_spread: pd.Series | None = None,
                   entry_blackout: pd.Series | None = None,
+                  legacy_same_close: bool = False,
+                  decision_end=None,
                   ) -> pd.DataFrame:
     """Generate mean-reversion trades on a daily spread.
 
@@ -133,6 +136,18 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
              max(S+, S-) > cusum_h (k=0.5 slack, classic defaults).
     z_series: pre-computed z (overrides rolling); used by Kalman path
               which produces innovations / sqrt(innov_var).
+
+    Fills (audit T1): an entry or exit decided on bar i (a row of
+    spread_full; the decision uses data up to bar i) fills on bar i+1, at
+    its close or, with exec_spread, at exec_spread[i] (the VWAP of bar i+1;
+    an exit whose VWAP is NaN fills at the close of bar i+1).  The holding
+    period and borrow start at the entry fill; entry/exit are the fill
+    dates, entry_signal/exit_signal the decision dates.  No bar i+1: an
+    entry is not filled; an exit fills at the close of bar i with reason
+    "end_of_data".
+    decision_end: no entry, exit or CUSUM decision on bars after this date
+                  (fill-only bars).
+    legacy_same_close: pre-audit fills on the deciding bar itself.
     """
     if z_series is None:
         mu  = spread_full.rolling(z_win).mean()
@@ -149,11 +164,16 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     trades = []
     in_pos, side = False, 0
     entry_idx, entry_spread = None, 0.0
+    entry_sig = None  # bar on which the open position's entry was decided
     entry_size = 1.0  # applied to pnl/cost at exit (1.0 normal, 0.5 panic-sized)
     cur_stop_z = stop_z  # per-trade stop (mutated at entry if vol_tight_stop on)
 
     idx = spread_full.index
+    n = len(idx)
     oos_mask = (idx >= pd.Timestamp(oos_start)) & (idx < pd.Timestamp(oos_end))
+    # Decisions on bars up to decision_end only; later bars are fill-only.
+    n_decide = (n if decision_end is None
+                else int(idx.searchsorted(pd.Timestamp(decision_end), side="right")))
 
     # Per-bar inputs as numpy arrays, taken once before the loop.  Reading
     # arr[i] gives the same values as the former `.iloc[i]` (speed only).
@@ -165,7 +185,20 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     blackout_vals = entry_blackout.to_numpy() if entry_blackout is not None else None
     exec_vals = exec_spread.to_numpy() if exec_spread is not None else None
 
-    for i in range(len(idx)):
+    def exit_fill(i: int, reason: str) -> tuple[int, float, str]:
+        """(fill bar, fill spread, reason) of an exit decided on bar i."""
+        if i + 1 >= n:                     # no bar i+1: the data ends here
+            return i, sp_vals[i], "end_of_data"
+        if exec_vals is not None and pd.notna(exec_vals[i]):
+            return i + 1, exec_vals[i], reason      # VWAP of bar i+1
+        return i + 1, sp_vals[i + 1], reason
+
+    def causal(decision: int, fill: int, reason: str) -> bool:
+        """Hard rule 2: a fill comes after its decision; only an exit at the
+        end of the data fills on its decision bar, the last bar."""
+        return fill > decision or (reason == "end_of_data" and fill == decision == n - 1)
+
+    for i in range(n_decide):
         if z_isna[i]:
             continue
         zi = z_vals[i]
@@ -177,15 +210,21 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                 broken = True
                 # Force-close any open position on break.
                 if in_pos:
-                    exit_spread = sp_vals[i]
-                    held_bars  = i - entry_idx
+                    if legacy_same_close:
+                        exit_idx, exit_spread, reason = i, sp_vals[i], "cusum_break"
+                    else:
+                        exit_idx, exit_spread, reason = exit_fill(i, "cusum_break")
+                    held_bars  = exit_idx - entry_idx
                     gross = side * (exit_spread - entry_spread)
                     pnl = entry_size * (gross - cost_per_trade - held_bars * borrow_per_day)
+                    assert legacy_same_close or (causal(entry_sig, entry_idx, "entry")
+                                                 and causal(i, exit_idx, reason))
                     trades.append({
-                        "entry":  idx[entry_idx], "exit": idx[i],
+                        "entry":  idx[entry_idx], "exit": idx[exit_idx],
                         "held":   held_bars, "side": side, "pnl": pnl,
                         "size":   entry_size,
-                        "reason": "cusum_break",
+                        "reason": reason,
+                        "entry_signal": idx[entry_sig], "exit_signal": idx[i],
                     })
                     in_pos = False
 
@@ -231,15 +270,28 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             # exec_spread is assumed pre-shifted: exec_spread.iloc[i] holds
             # the spread that would be realised by an order entered at the
             # end of bar i (i.e. day i+1 VWAP). NaN → skip (no fill yet).
-            fill_spread_at_entry = (
-                exec_vals[i] if exec_spread is not None
-                else sp_vals[i]
-            )
+            # Otherwise the fill is the close of bar i+1 (audit T1); no bar
+            # i+1 → not filled.  legacy_same_close: the close of bar i.
+            if legacy_same_close:
+                fill_idx = i
+                fill_spread_at_entry = (
+                    exec_vals[i] if exec_spread is not None
+                    else sp_vals[i]
+                )
+            elif i + 1 < n:
+                fill_idx = i + 1
+                fill_spread_at_entry = (
+                    exec_vals[i] if exec_spread is not None
+                    else sp_vals[i + 1]
+                )
+            else:
+                continue
             if exec_spread is not None and pd.isna(fill_spread_at_entry):
                 continue
             side = prov_side
             in_pos = True
-            entry_idx, entry_spread = i, fill_spread_at_entry
+            entry_idx, entry_spread = fill_idx, fill_spread_at_entry
+            entry_sig = i
             entry_size = this_size * mg_size
             cur_stop_z = stop_z
             if vol_tight_stop and i >= 60:
@@ -253,28 +305,36 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             hit_stop   = abs(zi) >= cur_stop_z
             timeout    = held >= max_hold
             if hit_target or hit_stop or timeout:
-                fill_spread_at_exit = (
-                    exec_vals[i] if exec_spread is not None
-                    else sp_vals[i]
-                )
-                if exec_spread is not None and pd.isna(fill_spread_at_exit):
-                    # Roll forward one bar — if last bar of OOS, force-close
-                    # at last available exec price (no future data leakage
-                    # because exec_spread is pre-shifted).
-                    last_known = exec_spread.iloc[:i + 1].dropna()
-                    if last_known.empty:
-                        continue
-                    fill_spread_at_exit = last_known.iloc[-1]
+                reason = "target" if hit_target else ("stop" if hit_stop else "time")
+                if legacy_same_close:
+                    exit_idx = i
+                    fill_spread_at_exit = (
+                        exec_vals[i] if exec_spread is not None
+                        else sp_vals[i]
+                    )
+                    if exec_spread is not None and pd.isna(fill_spread_at_exit):
+                        # Roll forward one bar — if last bar of OOS, force-close
+                        # at last available exec price (no future data leakage
+                        # because exec_spread is pre-shifted).
+                        last_known = exec_spread.iloc[:i + 1].dropna()
+                        if last_known.empty:
+                            continue
+                        fill_spread_at_exit = last_known.iloc[-1]
+                else:
+                    exit_idx, fill_spread_at_exit, reason = exit_fill(i, reason)
                 exit_spread = fill_spread_at_exit
-                held_bars  = i - entry_idx
+                held_bars  = exit_idx - entry_idx
                 borrow_cost = held_bars * borrow_per_day
                 gross = side * (exit_spread - entry_spread)
                 pnl = entry_size * gross - entry_size * cost_per_trade - entry_size * borrow_cost
+                assert legacy_same_close or (causal(entry_sig, entry_idx, "entry")
+                                             and causal(i, exit_idx, reason))
                 trades.append({
-                    "entry":  idx[entry_idx], "exit": idx[i],
-                    "held":   held, "side": side, "pnl": pnl,
+                    "entry":  idx[entry_idx], "exit": idx[exit_idx],
+                    "held":   held_bars, "side": side, "pnl": pnl,
                     "size":   entry_size,
-                    "reason": "target" if hit_target else ("stop" if hit_stop else "time"),
+                    "reason": reason,
+                    "entry_signal": idx[entry_sig], "exit_signal": idx[i],
                 })
                 in_pos = False
     return pd.DataFrame(trades)
@@ -406,7 +466,8 @@ class WfoConfig:
     ticker_overlap: bool = False
     per_pair_quarter_cap: int = 0
     vol_tight_stop: bool = False
-    vwap_exec: bool = False
+    exec_mode: str = "next_close"
+    legacy_same_close: bool = False
     rotation: bool = False
     voltarget: float = 0.0
     hmm: str = "off"
@@ -638,12 +699,14 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     pairs:   pair names "T1-T2" (both tickers must be columns of closes).
     volumes: daily share volumes (volumes_daily.csv); required by cfg.vwz,
              used for the Almgren-Chriss ADV if present.
-    vwap:    daily VWAPs (vwap_daily.csv); required by cfg.vwap_exec.
+    vwap:    daily VWAPs (vwap_daily.csv); required by cfg.exec_mode "vwap".
     """
+    if cfg.exec_mode not in ("next_close", "vwap"):
+        raise ValueError(f"cfg.exec_mode must be 'next_close' or 'vwap', not {cfg.exec_mode!r}")
     if cfg.vwz and volumes is None:
         raise ValueError("cfg.vwz needs the volumes frame (volumes_daily.csv)")
-    if cfg.vwap_exec and vwap is None:
-        raise ValueError("cfg.vwap_exec needs the vwap frame (vwap_daily.csv)")
+    if cfg.exec_mode == "vwap" and vwap is None:
+        raise ValueError("cfg.exec_mode 'vwap' needs the vwap frame (vwap_daily.csv)")
 
     # Macro returns for HMM.  Prefer SPY; otherwise use an equal-weighted
     # cross-sectional mean of log-returns as a market-wide panic proxy.
@@ -658,7 +721,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             print(f"  hmm mode: {cfg.hmm}   macro proxy: EW mean of {closes.shape[1]} names")
 
     vwap_daily = None
-    if cfg.vwap_exec:
+    if cfg.exec_mode == "vwap":
         vwap_daily = vwap
         print(f"  vwap-exec: ON ({vwap_daily.shape[0]} days × {vwap_daily.shape[1]} tickers)")
 
@@ -729,7 +792,16 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
           f"hmm:       {cfg.hmm}   "
           f"metagate:  {'ON' if cfg.metagate else 'off'}   "
           f"cusum:     {('h='+str(cfg.cusum)) if cfg.cusum else 'off'}")
+    exec_label = "next_close" if cfg.exec_mode == "next_close" else "next-day VWAP"
+    if cfg.legacy_same_close:
+        exec_label = ("SAME-CLOSE (legacy)" if cfg.exec_mode == "next_close"
+                      else exec_label + " (legacy same-bar bookkeeping)")
+    print(f"  exec:       {exec_label}")
     print()
+
+    # Last date of the run's data: fills never use a row after cfg.end.
+    data_end = pd.Timestamp(cfg.end) if cfg.end else closes.index.max()
+    has_px = None if cfg.legacy_same_close else closes.notna()   # for the fill-only bar
 
     all_trades = []
     for w_idx, (tr_s, tr_e, oos_s, oos_e) in enumerate(windows, start=1):
@@ -815,6 +887,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 if cfg.hmm == "size-panic":
                     panic_size_mult = 0.5
 
+        # Row range after the OOS end, up to data_end: the fill-only bar's candidates.
+        after_lo = closes.index.searchsorted(oos_e, side="right")
+        after_hi = closes.index.searchsorted(data_end, side="right")
+
         for pair in pairs:
             t1, t2 = pair.split("-")
             if t1 not in closes.columns or t2 not in closes.columns:
@@ -825,6 +901,16 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             full = closes.loc[tr_s:oos_e, [t1, t2]].dropna()
             if len(full) < Z_WIN + 10:
                 continue
+            if has_px is not None:
+                # Audit T1: append ONE fill-only bar, the first later row with
+                # both legs, so that a decision on the window's last bar can
+                # fill.  No decision is taken on it (decision_end=oos_e);
+                # positions still open after the last decision bar are
+                # dropped as before (T3).
+                both = (has_px[t1].to_numpy()[after_lo:after_hi]
+                        & has_px[t2].to_numpy()[after_lo:after_hi])
+                if both.any():
+                    full = pd.concat([full, closes[[t1, t2]].iloc[[after_lo + int(both.argmax())]]])
 
             # Per-pair cost: flat scalars OR Almgren-Chriss tiered.
             if cfg.execution_model == "almgren":
@@ -836,7 +922,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 sp, z_kal = kalman_spread_z(full, t1, t2)
                 tr = backtest_pair(sp, oos_s, oos_e, cost_log,
                                    cusum_h=cfg.cusum, z_series=z_kal,
-                                   borrow_per_day=borrow_per_day)
+                                   borrow_per_day=borrow_per_day,
+                                   legacy_same_close=cfg.legacy_same_close,
+                                   decision_end=oos_e)
             elif cfg.vwz:
                 beta = estimate_beta(train[t1], train[t2])
                 if not (0.1 <= abs(beta) <= 15.0):
@@ -850,6 +938,8 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                                    if panic_full is not None else None),
                     panic_size_mult=panic_size_mult,
                     borrow_per_day=borrow_per_day,
+                    legacy_same_close=cfg.legacy_same_close,
+                    decision_end=oos_e,
                 )
             else:
                 beta = estimate_beta(train[t1], train[t2])
@@ -889,6 +979,8 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                     vol_tight_stop=cfg.vol_tight_stop,
                     exec_spread=exec_sp,
                     entry_blackout=pair_blackout,
+                    legacy_same_close=cfg.legacy_same_close,
+                    decision_end=oos_e,
                 )
             if not tr.empty:
                 # HRP / inverse-vol: scale the entire trade (pnl is linear in
@@ -920,13 +1012,15 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     trades = pd.concat(all_trades, ignore_index=True)
     trades["entry"] = pd.to_datetime(trades["entry"])
     trades["exit"]  = pd.to_datetime(trades["exit"])
+    trades["entry_signal"] = pd.to_datetime(trades["entry_signal"])
+    trades["exit_signal"]  = pd.to_datetime(trades["exit_signal"])
 
     # ── volvol: per-entry size ∝ 1/recent_20d_spread_vol (window-normalised)
     if cfg.volvol:
         size_multipliers = []
         for _, row in trades.sort_values("entry").iterrows():
             t1, t2 = row["pair"].split("-")
-            entry_dt = row["entry"]
+            entry_dt = row["entry_signal"]      # closes up to the entry decision
             window_start = entry_dt - pd.Timedelta(days=30)
             sl = closes.loc[window_start:entry_dt, [t1, t2]].dropna()
             if len(sl) < 20:
@@ -1019,6 +1113,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     # to the last OOS window end. Used for the correct portfolio Sharpe.
     first_oos = windows[0][2]
     last_oos  = windows[-1][3]
+    # Audit T1: an exit decided on the last OOS bar fills on the next row, so
+    # the index runs to the last exit fill; no booked PnL falls outside it.
+    last_oos  = max(last_oos, trades["exit"].max())
     oos_idx = closes.loc[first_oos:last_oos].index
 
     # ── Quarterly per-pair rotation (Option B §5) ─────────────────────────
@@ -1032,6 +1129,14 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     if cfg.voltarget > 0:
         trades = apply_vol_target(trades, cfg.voltarget, oos_idx)
         print(f"  → voltarget={cfg.voltarget*100:.1f}%: causal leverage applied")
+
+    if not cfg.legacy_same_close:
+        # Hard rule 2 on the final table: every fill after its decision; an
+        # exit fills on its decision date only at the end of the data.
+        eod = trades["reason"] == "end_of_data"
+        assert (trades["entry"] > trades["entry_signal"]).all()
+        assert (trades["exit"] > trades["exit_signal"])[~eod].all()
+        assert (trades["exit"] == trades["exit_signal"])[eod].all()
 
     # exit-date booking over panel trading days; replaced by daily MTM over all business days in T4
     daily_pnl = exit_date_daily_pnl(trades, oos_idx)

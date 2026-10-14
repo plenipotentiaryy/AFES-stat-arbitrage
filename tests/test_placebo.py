@@ -23,10 +23,13 @@ RW_BUG = "pre-T1 behaviour: positions still open at a window end are dropped (T3
 ASYNC_BUG = ("pre-T1 behaviour: same-close fills on date-aligned, forward-filled local "
              "prints converted with a mistimed daily FX close (T1/T2), and positions "
              "open at a window end dropped (T3)")
-PENDING = "T1–T4 pending"
+T3_PENDING = "T3 pending: positions still open at a window end are dropped"
+T2_PENDING = ("T2 pending: fills on local-holiday dates at the forward-filled stale "
+              "local print")
 
-# Expected outcomes, measured at T0 (Ruling R5): (variant, dataset, test) →
-# reason of a strict xfail.  Absent = must pass.  The one table later tasks flip.
+# Expected outcomes, measured at T0 and re-measured by each task (Ruling R5):
+# (variant, dataset, test) → reason of a strict xfail.  Absent = must pass.
+# The one table later tasks flip.
 XFAIL = {
     ("legacy", "independent_rw",    "sharpe"): RW_BUG,
     ("legacy", "independent_rw",    "tstat"):  RW_BUG,
@@ -38,16 +41,12 @@ XFAIL = {
     ("legacy", "async_lag15_hol0",  "tstat"):  ASYNC_BUG,
     ("legacy", "async_lag15_hol5",  "sharpe"): ASYNC_BUG,
     ("legacy", "async_lag15_hol5",  "tstat"):  ASYNC_BUG,
-    ("fixed",  "independent_rw",    "sharpe"): PENDING,
-    ("fixed",  "independent_rw",    "tstat"):  PENDING,
-    ("fixed",  "async_lag4.5_hol0", "sharpe"): PENDING,
-    ("fixed",  "async_lag4.5_hol0", "tstat"):  PENDING,
-    ("fixed",  "async_lag4.5_hol5", "sharpe"): PENDING,
-    ("fixed",  "async_lag4.5_hol5", "tstat"):  PENDING,
-    ("fixed",  "async_lag15_hol0",  "sharpe"): PENDING,
-    ("fixed",  "async_lag15_hol0",  "tstat"):  PENDING,
-    ("fixed",  "async_lag15_hol5",  "sharpe"): PENDING,
-    ("fixed",  "async_lag15_hol5",  "tstat"):  PENDING,
+    ("fixed",  "independent_rw",    "sharpe"): T3_PENDING,
+    ("fixed",  "independent_rw",    "tstat"):  T3_PENDING,
+    ("fixed",  "async_lag4.5_hol5", "sharpe"): T2_PENDING,
+    ("fixed",  "async_lag4.5_hol5", "tstat"):  T2_PENDING,
+    ("fixed",  "async_lag15_hol5",  "sharpe"): T2_PENDING,
+    ("fixed",  "async_lag15_hol5",  "tstat"):  T2_PENDING,
 }
 
 TRUNCATION_DATASETS = ["independent_rw", "async_lag15_hol5", "ou_positive_control"]
@@ -69,17 +68,24 @@ def placebo():
     return ph.results(ph.all_jobs())
 
 
+def require_pooled_trades(s: ph.Summary) -> None:
+    """The trade-count floor.  pytest.fail, not assert: a strict xfail mark
+    (raises=AssertionError) must not absorb a floor failure."""
+    if s.n_trades < ph.MIN_POOLED_TRADES:
+        pytest.fail(f"only {s.n_trades} pooled trades (floor {ph.MIN_POOLED_TRADES})")
+
+
 @pytest.mark.parametrize("variant,dataset", cases("sharpe", ph.NULL_DATASETS))
 def test_null_mean_gross_sharpe_is_zero(placebo, variant, dataset):
     s = placebo[(variant, dataset)]
-    assert s.n_trades >= ph.MIN_POOLED_TRADES, f"only {s.n_trades} trades"
+    require_pooled_trades(s)
     assert -0.2 <= s.mean_sharpe <= 0.2, f"mean Sharpe {s.mean_sharpe:+.3f} ± {s.se_sharpe:.3f}"
 
 
 @pytest.mark.parametrize("variant,dataset", cases("tstat", ph.NULL_DATASETS))
 def test_null_mean_gross_trade_pnl_is_zero(placebo, variant, dataset):
     s = placebo[(variant, dataset)]
-    assert s.n_trades >= ph.MIN_POOLED_TRADES, f"only {s.n_trades} trades"
+    require_pooled_trades(s)
     assert abs(s.tstat) < 3, f"per-trade t {s.tstat:+.1f} over {s.n_trades} trades"
 
 
@@ -90,19 +96,34 @@ def test_ou_positive_control_shows_its_edge(placebo):
 
 @functools.lru_cache(maxsize=None)
 def full_and_truncated(key: tuple):
-    """Runs of seed 0 on the full panel and on the panel cut at its middle date."""
+    """Runs of seed 0 on the full panel and on the panel cut at its middle
+    date D (inclusive), and D."""
     cfg, builder, dataset = key
     closes, pairs = ph.make_panel(dataset, 0, builder)
     cut = closes.index[len(closes) // 2]
-    return ph.run_quiet(closes, pairs, cfg), ph.run_quiet(closes.loc[:cut], pairs, cfg)
+    return ph.run_quiet(closes, pairs, cfg), ph.run_quiet(closes.loc[:cut], pairs, cfg), cut
 
 
 @pytest.mark.parametrize("variant,dataset", cases("truncation", TRUNCATION_DATASETS))
 def test_truncation_invariance(variant, dataset):
-    # Ruling R4: at T0 compare the trades of every window the truncated run
-    # has; T3 tightens this to every decision before the cut date.
-    full, truncated = full_and_truncated(ph.run_key(variant, dataset))
+    # Trades of the windows the truncated run has (windows still reset, T3):
+    # every trade whose exit was decided before the cut date D is identical
+    # in all columns, and every entry decided before D has the same decision
+    # date, fill date, side and size.  Decisions at or after D are excluded
+    # (an exit decided on D fills on D+1 or, in the truncated run, at D's
+    # close as end_of_data).
+    full, truncated, cut = full_and_truncated(ph.run_key(variant, dataset))
     n = truncated.stats["n_windows"]
     assert 0 < n < full.stats["n_windows"] and not truncated.trades.empty
-    before = full.trades[full.trades["window"] <= n].reset_index(drop=True)
-    pd.testing.assert_frame_equal(truncated.trades, before, check_exact=True)
+    ref = full.trades[full.trades["window"] <= n]
+
+    def decided_before_cut(tr: pd.DataFrame, decision: str, cols=slice(None)) -> pd.DataFrame:
+        return tr.loc[tr[decision] < cut, cols].reset_index(drop=True)
+
+    exits = decided_before_cut(truncated.trades, "exit_signal")
+    assert not exits.empty
+    pd.testing.assert_frame_equal(exits, decided_before_cut(ref, "exit_signal"), check_exact=True)
+    entry_cols = ["pair", "window", "entry_signal", "entry", "side", "size"]
+    pd.testing.assert_frame_equal(decided_before_cut(truncated.trades, "entry_signal", entry_cols),
+                                  decided_before_cut(ref, "entry_signal", entry_cols),
+                                  check_exact=True)
