@@ -20,6 +20,7 @@ from dateutil.relativedelta import relativedelta
 from config import BAR_TIMEFRAME
 from cross_listing import mask_stale_prints, repeats_previous_print
 from kalman import kalman_hedge
+from mtm import CAPITAL_PER_PAIR, daily_mtm_pairs, mtm_stats, portfolio_pnl
 from metagate_daily import (
     MetaGateDaily, FEATURE_NAMES as MG_FEATURES,
     entry_features as mg_entry_features,
@@ -250,9 +251,11 @@ def tightened_stop(spread: pd.Series, i: int, stop_z: float,
 def trade_record(idx: pd.Index, entry_sig: int, entry_idx: int, exit_sig: int,
                  exit_idx: int, side: int, size: float, pnl: float, reason: str,
                  beta_e: float, p1e: float, p2e: float, p1x: float, p2x: float,
-                 q1: float, q2: float, gross: float) -> dict:
+                 q1: float, q2: float, gross: float, cost: float, borrow: float) -> dict:
     """One row of the trades table (bar numbers → dates; fills `entry` /
-    `exit`, decisions `entry_signal` / `exit_signal`)."""
+    `exit`, decisions `entry_signal` / `exit_signal`).  gross, cost (round
+    trip) and borrow (all held days) are per unit size and never rescaled, so
+    pnl = size·(gross − cost − borrow) after every sizing filter (audit T4)."""
     return {
         "entry":  idx[entry_idx], "exit": idx[exit_idx],
         "held":   exit_idx - entry_idx, "side": side, "pnl": pnl,
@@ -261,6 +264,7 @@ def trade_record(idx: pd.Index, entry_sig: int, entry_idx: int, exit_sig: int,
         "entry_signal": idx[entry_sig], "exit_signal": idx[exit_sig],
         "beta": beta_e, "p1_entry": p1e, "p2_entry": p2e, "p1_exit": p1x,
         "p2_exit": p2x, "q1": q1, "q2": q2, "gross": gross,
+        "cost": cost, "borrow": borrow,
     }
 
 
@@ -382,7 +386,8 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     def record(exit_sig: int, exit_idx: int, reason: str, p1x: float, p2x: float,
                gross: float, pnl: float) -> dict:
         return trade_record(idx, entry_sig, entry_idx, exit_sig, exit_idx, side, entry_size,
-                            pnl, reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross)
+                            pnl, reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross,
+                            cost_per_trade, (exit_idx - entry_idx) * borrow_per_day)
 
     def exit_fill(i: int, reason: str) -> tuple[int, float, float, float, str]:
         """(fill bar, fill spread, P1, P2, reason) of an exit decided on bar i."""
@@ -588,7 +593,8 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
         assert (fill_is_causal(entry_sig, entry_idx, "entry", n)
                 and fill_is_causal(decision, fill, reason, n))
         trades.append({**trade_record(idx, entry_sig, entry_idx, decision, fill, side, size, pnl,
-                                      reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross),
+                                      reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross,
+                                      cost_e, (fill - entry_idx) * borrow_e),
                        "window_entered": w_e, "window_exited": int(win_of[decision])})
 
     def exit_now(i: int, reason: str) -> None:
@@ -771,6 +777,7 @@ class WfoConfig:
     legacy_spread_pnl: bool = False
     legacy_stale_prints: bool = False
     legacy_window_reset: bool = False
+    legacy_exit_date_pnl: bool = False
     rotation: bool = False
     voltarget: float = 0.0
     hmm: str = "off"
@@ -784,13 +791,22 @@ class WfoConfig:
 class WfoResult:
     """Output of `run_wfo_daily`.
 
-    trades:    the trade list the CLI writes to wfo_daily_results*.csv.
-    daily_pnl: portfolio PnL per day of the OOS span (zeros on empty days).
-    stats:     summary metrics, see `trade_stats`.
+    trades:        the trade list the CLI writes to wfo_daily_results*.csv.
+    daily_pnl:     portfolio daily mark-to-market PnL (USD per $1 of leg-1
+                   notional) on every business day of the OOS span, zeros on
+                   empty days (audit T4, `mtm.daily_mtm`); legacy_exit_date_pnl:
+                   trade PnL booked on exit dates over the panel's OOS days.
+    stats:         summary metrics, see `run_stats` (legacy: `trade_stats`).
+    daily_returns: daily_pnl / capital, capital = the run's pairs × CAPITAL_PER_PAIR.
+    daily_pnl_pairs: the daily MTM PnL per pair (dates of daily_pnl × the
+                   run's pairs, `mtm.daily_mtm_pairs`); its columns, added in
+                   order, are daily_pnl exactly.  None with legacy_exit_date_pnl.
     """
     trades: pd.DataFrame
     daily_pnl: pd.Series
     stats: dict
+    daily_returns: pd.Series
+    daily_pnl_pairs: pd.DataFrame | None = None
 
 
 # ── Reporting ───────────────────────────────────────────────────────────────
@@ -807,11 +823,14 @@ def exit_date_daily_pnl(tr: pd.DataFrame, oos_index) -> pd.Series:
 
 def trade_stats(tr: pd.DataFrame, n_windows: int, n_pairs: int,
                 oos_index: pd.DatetimeIndex | None = None) -> dict:
-    """Portfolio metrics of a trade list (the numbers `summarise` prints).
+    """Legacy portfolio metrics of a trade list (the numbers the legacy
+    `summarise` prints; cfg.legacy_exit_date_pnl).
 
-    sharpe_full uses every OOS trading day (zeros on no-exit days);
-    sharpe_exit uses exit days only (legacy, inflated).  No trades →
-    n_trades = 0 and NaN metrics.
+    max_dd is over the cumulative trade PnL in table order; sharpe_full
+    books each trade's PnL on its exit date over every OOS trading day
+    (zeros on no-exit days); sharpe_exit uses exit days only (inflated).  No
+    trades → n_trades = 0 and NaN metrics.  The default metrics are
+    `run_stats` (audit T4).
     """
     nan = float("nan")
     stats = {
@@ -852,19 +871,35 @@ def trade_stats(tr: pd.DataFrame, n_windows: int, n_pairs: int,
     return stats
 
 
+def run_stats(tr: pd.DataFrame, n_windows: int, n_pairs: int, daily_pnl: pd.Series,
+              capital: float) -> dict:
+    """Portfolio metrics of a run (audit T4): the trade counts of
+    `trade_stats` (n_windows, n_pairs, n_pairs_active, n_trades, win_rate,
+    total_pnl, profit_factor, exit_reasons) and the daily mark-to-market
+    figures of `mtm.mtm_stats` on constant capital (capital, sharpe — the one
+    Sharpe —, ann_return, ann_vol, the date-ordered max_dd as a fraction of
+    capital, max_dd_peak, max_dd_trough).  No exit-date figure."""
+    st = trade_stats(tr, n_windows, n_pairs)
+    for k in ("max_dd", "sharpe_full", "sharpe_exit"):
+        del st[k]
+    return {**st, **mtm_stats(daily_pnl, capital)}
+
+
 def summarise(tr: pd.DataFrame, label: str, n_windows: int, n_pairs: int,
-              oos_index: pd.DatetimeIndex | None = None):
+              oos_index: pd.DatetimeIndex | None = None, stats: dict | None = None):
     """Report portfolio metrics.
 
-    full_sharpe uses every OOS trading day (zeros on no-exit days) — this
-    is the correct annualised portfolio Sharpe.  The legacy exit-day-only
-    Sharpe is also printed for backwards-compatibility; it inflates by
-    a factor of ~√(trading_days / exit_days) for sparse strategies.
+    stats (the run's `run_stats`, audit T4): the Sharpe of the daily
+    mark-to-market returns on constant capital, annualised return and vol,
+    the date-ordered MaxDD as a fraction of capital, and the trade counts.
+    Without stats (legacy_exit_date_pnl), the pre-T4 report: full_sharpe on
+    exit-date booked PnL over every OOS trading day, the exit-day-only
+    Sharpe (inflated), and MaxDD over trades in table order.
     """
     if tr.empty:
         print(f"\n[{label}] NO TRADES across {n_windows} windows × {n_pairs} pairs")
         return
-    st = trade_stats(tr, n_windows, n_pairs, oos_index)
+    st = stats if stats is not None else trade_stats(tr, n_windows, n_pairs, oos_index)
 
     print(f"\n{'='*70}")
     print(f"DAILY WFO SUMMARY — {label}")
@@ -873,15 +908,25 @@ def summarise(tr: pd.DataFrame, label: str, n_windows: int, n_pairs: int,
     print(f"Pairs (active): {st['n_pairs_active']} / {st['n_pairs']}")
     print(f"OOS Trades:     {st['n_trades']}")
     print(f"Win rate:       {st['win_rate']*100:.1f}%")
-    print(f"Total PnL:      {st['total_pnl']:+.4f}  (log-spread units)")
+    units = "USD per $1 of leg-1 notional, sum over trades" if stats is not None else "log-spread units"
+    print(f"Total PnL:      {st['total_pnl']:+.4f}  ({units})")
     print(f"Profit factor:  {st['profit_factor']:.2f}")
-    print(f"Max DD:         {st['max_dd']:+.4f}")
-    print(f"DD / PnL:       {abs(st['max_dd'])/st['total_pnl']*100:.1f}%")
-    if not np.isnan(st["sharpe_full"]):
-        print(f"Sharpe (full):  {st['sharpe_full']:+.3f}   ← correct portfolio Sharpe")
-        print(f"Sharpe (exit):  {st['sharpe_exit']:+.3f}   (inflated; legacy metric)")
+    if stats is not None:
+        print(f"Capital:        {st['capital']:.1f}  ({st['n_pairs']} pairs × {CAPITAL_PER_PAIR} "
+              f"USD per $1 of leg-1 notional, constant)")
+        print(f"Sharpe:         {st['sharpe']:+.3f}   (daily mark-to-market returns on capital, "
+              f"every business day, √252)")
+        print(f"Ann. return:    {st['ann_return']*100:+.2f}%   Ann. vol: {st['ann_vol']*100:.2f}%")
+        print(f"Max DD:         {st['max_dd']*100:+.2f}% of capital  (date-ordered daily MTM equity; "
+              f"peak {st['max_dd_peak'].date()} → trough {st['max_dd_trough'].date()})")
     else:
-        print(f"Sharpe (exit):  {st['sharpe_exit']:+.3f}")
+        print(f"Max DD:         {st['max_dd']:+.4f}")
+        print(f"DD / PnL:       {abs(st['max_dd'])/st['total_pnl']*100:.1f}%")
+        if not np.isnan(st["sharpe_full"]):
+            print(f"Sharpe (full):  {st['sharpe_full']:+.3f}   ← correct portfolio Sharpe")
+            print(f"Sharpe (exit):  {st['sharpe_exit']:+.3f}   (inflated; legacy metric)")
+        else:
+            print(f"Sharpe (exit):  {st['sharpe_exit']:+.3f}")
     print(f"Exit reasons:   {st['exit_reasons']}")
 
     by_pair = tr.groupby("pair")["pnl"].agg(["count", "sum", "mean"]).sort_values("sum", ascending=False)
@@ -1149,6 +1194,16 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     windows (`continuous_trades`); cfg.legacy_window_reset runs the pre-T3
     per-window loop (`backtest_pair` per pair and window), which the other
     pre-T3 legacy flags (legacy_same_close, legacy_spread_pnl) require.
+
+    PnL series (audit T4): daily_pnl is the daily mark-to-market of the final
+    trades (after every filter that scales or drops trades) on every business
+    day from the first OOS start to max(last OOS end, last exit fill), zeros
+    on empty days — the sum over pairs of daily_pnl_pairs
+    (`mtm.daily_mtm_pairs`); daily_returns = daily_pnl / capital with
+    capital = len(pairs) × CAPITAL_PER_PAIR; stats = `run_stats`.
+    cfg.legacy_exit_date_pnl restores the exit-date booking over the panel's
+    OOS trading days and `trade_stats` (needed by legacy_spread_pnl, whose
+    spread PnL has no leg quantities to mark).
     """
     if cfg.exec_mode not in ("next_close", "vwap"):
         raise ValueError(f"cfg.exec_mode must be 'next_close' or 'vwap', not {cfg.exec_mode!r}")
@@ -1160,6 +1215,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         raise ValueError("cfg.legacy_same_close / cfg.legacy_spread_pnl describe the pre-T3 "
                          "per-window engine: use them with cfg.legacy_window_reset "
                          "(--legacy-window-reset)")
+    if cfg.legacy_spread_pnl and not cfg.legacy_exit_date_pnl:
+        raise ValueError("cfg.legacy_spread_pnl books the spread change, which has no leg "
+                         "quantities to mark to market daily: use it with "
+                         "cfg.legacy_exit_date_pnl (--legacy-exit-date-pnl)")
 
     if not cfg.legacy_stale_prints:
         # Audit T2: an exactly unchanged close with zero or missing volume is
@@ -1267,6 +1326,14 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                                "train includes the OOS start" if cfg.legacy_window_reset else
                                "one per pair across windows; β per window (train < OOS start) "
                                "for new entries; end of run → next close"))
+    capital = CAPITAL_PER_PAIR * len(pairs)
+    print("  booking:    " + ("LEGACY — each trade's PnL on its exit date; MaxDD over trades "
+                               "in table order" if cfg.legacy_exit_date_pnl else
+                               "daily mark-to-market of the legs (costs on the fill dates, "
+                               "borrow per held day), every business day of the OOS span"))
+    if not cfg.legacy_exit_date_pnl:
+        print(f"  capital:    {len(pairs)} pairs × {CAPITAL_PER_PAIR} USD per $1 of leg-1 notional "
+              f"= {capital:g} (constant); daily return = MTM PnL / capital")
     print()
 
     # Last date of the run's data: fills never use a row after cfg.end.
@@ -1507,11 +1574,20 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
 
     if not all_trades:
         no_trades = pd.DataFrame()
-        oos_idx = (closes.loc[windows[0][2]:windows[-1][3]].index if windows
-                   else pd.DatetimeIndex([]))
-        return WfoResult(trades=no_trades,
-                         daily_pnl=exit_date_daily_pnl(no_trades, oos_idx),
-                         stats=trade_stats(no_trades, len(windows), len(pairs)))
+        by_pair = None
+        if cfg.legacy_exit_date_pnl:
+            oos_idx = (closes.loc[windows[0][2]:windows[-1][3]].index if windows
+                       else pd.DatetimeIndex([]))
+            daily_pnl = exit_date_daily_pnl(no_trades, oos_idx)
+            stats = trade_stats(no_trades, len(windows), len(pairs))
+        else:
+            span = (pd.bdate_range(windows[0][2], windows[-1][3], name="Date") if windows
+                    else pd.DatetimeIndex([], name="Date"))
+            by_pair = pd.DataFrame(0.0, index=span, columns=list(pairs))
+            daily_pnl = portfolio_pnl(by_pair)
+            stats = run_stats(no_trades, len(windows), len(pairs), daily_pnl, capital)
+        return WfoResult(trades=no_trades, daily_pnl=daily_pnl, stats=stats,
+                         daily_returns=daily_pnl / capital, daily_pnl_pairs=by_pair)
 
     trades = pd.concat(all_trades, ignore_index=True)
     if cfg.legacy_window_reset:
@@ -1661,7 +1737,24 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             assert px.loc[g["entry_signal"]].notna().all().all()
             assert px.loc[g["entry"]].notna().all().all()
 
-    # exit-date booking over panel trading days; replaced by daily MTM over all business days in T4
-    daily_pnl = exit_date_daily_pnl(trades, oos_idx)
-    return WfoResult(trades=trades, daily_pnl=daily_pnl,
-                     stats=trade_stats(trades, len(windows), len(pairs), oos_idx))
+    # Audit T4: gross, cost and borrow are per unit size and no filter rescales
+    # them, so the final table's pnl is size·(gross − cost − borrow).
+    assert np.allclose(trades["pnl"], trades["size"] * (trades["gross"] - trades["cost"]
+                                                        - trades["borrow"]),
+                       rtol=1e-9, atol=1e-12)
+    by_pair = None
+    if cfg.legacy_exit_date_pnl:
+        # Legacy: each trade's PnL on its exit date over the panel's OOS days.
+        daily_pnl = exit_date_daily_pnl(trades, oos_idx)
+        stats = trade_stats(trades, len(windows), len(pairs), oos_idx)
+    else:
+        # Daily mark-to-market of the final trades, per pair and in total, over
+        # every business day of the OOS span (R2: holidays are zero days), to
+        # the last exit fill (R16).
+        span = pd.bdate_range(first_oos, max(windows[-1][3], trades["exit"].max()), name="Date")
+        by_pair = daily_mtm_pairs(trades, closes, span, pairs)
+        daily_pnl = portfolio_pnl(by_pair)
+        assert np.isclose(daily_pnl.sum(), trades["pnl"].sum(), rtol=1e-9, atol=1e-9)   # nothing dropped
+        stats = run_stats(trades, len(windows), len(pairs), daily_pnl, capital)
+    return WfoResult(trades=trades, daily_pnl=daily_pnl, stats=stats,
+                     daily_returns=daily_pnl / capital, daily_pnl_pairs=by_pair)

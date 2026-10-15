@@ -1,10 +1,12 @@
 """bootstrap_sharpe.py — stationary block-bootstrap CI on portfolio Sharpe.
 
-Method: Politis-Romano (1994) stationary block bootstrap on the daily-PnL
-series.  Block lengths are i.i.d. geometric with mean L, which preserves
-short-range serial dependence (typical for trade-overlap effects) while
-still resampling.  Run N replicates, compute Sharpe for each, report
-percentiles.
+Method: Politis-Romano (1994) stationary block bootstrap on the run's daily
+mark-to-market PnL (wfo_daily_mtm<tag>.csv, written by step3j_wfo_daily.py
+next to the trades file; audit T4; its Sharpe equals that of the daily
+returns on constant capital).  Block lengths are i.i.d. geometric with mean
+L, which preserves short-range serial dependence (typical for trade-overlap
+effects) while still resampling.  Run N replicates, compute Sharpe for
+each, report percentiles.
 
 Usage:
     python bootstrap_sharpe.py --trades data/wfo_daily_results_bias.csv \\
@@ -14,6 +16,8 @@ from __future__ import annotations
 import argparse
 import numpy as np
 import pandas as pd
+
+from mtm import LEGACY_LABEL, add_series_args, mtm_pnl
 
 
 def stationary_block_bootstrap(x: np.ndarray, mean_block_len: float,
@@ -54,12 +58,17 @@ def main():
     p.add_argument("--block",  type=float, default=5.0,
                    help="Mean block length in trading days (default 5).")
     p.add_argument("--seed",   type=int, default=42)
+    add_series_args(p)
     args = p.parse_args()
 
-    series = daily_pnl_series(args.trades, args.split, args.closes)
+    print(f"Bootstrap on {args.trades}")
+    if args.legacy_exit_date_pnl:
+        print(f"series: {LEGACY_LABEL}")
+        series = daily_pnl_series(args.trades, args.split, args.closes)
+    else:
+        series = mtm_pnl(args).loc[args.split:]
     x = series.values
     n = len(x)
-    print(f"Bootstrap on {args.trades}")
     print(f"  OOS daily series: {n} days, sum PnL = {x.sum():+.3f}")
     print(f"  point Sharpe    : {x.mean() / x.std() * np.sqrt(252):+.3f}")
     print(f"  block bootstrap : reps={args.reps}, mean_block={args.block} days")

@@ -1,7 +1,9 @@
 """stress_crisis_analysis.py — Phase-1 stress and crisis-period analysis.
 
 Slices the daily-WFO output by named crisis episodes, computes VaR/CVaR
-on the daily-PnL series, and reports tail behaviour.
+on the daily series, and reports tail behaviour.  The series is the run's
+daily mark-to-market PnL (wfo_daily_mtm<tag>.csv, written by
+step3j_wfo_daily.py next to the trades file; audit T4).
 
 Run after step3j_wfo_daily.py:
     python stress_crisis_analysis.py \\
@@ -15,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from mtm import LEGACY_LABEL, add_series_args, mtm_pnl
 
 # ─────────────────────── Crisis windows (named) ─────────────────────────────
 CRISIS_WINDOWS = [
@@ -71,12 +75,20 @@ def main():
     ap.add_argument("--closes", required=True)
     ap.add_argument("--split",  default="2014-12-31")
     ap.add_argument("--out",    default="output/stress_crisis_report.json")
+    add_series_args(ap)
     args = ap.parse_args()
 
-    closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
-    oos    = closes.loc[args.split:].index
     t      = pd.read_csv(args.trades, parse_dates=["entry", "exit"])
-    d_all  = daily_pnl(t, oos)
+    if args.legacy_exit_date_pnl:
+        print(f"series: {LEGACY_LABEL}")
+        closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
+        oos    = closes.loc[args.split:].index
+        d_all  = daily_pnl(t, oos)
+        units  = "log-spread units"
+    else:
+        d_all  = mtm_pnl(args).loc[args.split:]
+        oos    = d_all.index
+        units  = "USD per $1 of leg-1 notional"
 
     full_sharpe = d_all.mean() / d_all.std() * np.sqrt(252)
     print(f"{'='*92}")
@@ -114,7 +126,7 @@ def main():
         print(f"  {p*100:>7.1f}%{v:>+10.4f}")
 
     # VaR and CVaR
-    print("\n  Risk metrics (per-day, log-spread units):")
+    print(f"\n  Risk metrics (per-day, {units}):")
     daily_mean, daily_std = d_all.mean(), d_all.std()
     var_99   = d_all.quantile(0.01)
     var_999  = d_all.quantile(0.001)

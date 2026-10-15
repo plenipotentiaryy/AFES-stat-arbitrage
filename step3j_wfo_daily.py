@@ -14,7 +14,11 @@ backbone, each justified by an A/B comparison vs. this raw baseline.
 The engine lives in `wfo_daily_core.py` (`run_wfo_daily`); this file is the
 CLI: it reads data/, builds the `WfoConfig`, applies the headline-universe
 policy to the pair list (audit T2), prints the summary and the separate
-cross-listed table, and writes the trades CSV and the equity chart.
+cross-listed table, and writes the trades CSV, the daily mark-to-market
+series (wfo_daily_mtm<tag>.csv: Date, pnl, ret — audit T4; the input of
+bootstrap_sharpe / dashboard_daily / stress_crisis_analysis /
+factor_attribution), the per-pair daily MTM PnL (wfo_daily_mtm_pairs<tag>.csv,
+read by dashboard_daily) and the equity chart.
 
 CLI:
     python step3j_wfo_daily.py --pairs pairs_baseline14.csv
@@ -38,13 +42,20 @@ from wfo_daily_core import (
 )
 
 
-def save_equity_chart(tr: pd.DataFrame, path: Path):
+def save_equity_chart(tr: pd.DataFrame, path: Path, daily_returns: pd.Series | None = None):
+    """The date-ordered daily mark-to-market equity (cumulative daily returns
+    on capital, audit T4); without daily_returns (legacy exit-date booking)
+    the cumulative trade PnL by exit date."""
     if tr.empty:
         return
-    eq = tr.sort_values("exit")["pnl"].cumsum()
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(tr.sort_values("exit")["exit"].values, eq.values)
-    ax.set_title("Daily WFO — cumulative log-spread PnL")
+    if daily_returns is None:
+        eq = tr.sort_values("exit")["pnl"].cumsum()
+        ax.plot(tr.sort_values("exit")["exit"].values, eq.values)
+        ax.set_title("Daily WFO — cumulative log-spread PnL")
+    else:
+        ax.plot(daily_returns.index, daily_returns.cumsum().to_numpy() * 100)
+        ax.set_title("Daily WFO — daily mark-to-market equity (cumulative return, % of capital)")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(path)
@@ -182,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(positions still open at a window end are dropped; the training "
                         "slice includes the first OOS day). Needed by --legacy-same-close "
                         "and --legacy-spread-pnl. Comparison only; never for headline results.")
+    p.add_argument("--legacy-exit-date-pnl", action="store_true", dest="legacy_exit_date_pnl",
+                   help="LEGACY: book each trade's PnL on its exit date (daily PnL, Sharpe(full), "
+                        "Sharpe(exit)) and MaxDD over trades in table order, instead of the daily "
+                        "mark-to-market on constant capital; no MTM file is written. Needed by "
+                        "--legacy-spread-pnl. Comparison only; never for headline results.")
     p.add_argument("--legacy-cross-listed", action="store_true", dest="legacy_cross_listed",
                    help="LEGACY: keep the cross-listed pairs (fx_unaligned, ASX/TSE or "
                         "European legs) in the run; their numbers are NOT VALID. "
@@ -274,17 +290,19 @@ def main():
         return
     trades = result.trades
 
+    legacy_pnl = args.legacy_exit_date_pnl
     summarise(trades, label=f"NET {args.cost} bps/leg",
               n_windows=result.stats["n_windows"], n_pairs=len(run_pairs),
-              oos_index=result.daily_pnl.index)
+              oos_index=result.daily_pnl.index, stats=None if legacy_pnl else result.stats)
     if args.legacy_cross_listed:
         print("\n" + cross_listed_table(excluded, trades))
         cross = trades[trades["pair"].isin(excluded.index)]
         if not cross.empty:
             st = trade_stats(cross, result.stats["n_windows"], len(excluded), result.daily_pnl.index)
+            # The exit-date Sharpe(full) only with the legacy booking (rule 4: one Sharpe).
             print(f"  cross-listed block (LEGACY — NOT VALID): {st['n_trades']} trades, "
-                  f"win {st['win_rate']:.1%}, total PnL {st['total_pnl']:+.4f}, "
-                  f"Sharpe(full) {st['sharpe_full']:+.3f}")
+                  f"win {st['win_rate']:.1%}, total PnL {st['total_pnl']:+.4f}"
+                  + (f", Sharpe(full) {st['sharpe_full']:+.3f}" if legacy_pnl else ""))
     else:
         print("\n" + cross_listed_table(excluded))
 
@@ -292,8 +310,16 @@ def main():
     out_csv = DATA_DIR / f"wfo_daily_results{suffix}.csv"
     trades.to_csv(out_csv, index=False)
     chart = OUTPUT_DIR / f"wfo_daily_equity{suffix}.png"
-    save_equity_chart(trades, chart)
+    save_equity_chart(trades, chart, None if legacy_pnl else result.daily_returns)
     print(f"\nSaved → {out_csv} ({len(trades)} trades)")
+    if not legacy_pnl:
+        # Audit T4: the daily MTM series, the downstream scripts' input.
+        out_mtm = DATA_DIR / f"wfo_daily_mtm{suffix}.csv"
+        pd.DataFrame({"pnl": result.daily_pnl, "ret": result.daily_returns}).rename_axis("Date") \
+            .to_csv(out_mtm)
+        out_pairs = DATA_DIR / f"wfo_daily_mtm_pairs{suffix}.csv"
+        result.daily_pnl_pairs.rename_axis("Date").to_csv(out_pairs)
+        print(f"MTM    → {out_mtm} ({len(result.daily_pnl)} business days), per pair → {out_pairs}")
     print(f"Chart  → {chart}")
 
 

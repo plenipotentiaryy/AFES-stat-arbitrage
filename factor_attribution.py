@@ -6,8 +6,10 @@ returns to answer a basic but critical question:
     Is the backtest producing idiosyncratic spread alpha, or is it just a
     disguised exposure to market, sector, size, momentum, or rates factors?
 
-The dependent variable is the daily PnL series from a trade ledger.  The
-independent variables are daily log returns of available ETF proxies.
+The dependent variable is the run's daily mark-to-market PnL
+(wfo_daily_mtm<tag>.csv, written by step3j_wfo_daily.py next to the trades
+file; audit T4).  The independent variables are daily log returns of
+available ETF proxies.
 """
 from __future__ import annotations
 
@@ -18,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+
+from mtm import LEGACY_LABEL, add_series_args, mtm_pnl
 
 
 DEFAULT_FACTORS = [
@@ -61,7 +65,7 @@ def load_factor_returns(closes_path: str, factors: list[str]) -> pd.DataFrame:
 
 
 def fit_ols(y: pd.Series, x: pd.DataFrame):
-    aligned = pd.concat([y, x], axis=1).dropna()
+    aligned = pd.concat([y, x], axis=1, sort=True).dropna()   # union of the two calendars, by date
     if len(aligned) < max(60, x.shape[1] * 10):
         raise ValueError(f"Not enough aligned observations: {len(aligned)}")
     yy = aligned.iloc[:, 0]
@@ -88,10 +92,15 @@ def main() -> None:
     parser.add_argument("--factors", nargs="*", default=DEFAULT_FACTORS)
     parser.add_argument("--out", default="output/factor_attribution_report.json")
     parser.add_argument("--csv-out", default="data/factor_attribution_daily.csv")
+    add_series_args(parser)
     args = parser.parse_args()
 
     factor_ret = load_factor_returns(args.closes, args.factors)
-    y = load_daily_pnl(args.trades, factor_ret.index)
+    if args.legacy_exit_date_pnl:
+        print(f"series: {LEGACY_LABEL}")
+        y = load_daily_pnl(args.trades, factor_ret.index)
+    else:
+        y = mtm_pnl(args).rename("strategy_pnl")
     model, aligned = fit_ols(y, factor_ret)
 
     coefs = []

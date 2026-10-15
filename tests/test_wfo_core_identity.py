@@ -7,13 +7,14 @@ the same arguments, must reproduce every fixture byte for byte.  Later tasks
 run these cases with their legacy_* flags on (LEGACY_FLAGS), so the legacy
 path keeps reproducing the pre-audit code.
 
-The same inputs also run in the default (corrected) mode (audit T1, T2, T3):
+The same inputs also run in the default (corrected) mode (audit T1–T4):
 every fill on the pair's next row with genuine prints of both legs after its
-decision, nothing after cfg.end, one position per pair across windows, and
-the booked PnL rebuilt from the fill prices — the legs' prices with
-quantities fixed at the entry fill and β from the training rows before the
-OOS start (T2, T3), or, with legacy_spread_pnl on the per-window engine, the
-spread change between the fill dates (T1).
+decision, nothing after cfg.end, one position per pair across windows, the
+booked PnL rebuilt from the fill prices — the legs' prices with quantities
+fixed at the entry fill and β from the training rows before the OOS start
+(T2, T3), or, with legacy_spread_pnl on the per-window engine, the spread
+change between the fill dates (T1) — and daily_pnl the daily mark-to-market
+of the final trades (T4).
 """
 import contextlib
 import dataclasses
@@ -31,6 +32,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+import mtm  # noqa: E402
 from cross_listing import mask_stale_prints  # noqa: E402
 from step3j_wfo_daily import build_parser  # noqa: E402
 from wfo_daily_core import WfoConfig, estimate_beta, make_windows, run_wfo_daily  # noqa: E402
@@ -43,7 +45,8 @@ _spec.loader.exec_module(make_golden)
 # WfoConfig fields that select the pre-audit behaviour; each audit task adds
 # its legacy_* flag here.
 LEGACY_FLAGS: dict = {"legacy_same_close": True, "legacy_spread_pnl": True,
-                      "legacy_stale_prints": True, "legacy_window_reset": True}
+                      "legacy_stale_prints": True, "legacy_window_reset": True,
+                      "legacy_exit_date_pnl": True}
 # All of them off: the corrected defaults.
 DEFAULTS: dict = dict.fromkeys(LEGACY_FLAGS, False)
 # CLI options that are not WfoConfig fields: file IO, and the headline
@@ -113,7 +116,12 @@ def test_result_daily_pnl_and_stats_match_trades(legacy):
     assert set(tr["exit"].dt.normalize()) <= set(daily.index)
     assert res.stats["n_trades"] == len(tr)
     assert res.stats["total_pnl"] == tr["pnl"].sum()
-    assert res.stats["sharpe_full"] == daily.mean() / daily.std() * np.sqrt(252)
+    if legacy:                      # exit-date booking (legacy_exit_date_pnl)
+        assert res.stats["sharpe_full"] == daily.mean() / daily.std() * np.sqrt(252)
+    else:                           # T4: daily MTM returns on constant capital
+        ret = res.daily_returns
+        assert res.stats["sharpe"] == ret.mean() / ret.std() * np.sqrt(252)
+        assert res.stats["sharpe"] == pytest.approx(daily.mean() / daily.std() * np.sqrt(252))
 
 
 def test_cli_options_are_the_wfo_config_fields_with_same_defaults():
@@ -198,6 +206,25 @@ def test_default_mode_fills_on_the_pairs_next_row(case):
         assert (wx >= we).all()
     assert res.daily_pnl.sum() == pytest.approx(tr["pnl"].sum(), abs=1e-9)
     assert set(tr["exit"].dt.normalize()) <= set(res.daily_pnl.index)
+    # Daily mark-to-market (T4) of the final trades (after every filter that
+    # scales or drops trades): pnl = size·(gross − cost − borrow) with the
+    # per-unit columns; per trade the daily gross sums to gross and the daily
+    # net to pnl; daily_pnl = their sum over every business day of the span.
+    np.testing.assert_allclose(tr["pnl"], tr["size"] * (tr["gross"] - tr["cost"] - tr["borrow"]),
+                               rtol=1e-12, atol=1e-15)
+    for _, t in tr.iterrows():
+        m = mtm.trade_mtm(t, closes)
+        assert (m.index[0], m.index[-1]) == (t["entry"], t["exit"])
+        assert m["gross"].sum() == pytest.approx(t["gross"], abs=1e-12)
+        assert (t["size"] * (m["gross"] - m["cost"] - m["borrow"])).sum() == pytest.approx(t["pnl"], abs=1e-12)
+    span = pd.bdate_range(oos_s[0], max(oos_e[-1], tr["exit"].max()), name="Date")
+    assert res.daily_pnl.index.equals(span)
+    pd.testing.assert_series_equal(res.daily_pnl, mtm.daily_mtm(tr, closes, span))
+    # Per pair: every pair of the run on the same dates; the columns, added
+    # in order, are daily_pnl exactly.
+    by_pair = res.daily_pnl_pairs
+    assert set(by_pair.columns) == set(inp["pairs"]) and by_pair.index.equals(span)
+    np.testing.assert_array_equal(mtm.portfolio_pnl(by_pair), res.daily_pnl)
 
 
 @pytest.mark.parametrize("window,days_after", [(3, 0), (9, 0), (15, 0), (21, 0), (20, 1), (20, 3)],
@@ -236,7 +263,8 @@ def test_booked_pnl_is_rebuilt_from_the_fill_prices(exec_mode, pnl):
     inp = make_golden.case_inputs("vwap_exec")
     closes, vwap = inp["closes"], inp["vwap"]
     cfg = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0, exec_mode=exec_mode,
-                    legacy_spread_pnl=pnl == "spread", legacy_window_reset=pnl == "spread")
+                    legacy_spread_pnl=pnl == "spread", legacy_window_reset=pnl == "spread",
+                    legacy_exit_date_pnl=pnl == "spread")
     tr = run_quiet(closes, inp["pairs"], cfg, vwap=vwap).trades
     windows = make_windows(closes, cfg.train, cfg.oos, cfg.step)
     use_vwap = exec_mode == "vwap"

@@ -96,9 +96,12 @@ def test_position_open_at_a_window_cut_keeps_its_loss():
     assert (t["window_entered"], t["window_exited"]) == (1, 2)
     assert (t["window"], t["oos_start"]) == (1, OOS_S[0])
     assert t["pnl"] < -0.02
-    # The loss is in daily_pnl: on its exit fill date, and in the total.
-    assert res.daily_pnl.loc[t["exit"]] == pytest.approx(
-        res.trades.loc[res.trades["exit"] == t["exit"], "pnl"].sum(), abs=1e-15)
+    # The loss is in daily_pnl, marked to market day by day (T4): the one
+    # pair's daily PnL from the entry to the exit fill is this trade's, and
+    # most of the loss is booked before the exit date.
+    held = res.daily_pnl.loc[t["entry"]:t["exit"]]
+    assert held.sum() == pytest.approx(t["pnl"], abs=1e-12)
+    assert held.loc[:t["exit_signal"]].sum() < 0.5 * t["pnl"]
     assert res.daily_pnl.sum() == pytest.approx(res.trades["pnl"].sum(), abs=1e-12)
     # PnL from the leg fills, quantities fixed at the entry fill (T2).
     p1e, p2e = closes.loc[t["entry"]]
@@ -179,7 +182,10 @@ def test_pre_t3_legacy_flags_need_the_window_reset(flag):
     closes = panel("2020-09-28")
     with pytest.raises(ValueError, match="legacy_window_reset"):
         run(closes, replace(GROSS, **{flag: True}))
-    run(closes, replace(GROSS, legacy_window_reset=True, **{flag: True}))
+    # (spread PnL has no leg quantities to mark daily: it also needs the
+    # exit-date booking, T4)
+    run(closes, replace(GROSS, legacy_window_reset=True, **{flag: True},
+                        legacy_exit_date_pnl=flag == "legacy_spread_pnl"))
 
 
 # ── Engine level ────────────────────────────────────────────────────────────

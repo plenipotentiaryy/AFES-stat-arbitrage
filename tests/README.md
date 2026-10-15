@@ -27,18 +27,21 @@ synthetic data whose true edge is known.
 | `test_diag_stale_entries.py` | `diag_stale_entries.py` on hand-made prices and the async holiday dataset (T2) |
 | `test_headline_universe.py` | the CLI's headline-universe filter and cross-listed table (T2) |
 | `test_continuous_positions.py` | one position per pair across windows, β per window for new entries, end-of-run close (T3) |
+| `test_daily_mtm.py` | daily mark-to-market PnL, capital, the one Sharpe, date-ordered MaxDD; the downstream scripts read the MTM file (T4) |
 
 ### Variants
 
 `placebo_harness.VARIANTS`: `legacy` = the gross config with every `legacy_*`
 flag on (T1: `legacy_same_close`, the pre-audit same-close fills; T2:
 `legacy_spread_pnl`, `legacy_stale_prints`; T3: `legacy_window_reset`, the
-per-window engine) and the legacy async panel builder
+per-window engine; T4: `legacy_exit_date_pnl`, PnL booked on exit dates) and
+the legacy async panel builder
 `build_async_panel` (local prints forward-filled onto the US calendar,
 converted with the daily FX close); `fixed` = the gross config with the
 corrected defaults (T1: an order decided at close t fills at close t+1; T2:
 stale prints masked, no entry on a zero-return day, PnL from the leg fills;
-T3: one continuous position per pair across windows) and
+T3: one continuous position per pair across windows; T4: `daily_pnl` = the
+daily mark-to-market of the trades over every business day) and
 `build_async_panel_fixed` (each local print converted with the grid FX at
 its own close, on the union calendar, NaN on local holidays).
 
@@ -122,7 +125,8 @@ its own close, on the union calendar, NaN on local holidays).
   (not filled), `decision_end` (no decision on fill-only bars) and the VWAP path.
 - **Identity** (`test_wfo_core_identity.py`): `run_wfo_daily` with
   `LEGACY_FLAGS` (`legacy_same_close`, T1; `legacy_spread_pnl` and
-  `legacy_stale_prints`, T2; `legacy_window_reset`, T3) reproduces the
+  `legacy_stale_prints`, T2; `legacy_window_reset`, T3; `legacy_exit_date_pnl`,
+  T4) reproduces the
   trades CSV of `step3j_wfo_daily.py` at commit 46ffdfb on 26 small synthetic
   cases that cover every CLI option, compared on the fixture's columns (later
   tasks add columns; the legacy `entry_signal` / `exit_signal` equal `entry` /
@@ -146,7 +150,11 @@ its own close, on the union calendar, NaN on local holidays).
   `window_entered`, `window_exited` is the latest-starting window whose OOS
   has begun on the exit decision date (≥ `window_entered`), an `end_of_data`
   close is decided on the pair's last row up to the last OOS end, and
-  `daily_pnl` holds every trade's PnL. With `cfg.end` set, the run on the
+  `daily_pnl` holds every trade's PnL — since T4 it is the daily
+  mark-to-market of the final trades over `pd.bdate_range(first OOS start,
+  max(last OOS end, last exit fill))`, each trade's daily gross summing to
+  its `gross` and its daily net to its `pnl`, and pnl = size·(gross − cost −
+  borrow) after every filter. With `cfg.end` set, the run on the
   full panel equals the run on the panel cut at `cfg.end` (the fill-only bar
   never lies after it, Ruling R15). With zero costs, each trade's PnL is
   rebuilt from its fill prices, in `next_close` and `vwap` mode: by default
@@ -158,7 +166,8 @@ its own close, on the union calendar, NaN on local holidays).
   on a hand-made two-leg panel (zero costs): the acceptance case — a short
   spread decided on the last days of window 1, open at the cut, stopped out
   in window 2 at a loss: it is in `trades` (`window_entered` 1,
-  `window_exited` 2, PnL from the leg fills) and in `daily_pnl`; it keeps
+  `window_exited` 2, PnL from the leg fills) and in `daily_pnl` (since T4
+  marked to market: most of the loss is booked before the exit); it keeps
   β of window 1 (β1 ≠ β2) and exits on the rolling z of log PA − β1·log PB;
   window 2's z is above ENTRY_Z while it is open, yet no second position
   opens (the per-window reset opens one and drops the window-1 trade); new
@@ -179,19 +188,66 @@ its own close, on the union calendar, NaN on local holidays).
   before the last window: its end-of-run close is labelled with the window
   of its last decision row.
 
+- **Daily mark-to-market** (`test_daily_mtm.py`, T4).  Trade level
+  (`mtm.trade_mtm` / `mtm.daily_mtm`, hand-made two-leg trades): the
+  acceptance case — long the spread PA − PB with β = 1 (2.0 USD of capital,
+  one pair), −5% of capital at mid-life (PA −5%, PB +5%), exit at +1%:
+  `mtm_stats` MaxDD −5% (peak and trough dates), while the exit-date
+  booking's trade-order MaxDD is 0; the equity curve starts at 0 (a loss on
+  the first day is a drawdown); half the round-trip cost on each fill date,
+  borrow on each held row, size scaling, Σ daily gross = gross and Σ daily
+  net = pnl; VWAP fills (entry day marked from the VWAP to the close, exit
+  day from the close to the exit VWAP); a leg without a print on a date
+  books only the other leg that date, no borrow, and its next print carries
+  its move; a held-0 round trip books only its costs; the portfolio is the
+  sum of the trades, and a date with PnL outside the index or a panel whose
+  rows do not match the trade's `held` is refused.  Run level (OU panel,
+  flat costs): `daily_pnl` = `daily_mtm` of the final trades on the business
+  days of the span, `daily_returns` = `daily_pnl` / capital, `stats`
+  (capital, sharpe, ann_return, ann_vol, max_dd and its dates; no
+  `sharpe_full` / `sharpe_exit`), `daily_pnl_pairs` (every pair of the run;
+  its columns, added in order, are `daily_pnl` exactly);
+  `legacy_exit_date_pnl` restores the exit-date `daily_pnl` and
+  `trade_stats` exactly; `legacy_spread_pnl`
+  without it raises `ValueError`; the summary prints the MTM figures and no
+  exit-day Sharpe.  Downstream (the CLI in a temp run dir on a synthetic
+  panel): it writes `wfo_daily_mtm_<tag>.csv` (Date, pnl, ret) and
+  `wfo_daily_mtm_pairs_<tag>.csv` (Date × pairs, summing to the portfolio
+  pnl exactly), and `bootstrap_sharpe.py`, `stress_crisis_analysis.py`,
+  `factor_attribution.py` and `dashboard_daily.py` read them (point Sharpe,
+  VaR, crisis drawdowns, regression input, dashboard Sharpe / maxDD); the
+  dashboard's per-pair and sub-block Sharpe ratios come from the per-pair
+  file (no exit-date Sharpe appears; without the file "—"); without the MTM
+  file each script stops (`SystemExit`), with `--legacy-exit-date-pnl` each
+  runs and labels its output "LEGACY exit-date booking"; an MTM file that
+  does not sum to the trades file (or a per-pair file that does not match)
+  stops them ("does not match").
+
 ### Statistic definitions
 
 - **Sharpe per seed** = `daily_pnl.mean() / daily_pnl.std() * sqrt(252)` on
   `WfoResult.daily_pnl` (pandas std, ddof = 1; 0.0 if the std is 0 or NaN).
-  At T0 `daily_pnl` books each trade's PnL on its exit date, zeros on the other
-  OOS trading days (since T1 `exit` is the exit fill date, `exit_signal` the
-  decision date); T4 replaces it with daily mark-to-market over all business days.
+  Until T3 `daily_pnl` booked each trade's PnL on its exit date, zeros on the
+  other OOS trading days of the panel (since T1 `exit` is the exit fill date,
+  `exit_signal` the decision date).  Since T4 it is the daily mark-to-market
+  PnL of the positions (`mtm.daily_mtm`) on every business day from the first
+  OOS start to max(last OOS end, last exit fill), zeros on empty days and
+  holidays — the one Sharpe definition (hard rule 4; `legacy` keeps the
+  exit-date booking, `legacy_exit_date_pnl`).
+- **Capital** (T4 ruling): constant, number of pairs in the run ×
+  `mtm.CAPITAL_PER_PAIR` = 2.0 USD per $1 of leg-1 notional (a pair with
+  |β| = 1 holds $1 long and $1 short).  `WfoResult.daily_returns` =
+  `daily_pnl` / capital; `stats["sharpe"]` = mean / std · √252 of the daily
+  returns (the same number as on `daily_pnl`: Sharpe does not depend on the
+  constant); `stats["max_dd"]` = deepest fall of the date-ordered equity
+  curve (cumulative daily returns, starting at 0) below its running peak, as
+  a fraction of capital; `ann_return` = mean · 252, `ann_vol` = std · √252.
 - **Mean Sharpe ± SE**: average over seeds; SE = sample std over seeds / √(seeds).
 - **Per-trade t-stat** = mean / (std / √n) (sample std) of `trades["pnl"]`
   pooled over all seeds of a dataset. It is a t-statistic, not a Sharpe.
 - **Win rate**: share of pooled trades with pnl > 0.
 
-### Expected outcomes (measured at T3)
+### Expected outcomes (measured at T4)
 
 | test (null: mean Sharpe and per-trade t-stat) | `legacy` | `fixed` |
 |---|---|---|
@@ -199,10 +255,10 @@ its own close, on the union calendar, NaN on local holidays).
 | null, `async_lag4.5_hol0` | strict xfail | pass (since T3; passed at T1, failed at T2) |
 | null, `async_lag15_hol0` | strict xfail | pass (since T1) |
 | null, `async_lag4.5_hol5`, `async_lag15_hol5` | strict xfail | pass (since T2) |
-| OU positive control | — | pass (+6.68) |
+| OU positive control | — | pass (+6.62; +6.68 at T3 on exit-date booking) |
 | truncation invariance (3 datasets) | pass | pass |
 
-The measured numbers are in `AUDIT_FIX_LOG.md` (T0–T3). Until T2 the
+The measured numbers are in `AUDIT_FIX_LOG.md` (T0–T4). Until T2 the
 per-window engine dropped every position still open at a window end: on
 `independent_rw` those were losers (5541 positions, mean mark-to-market at
 the cut −195 bp, t = −25.3), which made the closed trades show +0.76 Sharpe
@@ -240,3 +296,6 @@ mask, entry guard, leg prices), the pool ≈ 51 s; the T2 tests add ≈ 6 s.
 At T3 ≈ 50–55 s: the continuous engine makes one pass per pair instead of one
 per pair and window (`independent_rw` seed 0, best of 5: 0.29 s vs 1.16 s
 for the per-window engine), the pool ≈ 35 s; the T3 tests add ≈ 1 s.
+At T4 ≈ 50 s: the daily mark-to-market adds ≈ 0.02 s per run (`independent_rw`
+seed 0, best of 5: 0.297 s vs 0.276 s with `legacy_exit_date_pnl`); the T4
+tests add ≈ 3 s.

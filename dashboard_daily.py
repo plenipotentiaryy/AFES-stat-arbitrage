@@ -4,6 +4,18 @@ Produces a single 6-panel PNG covering equity curve, drawdown, monthly
 returns heatmap, per-pair Sharpe ranking, trade-count by year, and
 sub-block (cross-listing / non-cross) decomposition.
 
+Series (audit T4): the run's daily mark-to-market files, written by
+step3j_wfo_daily.py next to the trades file — wfo_daily_mtm<tag>.csv for
+the portfolio (headline Sharpe and maxDD, combined equity, drawdown,
+monthly heatmap, "Combined" row) and wfo_daily_mtm_pairs<tag>.csv for the
+per-pair ranking and the sub-blocks.  Every Sharpe is the one definition:
+daily MTM returns on constant capital (pairs × 2.0 USD per $1 of leg-1
+notional, a block: its pairs × 2.0), mean / std · √252; every drawdown is
+the date-ordered equity starting at 0, in % of capital (`mtm.mtm_stats`).
+Without the per-pair file the per-pair and sub-block items show trades and
+PnL only.  --legacy-exit-date-pnl: the pre-audit exit-date booking, labelled
+LEGACY.
+
 CLI:
     python dashboard_daily.py --trades data/wfo_daily_results_fullrun.csv \\
         --closes data/closes_daily_extended_v2.csv --split 2014-12-31 \\
@@ -20,6 +32,9 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
 
+from mtm import (CAPITAL_PER_PAIR, LEGACY_LABEL, add_series_args, load_mtm, load_mtm_pairs,
+                 mtm_path, mtm_stats, portfolio_pnl)
+
 
 def daily_series(trades: pd.DataFrame, oos_days: pd.DatetimeIndex) -> pd.Series:
     d = trades.set_index("exit")["pnl"].groupby(level=0).sum()
@@ -32,69 +47,120 @@ def sharpe(d: pd.Series) -> float:
     return float(d.mean() / d.std() * np.sqrt(252))
 
 
+def block_returns(by_pair: pd.DataFrame | None, in_block) -> pd.Series | None:
+    """Daily MTM return of the block of pairs `in_block(pair)` on its own
+    capital (its pairs × CAPITAL_PER_PAIR); None without the per-pair file
+    or pairs."""
+    if by_pair is None:
+        return None
+    cols = [p for p in by_pair.columns if in_block(p)]
+    if not cols:
+        return None
+    return portfolio_pnl(by_pair[cols]) / (len(cols) * CAPITAL_PER_PAIR)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trades", required=True)
     ap.add_argument("--closes", required=True)
     ap.add_argument("--split",  default="2014-12-31")
     ap.add_argument("--out",    default="output/dashboard_daily.png")
+    ap.add_argument("--mtm-pairs", default=None,
+                    help="Per-pair daily MTM file of the run; default: the --trades path with "
+                         "wfo_daily_results → wfo_daily_mtm_pairs.  Missing: the per-pair and "
+                         "sub-block items show trades and PnL only.")
+    add_series_args(ap)
     args = ap.parse_args()
 
-    closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
-    oos = closes.loc[args.split:].index
     t = pd.read_csv(args.trades, parse_dates=["entry", "exit"])
-
-    # ── Aggregate metrics ─────────────────────────────────────────────────
-    d_all = daily_series(t, oos)
-    eq = d_all.cumsum()
-    dd = eq - eq.cummax()
-
-    sh   = sharpe(d_all)
-    pnl  = float(t.pnl.sum())
-    n_tr = len(t)
-    win  = (t.pnl > 0).mean() * 100
-    pf   = float(t[t.pnl > 0].pnl.sum() / abs(t[t.pnl < 0].pnl.sum())) if (t.pnl < 0).any() else float("inf")
-    mdd  = float(dd.min())
+    legacy = args.legacy_exit_date_pnl
+    texts = []                     # titles, legend labels and table rows, also printed
 
     # Cross-listing decomposition
     CROSS = {p for p in t.pair.unique() if "_USD" in p}
     t_cr  = t[t.pair.isin(CROSS)]
     t_nc  = t[~t.pair.isin(CROSS)]
-    d_cr  = daily_series(t_cr, oos)
-    d_nc  = daily_series(t_nc, oos)
+    SUB = {
+        "Canadian dual": {"RY-RY.TO_USD","TD-TD.TO_USD","BNS-BNS.TO_USD","ENB-ENB.TO_USD","SU-SU.TO_USD"},
+        "European ADR":  {"SAP-SAP.DE_USD","SNY-SAN.PA_USD","NVS-NOVN.SW_USD"},
+        "Aussie ADR":    {"BHP-BHP.AX_USD","RIO-RIO.AX_USD"},
+    }
+
+    # ── Aggregate metrics ─────────────────────────────────────────────────
+    if legacy:
+        print(f"series: {LEGACY_LABEL}")
+        closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
+        oos = closes.loc[args.split:].index
+        d_all = daily_series(t, oos)
+        eq = d_all.cumsum()
+        dd = eq - eq.cummax()
+        sh, mdd = sharpe(d_all), float(dd.min())
+        d_cr, d_nc = daily_series(t_cr, oos), daily_series(t_nc, oos)
+        curves = [("Cross-listing", d_cr.cumsum(), sharpe(d_cr)),
+                  ("Non-cross", d_nc.cumsum(), sharpe(d_nc))]
+        units, scale, mdd_text = "log-spread units", 1.0, f"{mdd:+.3f}"
+        booking = "LEGACY exit-date booking"
+    else:
+        m = load_mtm(args)
+        by_pair = load_mtm_pairs(args.mtm_pairs or mtm_path(args.trades, "wfo_daily_mtm_pairs"),
+                                 t, m["pnl"])
+        if by_pair is not None:
+            by_pair = by_pair.loc[args.split:]
+        d_all = m["ret"].loc[args.split:]            # daily return on the run's capital
+        oos = d_all.index
+        st = mtm_stats(d_all, 1.0)
+        sh, mdd = st["sharpe"], st["max_dd"]
+        eq = d_all.cumsum()
+        dd = eq - eq.cummax().clip(lower=0.0)        # the equity starts at 0 (mtm_stats)
+        curves = []
+        for name, in_block in [("Cross-listing", lambda p: "_USD" in p),
+                               ("Non-cross", lambda p: "_USD" not in p)]:
+            r = block_returns(by_pair, in_block)
+            if r is not None:
+                curves.append((name, r.cumsum(), mtm_stats(r, 1.0)["sharpe"]))
+        units, scale, mdd_text = "% of capital", 100.0, f"{mdd * 100:+.2f}%"
+        booking = "daily mark-to-market"
+
+    pnl  = float(t.pnl.sum())
+    n_tr = len(t)
+    win  = (t.pnl > 0).mean() * 100
+    pf   = float(t[t.pnl > 0].pnl.sum() / abs(t[t.pnl < 0].pnl.sum())) if (t.pnl < 0).any() else float("inf")
 
     # ── Layout ────────────────────────────────────────────────────────────
     fig = plt.figure(figsize=(20, 13))
     gs  = gridspec.GridSpec(3, 3, hspace=0.40, wspace=0.30,
                               left=0.05, right=0.98, top=0.94, bottom=0.06)
-    fig.suptitle(
-        f"AFES v2 — Daily WFO Dashboard   |   OOS {oos.min().date()} → {oos.max().date()}   |   "
-        f"Sharpe={sh:+.3f}   PnL={pnl:+.2f}   trades={n_tr}   win={win:.1f}%   PF={pf:.2f}   maxDD={mdd:+.3f}",
-        fontsize=13, y=0.985,
-    )
+    title = (f"AFES v2 — Daily WFO Dashboard   |   OOS {oos.min().date()} → {oos.max().date()}   |   "
+             f"Sharpe={sh:+.3f}   PnL={pnl:+.2f}   trades={n_tr}   win={win:.1f}%   PF={pf:.2f}   "
+             f"maxDD={mdd_text}   |   {booking}")
+    fig.suptitle(title, fontsize=13, y=0.985)
+    print(f"Sharpe={sh:+.3f}   maxDD={mdd_text}   ({booking})")
 
     # ─── Panel 1: Equity curve (combined + sub-blocks)
     ax = fig.add_subplot(gs[0, :2])
-    ax.plot(eq.index, eq.values, lw=1.6, color="#1f77b4", label=f"Combined (S={sh:+.2f})")
-    ax.plot(d_cr.cumsum().index, d_cr.cumsum().values, lw=1.2, color="#2ca02c",
-             label=f"Cross-listing (S={sharpe(d_cr):+.2f})", alpha=0.8)
-    ax.plot(d_nc.cumsum().index, d_nc.cumsum().values, lw=1.2, color="#ff7f0e",
-             label=f"Non-cross (S={sharpe(d_nc):+.2f})", alpha=0.8)
+    ax.plot(eq.index, eq.values * scale, lw=1.6, color="#1f77b4", label=f"Combined (S={sh:+.2f})")
+    texts.append(f"legend: Combined (S={sh:+.2f})")
+    for name, curve, s in curves:
+        color = "#2ca02c" if name == "Cross-listing" else "#ff7f0e"
+        ax.plot(curve.index, curve.values * scale, lw=1.2, color=color,
+                label=f"{name} (S={s:+.2f})", alpha=0.8)
+        texts.append(f"legend: {name} (S={s:+.2f})")
     ax.set_title("Equity curve — combined vs sub-blocks", fontsize=11)
-    ax.set_ylabel("Cumulative PnL (log-spread units)")
+    ax.set_ylabel(f"Cumulative PnL ({units})" if legacy else
+                  "Cumulative return (% of capital; a block: % of its own capital)")
     ax.legend(loc="upper left", fontsize=9)
     ax.grid(alpha=0.3)
 
     # ─── Panel 2: Drawdown
     ax = fig.add_subplot(gs[0, 2])
-    ax.fill_between(dd.index, dd.values, 0, color="#d62728", alpha=0.6)
-    ax.set_title(f"Drawdown (max = {mdd:+.3f})", fontsize=11)
-    ax.set_ylabel("Underwater (log-units)")
+    ax.fill_between(dd.index, dd.values * scale, 0, color="#d62728", alpha=0.6)
+    ax.set_title(f"Drawdown (max = {mdd_text})", fontsize=11)
+    ax.set_ylabel("Underwater (log-units)" if legacy else "Underwater (% of capital)")
     ax.grid(alpha=0.3)
 
     # ─── Panel 3: Monthly returns heatmap
     ax = fig.add_subplot(gs[1, 0:2])
-    monthly = d_all.resample("ME").sum().to_frame("pnl")
+    monthly = (d_all * scale).resample("ME").sum().to_frame("pnl")
     monthly["year"]  = monthly.index.year
     monthly["month"] = monthly.index.month
     pivot = monthly.pivot(index="year", columns="month", values="pnl")
@@ -111,7 +177,8 @@ def main():
             if pd.notna(v):
                 ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=7,
                          color="black" if abs(v) < pivot.abs().max().max() * 0.6 else "white")
-    ax.set_title("Monthly PnL heatmap", fontsize=11)
+    ax.set_title("Monthly PnL heatmap" if legacy else "Monthly return heatmap (% of capital)",
+                 fontsize=11)
     fig.colorbar(im, ax=ax, fraction=0.025)
 
     # ─── Panel 4: Trades by year
@@ -128,28 +195,38 @@ def main():
 
     # ─── Panel 5: Per-pair Sharpe ranking
     ax = fig.add_subplot(gs[2, :2])
-    pair_sharpes = {}
-    for p in t.pair.unique():
-        dp = daily_series(t[t.pair == p], oos)
-        pair_sharpes[p] = sharpe(dp)
-    ps = pd.Series(pair_sharpes).sort_values()
+    if legacy:
+        ps = pd.Series({p: sharpe(daily_series(t[t.pair == p], oos)) for p in t.pair.unique()})
+        title5, xlabel5 = "Per-pair Sharpe (green = cross-listing, blue = non-cross)", "Sharpe"
+    elif by_pair is not None:
+        ps = pd.Series({p: mtm_stats(by_pair[p], CAPITAL_PER_PAIR)["sharpe"] for p in t.pair.unique()})
+        title5 = "Per-pair Sharpe, daily MTM (green = cross-listing, blue = non-cross)"
+        xlabel5 = "Sharpe"
+    else:
+        ps = t.groupby("pair")["pnl"].sum()
+        title5 = ("Per-pair total trade PnL — no per-pair MTM file, no Sharpe "
+                  "(green = cross-listing, blue = non-cross)")
+        xlabel5 = "Total PnL (USD per $1 of leg-1 notional)"
+    ps = ps.sort_values()
     colors = ["#2ca02c" if p in CROSS else "#1f77b4" for p in ps.index]
     ax.barh(range(len(ps)), ps.values, color=colors, alpha=0.8)
     ax.set_yticks(range(len(ps)))
     ax.set_yticklabels(ps.index, fontsize=7)
     ax.axvline(0, color="k", lw=0.5)
-    ax.set_title("Per-pair Sharpe (green = cross-listing, blue = non-cross)", fontsize=11)
-    ax.set_xlabel("Sharpe")
+    ax.set_title(title5, fontsize=11)
+    ax.set_xlabel(xlabel5)
     ax.grid(alpha=0.3, axis="x")
+    texts.append(f"panel 5: {title5}: " + ", ".join(f"{p} {v:+.3f}" for p, v in ps.items()))
 
     # ─── Panel 6: Sub-block summary table
     ax = fig.add_subplot(gs[2, 2])
     ax.axis("off")
 
-    def block_stats(grp, label):
+    def block_stats(grp, label, ds=None):
         if len(grp) == 0:
             return [label, "0", "+0.00", "+0.00", "0.0%"]
-        ds = daily_series(grp, oos)
+        if ds is None:
+            ds = daily_series(grp, oos)
         eqs = ds.cumsum()
         return [
             label,
@@ -159,16 +236,30 @@ def main():
             f"{(eqs - eqs.cummax()).min():+.3f}",
         ]
 
-    SUB = {
-        "Canadian dual": {"RY-RY.TO_USD","TD-TD.TO_USD","BNS-BNS.TO_USD","ENB-ENB.TO_USD","SU-SU.TO_USD"},
-        "European ADR":  {"SAP-SAP.DE_USD","SNY-SAN.PA_USD","NVS-NOVN.SW_USD"},
-        "Aussie ADR":    {"BHP-BHP.AX_USD","RIO-RIO.AX_USD"},
-    }
+    def mtm_block_stats(grp, label, ret):
+        """Trades and PnL from the trades; Sharpe and MaxDD (% of the block's
+        capital) from its daily MTM returns, "—" without them."""
+        if ret is None:
+            return [label, f"{len(grp)}", f"{grp.pnl.sum():+.2f}", "—", "—"]
+        bs = mtm_stats(ret, 1.0)
+        return [label, f"{len(grp)}", f"{grp.pnl.sum():+.2f}", f"{bs['sharpe']:+.2f}",
+                f"{bs['max_dd'] * 100:+.2f}%"]
+
     rows = [["Block", "Trades", "PnL", "Sharpe", "MaxDD"]]
-    for name, ps_set in SUB.items():
-        rows.append(block_stats(t[t.pair.isin(ps_set)], name))
-    rows.append(block_stats(t_nc, "Non-cross (26)"))
-    rows.append(block_stats(t,    "Combined"))
+    if legacy:
+        for name, ps_set in SUB.items():
+            rows.append(block_stats(t[t.pair.isin(ps_set)], name))
+        rows.append(block_stats(t_nc, "Non-cross (26)"))
+        rows.append(block_stats(t,    "Combined", d_all))
+        title6 = f"Sub-block decomposition; {booking}"
+    else:
+        for name, ps_set in SUB.items():
+            rows.append(mtm_block_stats(t[t.pair.isin(ps_set)], name,
+                                        block_returns(by_pair, ps_set.__contains__)))
+        rows.append(mtm_block_stats(t_nc, "Non-cross (26)",
+                                    block_returns(by_pair, lambda p: "_USD" not in p)))
+        rows.append(mtm_block_stats(t, "Combined", d_all))
+        title6 = "Sub-block decomposition (daily MTM; MaxDD % of the block's capital)"
 
     tbl = ax.table(cellText=rows[1:], colLabels=rows[0], loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
@@ -177,11 +268,13 @@ def main():
     for j in range(len(rows[0])):
         tbl[(0, j)].set_facecolor("#cccccc")
         tbl[(0, j)].set_text_props(weight="bold")
-    ax.set_title("Sub-block decomposition", fontsize=11, y=0.92)
+    ax.set_title(title6, fontsize=11, y=0.92)
+    texts += [f"panel 6: {title6}"] + ["table: " + " | ".join(r) for r in rows]
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    print("\n".join(texts))
     print(f"Dashboard → {out_path}  ({out_path.stat().st_size/1024:.0f}KB)")
 
 
