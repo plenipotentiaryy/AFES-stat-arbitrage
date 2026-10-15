@@ -33,6 +33,7 @@ synthetic data whose true edge is known.
 | `test_holdout_trials.py` | the final-holdout guard (core and CLI), `HOLDOUT_USES.md`, the `TRIALS.csv` registry and the CLI's SR / PSR(0) / DSR / N lines, the back-fill's per-trial Sharpe (T6) |
 | `test_entry_guards.py` | the entry window entry_z < \|z\| < stop_z in both engines, the vol-tight stop, `legacy_no_entry_guards`; the T2 structural guards pinned: genuine prints on the signal date, a z window without no-print days (T7) |
 | `test_position_costs.py` | costs per fill per leg on the leg notionals (round trip 2·(c + s)·(1 + \|β\|)), FX on `*_USD` legs, borrow on the short legs' marked notional (US / non-US / tier rate), the MTM schedule, `legacy_flat_cost`, the conservative default model, the run header and the `wfo_daily_meta<tag>.json` sidecar (T8) |
+| `test_remaining_lookahead.py` | remaining look-ahead (T9): per-window training rows strictly before the OOS start, the Kalman prior β and the entry z of the trade's own spread (R28), the causal forward-filtered macro HMM on a US-close proxy, truncation invariance of every optional flag (cut and different future), causal sizing of `--volvol` / `--pairmom` / `--voltarget`, `--metagate` / `--hrp` refused in a headline run, VWAP fills refused on the `--kalman` / `--vwz` paths |
 | `conftest.py` | session-wide: points the CLI's `TRIALS_FILE` / `HOLDOUT_USES_FILE` to a temp dir, so no test writes the committed repo-root files (T6) |
 
 ### Variants
@@ -42,7 +43,9 @@ flag on (T1: `legacy_same_close`, the pre-audit same-close fills; T2:
 `legacy_spread_pnl`, `legacy_stale_prints`; T3: `legacy_window_reset`, the
 per-window engine; T4: `legacy_exit_date_pnl`, PnL booked on exit dates; T7:
 `legacy_no_entry_guards`, any |z| > entry_z enters; T8: `legacy_flat_cost`,
-one round trip per trade whatever |β|) and
+one round trip per trade whatever |β|; T9: `legacy_kalman_posterior`,
+`legacy_hmm_viterbi`, `legacy_sizing_lookahead` — no effect on the placebo,
+whose gross config uses none of those paths) and
 the legacy async panel builder
 `build_async_panel` (local prints forward-filled onto the US calendar,
 converted with the daily FX close); `fixed` = the gross config with the
@@ -51,7 +54,7 @@ stale prints masked, no entry on a zero-return day, PnL from the leg fills;
 T3: one continuous position per pair across windows; T4: `daily_pnl` = the
 daily mark-to-market of the trades over every business day; T7: an entry
 only if entry_z < |z| < stop_z; T8: costs per fill per leg — all zero in the
-gross config) and
+gross config; T9: no change on the static-β path) and
 `build_async_panel_fixed` (each local print converted with the grid FX at
 its own close, on the union calendar, NaN on local holidays).
 
@@ -137,7 +140,9 @@ its own close, on the union calendar, NaN on local holidays).
 - **Identity** (`test_wfo_core_identity.py`): `run_wfo_daily` with
   `LEGACY_FLAGS` (`legacy_same_close`, T1; `legacy_spread_pnl` and
   `legacy_stale_prints`, T2; `legacy_window_reset`, T3; `legacy_exit_date_pnl`,
-  T4; `legacy_no_entry_guards`, T7; `legacy_flat_cost`, T8) reproduces the
+  T4; `legacy_no_entry_guards`, T7; `legacy_flat_cost`, T8;
+  `legacy_kalman_posterior`, `legacy_hmm_viterbi` and `legacy_sizing_lookahead`,
+  T9) reproduces the
   trades CSV of `step3j_wfo_daily.py` at commit 46ffdfb on 26 small synthetic
   cases that cover every CLI option, compared on the fixture's columns (later
   tasks add columns; the legacy `entry_signal` / `exit_signal` equal `entry` /
@@ -397,6 +402,62 @@ its own close, on the union calendar, NaN on local holidays).
   whose entry signal is moved onto a no-print day.  The identity fixtures need
   `legacy_no_entry_guards` too: without it 21 of the 26 cases differ from the
   pre-audit CSVs (of the other 5, one has no trades and four have no entry beyond the stop).
+- **Remaining look-ahead** (`test_remaining_lookahead.py`, T9).
+  *Training rows* (T9.1): on the golden `hmm_block_panic` inputs with `--ivol`
+  and almgren costs, every price from window 6's OOS start (Tuesday
+  2006-10-03, a trading day) on is changed (×e^N(0, 2%)); window 6's β,
+  eligibility and `LegCosts` of every pair (spy on `backtest_pair_continuous`),
+  its ivol weights (spy on `continuous_trades`' `WindowContext`) and its HMM
+  parameters (spy on `fit_macro_hmm`) are unchanged, its OOS panic flags are
+  not; with `legacy_window_reset` the HMM fit sees the changed oos_s row.
+  *Kalman* (T9.2): `kalman_hedge(return_prior=True)` keeps the four outputs and
+  adds β_{t|t−1} = β_{t−1|t−1} (β_init on day 0); a different y_t leaves the
+  prior up to t unchanged and moves the posterior at t; `kalman_spread_z(prior=
+  True)`: spread_t = log p1_t − β_{t|t−1}·log p2_t, moved by exactly log(1.05)
+  when p1_t is ×1.05; `window_z` = the rolling z of the trade's own spread on
+  that row (to 1e-9; bit for bit between a per-row and a scalar β); on the golden
+  `kalman` case every trade's β is the prior of its decision row and its entry
+  z equals its exit z on that row, ENTRY_Z < |z| < STOP_Z (legacy: the posterior).
+  *Macro HMM* (T9.3): `hmm_filter` equals hmmlearn's smoothed posterior of the
+  prefix at its last day (the filtered probability, 1e-9) and is truncation
+  invariant; the states (argmax of the filter; two states: P > 0.5) on returns
+  cut at k equal the full states' first k for 2 and 3 states, the Viterbi path's
+  do not; run level, for every `--hmm` mode (block-panic, extreme-3state,
+  block-calm, size-panic), the panic flags of every window whose OOS has begun by D
+  equal those with a different future after D (legacy Viterbi: they differ);
+  with hmmlearn's `predict` / `predict_proba` / `decode` / `score_samples`
+  patched to raise, the default gate runs and binds (legacy: `predict` is
+  called); `macro_proxy`: SPY, else the EW mean of the US listings only (no
+  `*_USD`, `.TO`, `.L` or unknown suffix; legacy: every column).
+  *Optional flags* (T9.4), each on the golden case where it binds (`--ivol`,
+  `--volvol`, `--pairmom`, `--rotation`, `--voltarget`, `--cusum` (h = 30),
+  `--aussie-filter`, plus `--kalman`, `--hmm block-panic`), D = 2008-02-13 (six
+  weeks into window 11's OOS): (a) the plan's cut test (test_placebo's pattern,
+  C = min(D, the cut run's last OOS end)); (b) the run with every log return
+  after D × −3 agrees on every entry and exit filled on or before D (sees a
+  look-ahead inside a window: a full-window fit, decoding or normalisation);
+  each flag's decisions differ from its panel's run without it in the compared
+  region, and the CUSUM case has `cusum_break` exits there (Ruling R29).
+  `legacy_sizing_lookahead` (`--volvol` over all trades) fails (a).
+  `pair_momentum` on hand-made trades: an earlier trade still open at the entry
+  decision is not counted (legacy: it is); on the default engine the rule changes
+  nothing (identical trades).  `apply_vol_target`: a trade filled three days
+  after its decision gets the leverage of the day after the decision, whatever an
+  exit in between earned (legacy: looked up at the fill date).  CLI:
+  `--metagate` / `--hrp` stop a run that would be HEADLINE before anything runs
+  or is registered and name themselves in a non-headline run's banner (then R7);
+  `exec_mode` vwap with `kalman` / `vwz` → `ValueError` in both engines.
+  R40: window eligibility counts only the rows before oos_s (a pair with 65 /
+  75 training rows: [no, yes] whether or not its legs are delisted 2 rows into
+  the OOS).  R41: `--kalman` with `--hmm` → `ValueError` in the continuous
+  engine (the legacy engine keeps running it); a refused forbidden flag records
+  no `--final-holdout` use.
+  Mutation check (scratch copy, not committed), each caught (13/13): Kalman
+  posterior; entry z of the dynamic spread; Viterbi states; inclusive HMM fit;
+  proxy over every column; `--volvol` full-sample mean; `--voltarget` at the
+  fill date; `--pairmom` with open trades; CUSUM force-close on any break (caught
+  by (b)); inclusive ivol slice; VWAP with Kalman allowed; forbidden flags in a
+  headline run allowed; smoothed (`predict_proba`) states.
 
 ### Statistic definitions
 
@@ -444,7 +505,9 @@ With one continuous position per pair (T3) `independent_rw` gives +0.006
 At T7 (daily mark-to-market since T4, entry window) the `fixed` null means are +0.005
 (`independent_rw`), −0.118, −0.008, +0.024, +0.039 (|t| ≤ 2.3) and the OU control +6.613;
 `legacy` is unchanged.  At T8 (costs per fill per leg) both variants are bit-identical
-to T7 (gross: every cost is zero; `legacy` has `legacy_flat_cost`).
+to T7 (gross: every cost is zero; `legacy` has `legacy_flat_cost`).  At T9 both
+variants are bit-identical to T8 (every per-seed Sharpe and trade PnL of the 11
+jobs, T8 tree from `git archive 8669596`).
 
 ### How later tasks update the harness
 
@@ -483,3 +546,5 @@ At T6 ≈ 54 s: the T6 tests add ≈ 4 s (25 tests).
 At T7 ≈ 55 s: the T7 tests add ≈ 1.5 s (27 tests); a default run is as fast as before (one
 extra comparison per flat bar with |z| > entry_z).
 At T8 ≈ 56 s: the T8 tests add ≈ 2 s (47 tests).
+At T9 ≈ 70–80 s: the T9 tests add ≈ 20 s (47 tests; ≈ 60 runs of the golden cases, the
+HMM ones ≈ 1 s each).

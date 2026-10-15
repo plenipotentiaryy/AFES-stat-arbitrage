@@ -16,9 +16,10 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
+from numpy.lib.stride_tricks import sliding_window_view
 
 from config import BAR_TIMEFRAME
-from cross_listing import mask_stale_prints, repeats_previous_print
+from cross_listing import EXCHANGES, close_time, mask_stale_prints, repeats_previous_print
 from kalman import kalman_hedge
 from mtm import CAPITAL_PER_PAIR, borrow_rows, daily_mtm_pairs, fill_cost, mtm_stats, portfolio_pnl
 from metagate_daily import (
@@ -792,6 +793,63 @@ def fit_macro_hmm(spy_returns_train: np.ndarray,
         return None, None
 
 
+def hmm_filter(m, x: np.ndarray) -> np.ndarray:
+    """Forward-filtered state probabilities P(s_t | x_1..t) (audit T9), one row
+    per day of the 1-D series x, from the fitted model's start probabilities,
+    transition matrix and Gaussian emission densities: α_1 ∝ π·b(x_1),
+    α_t ∝ (α_{t−1}·A)·b(x_t), normalised each day.  Row t uses x up to t only,
+    so the filter on x cut at k is the first k rows of the filter on x.
+    (hmmlearn's predict / predict_proba decode or smooth the whole sequence.)"""
+    x = np.asarray(x, dtype=float)
+    mu, var = m.means_[:, 0], m.covars_[:, 0, 0]
+    log_b = -0.5 * (np.log(2 * np.pi * var) + (x[:, None] - mu) ** 2 / var)
+    b = np.exp(log_b - log_b.max(axis=1, keepdims=True))     # a day's scale cancels below
+    alpha = np.empty_like(b)
+    for t in range(len(x)):
+        a = (m.startprob_ if t == 0 else alpha[t - 1] @ m.transmat_) * b[t]
+        alpha[t] = a / a.sum()
+    return alpha
+
+
+def macro_states(m, x: np.ndarray, viterbi: bool = False) -> np.ndarray:
+    """The macro-HMM state of each day of x: the argmax of the forward-filtered
+    probabilities (`hmm_filter`; with 2 states: P(state) > 0.5), from x up to
+    that day only.  viterbi (legacy_hmm_viterbi): hmmlearn's Viterbi path of
+    the whole sequence, which uses later returns."""
+    if viterbi:
+        return m.predict(np.asarray(x, dtype=float).reshape(-1, 1))
+    return hmm_filter(m, x).argmax(axis=1)
+
+
+def is_us_close(ticker: str) -> bool:
+    """A US listing: no `*_USD` conversion and the NYSE/Nasdaq suffix rule of
+    `cross_listing.close_time`; its close prints at 16:00 ET.  An unknown
+    suffix is not US."""
+    if ticker.endswith("_USD"):
+        return False
+    try:
+        return close_time(ticker) is EXCHANGES[""]
+    except KeyError:
+        return False
+
+
+def macro_proxy(closes: pd.DataFrame, legacy: bool = False) -> tuple[pd.Series, str]:
+    """(daily log returns of the macro-HMM proxy, its label): SPY if present,
+    else the equal-weighted mean of the log returns of the US listings
+    (audit T9: no `*_USD` leg — converted with a daily FX close, fx_unaligned
+    — and no other exchange's close).  Every proxy close prints at 16:00 ET, so
+    its day-t value is known at the day-t decision (no shift).  legacy
+    (legacy_hmm_viterbi): the EW mean of every column, as before T9."""
+    if "SPY" in closes.columns:
+        return np.log(closes["SPY"]).diff(), "SPY"
+    if legacy:
+        return np.log(closes).diff().mean(axis=1), f"EW mean of {closes.shape[1]} names"
+    cols = [c for c in closes.columns if is_us_close(c)]
+    return (np.log(closes[cols]).diff().mean(axis=1),
+            f"EW mean of {len(cols)} US-close names ({closes.shape[1] - len(cols)} *_USD / "
+            "non-US columns excluded)")
+
+
 def vwz_spread_z(df: pd.DataFrame, vol: pd.DataFrame, t1: str, t2: str,
                  beta: float, z_win: int = Z_WIN
                  ) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -827,7 +885,8 @@ def vwz_spread_z(df: pd.DataFrame, vol: pd.DataFrame, t1: str, t2: str,
 
 def kalman_spread_z(df: pd.DataFrame, t1: str, t2: str,
                     delta: float = 1e-6,
-                    z_win: int = Z_WIN) -> tuple[pd.Series, pd.Series, pd.Series]:
+                    z_win: int = Z_WIN,
+                    prior: bool = False) -> tuple[pd.Series, pd.Series, pd.Series]:
     """Dynamic-β spread via Kalman, then rolling z on the spread.
 
     Kalman provides the time-varying hedge ratio β_t (random-walk prior).
@@ -835,12 +894,19 @@ def kalman_spread_z(df: pd.DataFrame, t1: str, t2: str,
     you can hold and exit later. We then standardise it with the same
     rolling-z used by the static-β baseline so PnL semantics match.
 
+    prior (audit T9, the default path): β_t = the one-step prior β_{t|t−1},
+    the state before the update with log P1_t, so y_t enters spread_t only
+    through its direct term.  Without it (legacy_kalman_posterior): the
+    posterior β_{t|t}, already updated with log P1_t.
+
     Returns (spread_series, z_series, beta_series) aligned to df.index;
     β_t sizes a trade entered on bar t (audit T2).
     """
     p1 = np.log(df[t1].values)
     p2 = np.log(df[t2].values)
-    _, beta, _, _ = kalman_hedge(p1, p2, delta=delta, beta_init=1.0)
+    _, posterior, _, _, beta_prior = kalman_hedge(p1, p2, delta=delta, beta_init=1.0,
+                                                   return_prior=True)
+    beta = beta_prior if prior else posterior
     # Use only the dynamic β; ignore the Kalman α (intercept).  α tracks
     # the spread mean in real-time, which collapses the residual to noise
     # and produces a 80%+ win-rate artefact (looks like edge, isn't).
@@ -849,6 +915,22 @@ def kalman_spread_z(df: pd.DataFrame, t1: str, t2: str,
     sig = spread.rolling(z_win).std()
     z   = (spread - mu) / sig
     return spread, z, pd.Series(beta, index=df.index, name="kalman_beta")
+
+
+def window_z(log1: np.ndarray, log2: np.ndarray, beta, z_win: int = Z_WIN) -> np.ndarray:
+    """z of row t of the spread log p1 − b_t·log p2 over the trailing z_win rows
+    (t − z_win + 1 … t), row t's b_t applied to the whole window (Ruling R28,
+    audit T9): the z a trade entered with β_e = b_t carries on row t.  beta:
+    one per row, or a scalar.  Mean and sample std (ddof 1) as `rolling_z`;
+    NaN on the first z_win − 1 rows."""
+    n = len(log1)
+    z = np.full(n, np.nan)
+    if n < z_win:
+        return z
+    b = np.broadcast_to(np.asarray(beta, dtype=float), (n,))[z_win - 1:, None]
+    s = sliding_window_view(log1, z_win) - b * sliding_window_view(log2, z_win)
+    z[z_win - 1:] = (s[:, -1] - s.mean(axis=1)) / s.std(axis=1, ddof=1)
+    return z
 
 
 def make_windows(closes: pd.DataFrame,
@@ -907,6 +989,9 @@ class WfoConfig:
     legacy_exit_date_pnl: bool = False
     legacy_no_entry_guards: bool = False
     legacy_flat_cost: bool = False
+    legacy_kalman_posterior: bool = False   # audit T9.2
+    legacy_hmm_viterbi: bool = False        # audit T9.3
+    legacy_sizing_lookahead: bool = False   # audit T9.4
     rotation: bool = False
     voltarget: float = 0.0
     hmm: str = "off"
@@ -1236,17 +1321,55 @@ def apply_quarterly_rotation(trades: pd.DataFrame,
     return trades_out
 
 
+def pair_momentum(trades: pd.DataFrame, n_lookback: int = 10,
+                  legacy_open_trades: bool = False) -> pd.Series:
+    """--pairmom size multiplier of each trade (index of `trades`): from the
+    PnL of the pair's last n_lookback earlier trades — audit T9: those whose
+    exit filled by this trade's entry decision (legacy_open_trades,
+    legacy_sizing_lookahead: every earlier-entered one, open or not) — the
+    Sharpe sh = mean / std (≥ 3 trades and std > 0, else multiplier 1) →
+    clip(1 + sh/4, 0.5, 1.5)."""
+    adjusted = []
+    for pair, grp in trades.sort_values("entry").groupby("pair"):
+        past = []
+        for _, row in grp.iterrows():
+            if not legacy_open_trades:
+                past = grp.loc[(grp["entry"] < row["entry"])
+                               & (grp["exit"] <= row["entry_signal"]), "pnl"].tolist()
+            if len(past) < 3:
+                mult = 1.0
+            else:
+                arr = np.array(past[-n_lookback:])
+                if arr.std() > 0:
+                    sh = arr.mean() / arr.std()
+                    # Map Sharpe ∈ [-2, +2] → multiplier ∈ [0.5, 1.5]
+                    mult = float(np.clip(1.0 + 0.25 * sh, 0.5, 1.5))
+                else:
+                    mult = 1.0
+            adjusted.append((row.name, mult))
+            if legacy_open_trades:                  # every earlier-entered trade, open or not
+                past.append(row["pnl"])
+    idx, mults = zip(*adjusted)
+    return pd.Series(mults, index=idx)
+
+
 def apply_vol_target(trades: pd.DataFrame, target_vol: float,
                       oos_index: pd.DatetimeIndex,
                       lookback: int = 20,
                       max_lev: float = 2.0, min_lev: float = 0.5,
-                      smooth_alpha: float = 0.20) -> pd.DataFrame:
+                      smooth_alpha: float = 0.20,
+                      legacy_fill_date: bool = False) -> pd.DataFrame:
     """Causal portfolio-level vol targeting.
 
     For each day in the OOS window, compute realised vol from the previous
     `lookback` days of portfolio PnL. Leverage_t = target / realised_t,
     clipped and smoothed.  Scale each trade's PnL by the leverage that was
-    available at its entry date (causal — no future info).
+    available at its entry decision (audit T9): the value on the first OOS
+    day after its entry_signal, i.e. from the PnL of exits filled up to the
+    decision day.  That is the fill date's value when the trade fills on the
+    next OOS day; on a later fill (a leg without a print) the fill date's
+    value would use exits filled after the decision.  legacy_fill_date
+    (legacy_sizing_lookahead): looked up at the entry fill date, as before T9.
     """
     if trades.empty or target_vol <= 0:
         return trades
@@ -1265,6 +1388,11 @@ def apply_vol_target(trades: pd.DataFrame, target_vol: float,
     smooth = smooth.clip(lower=min_lev, upper=max_lev)
     # Look up leverage at each trade's entry date.
     entry_dates = t["entry"].dt.normalize()
+    if not legacy_fill_date:          # audit T9: the first OOS day after the entry decision
+        days = smooth.index
+        nxt = days.searchsorted(pd.to_datetime(t["entry_signal"]).dt.normalize(), side="right")
+        entry_dates = pd.Series(days[np.minimum(nxt, len(days) - 1)].where(nxt < len(days)),
+                                index=t.index)
     lev = entry_dates.map(smooth).fillna(1.0).values
     t["pnl"] = t["pnl"].values * lev
     if "size" in t.columns:
@@ -1294,10 +1422,11 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     A pair's rows: its dates with prints of both legs from the first window's
     training start to the last window's OOS end, plus the fill-only row (the
     first later row with both legs, never after data_end, R15).  Per window
-    w the pair is eligible as in the per-window engine (≥ 60 training rows,
-    ≥ Z_WIN + 10 rows in [tr_s, oos_e], 0.1 ≤ |β_w| ≤ 15 except on the Kalman
-    path), with the training rows strictly before oos_s (T9.1): β_w, and the
-    cost rates of trades entered in w (pair_cost).  window_ctx[w − 1]: the
+    w the pair is eligible with ≥ 60 and ≥ Z_WIN + 10 training rows (R40: the
+    per-window engine counts Z_WIN + 10 rows in [tr_s, oos_e], future prints)
+    and 0.1 ≤ |β_w| ≤ 15 except on the Kalman path, with the training rows
+    strictly before oos_s (T9.1): β_w, and the cost rates of trades entered in
+    w (pair_cost).  window_ctx[w − 1]: the
     WindowContext of window w, built by the run's window loop; a trade is
     sized with its entry window's weight.
     Returns one trades frame per pair (columns as the per-window engine, then
@@ -1328,12 +1457,24 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         if cfg.kalman:
             # One causal Kalman pass over the pair's rows; a trade exits on the
             # rolling z of log p1 − β_e·log p2 with β_e of its entry decision.
-            _, z_kal, beta_kal = kalman_spread_z(px, t1, t2)
+            # Audit T9: β_e = the prior β_{t|t−1} of the decision row t, and the
+            # entry z on row t is the z of that same spread (Ruling R28,
+            # `window_z`), so entry and exit z agree on the entry row.
+            # legacy_kalman_posterior: the posterior β_t and the entry z of the
+            # dynamic-β spread log p1_t − β_t·log p2_t.
+            prior = not cfg.legacy_kalman_posterior
+            _, z_kal, beta_kal = kalman_spread_z(px, t1, t2, prior=prior)
             z_kal, kalman_beta = z_kal.to_numpy(), beta_kal.to_numpy()
             log1, log2 = np.log(px[t1]), np.log(px[t2])
+            if prior:
+                l1, l2 = log1.to_numpy(), log2.to_numpy()
+                z_kal = window_z(l1, l2, kalman_beta)
 
-            def exit_z_of(b: float) -> np.ndarray:
-                return rolling_z(log1 - b * log2).to_numpy()
+                def exit_z_of(b: float) -> np.ndarray:
+                    return window_z(l1, l2, b)
+            else:
+                def exit_z_of(b: float) -> np.ndarray:
+                    return rolling_z(log1 - b * log2).to_numpy()
 
         vw = exec_legs = None
         if (vwap_daily is not None and not cfg.kalman and not cfg.vwz
@@ -1347,7 +1488,9 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             lo = rows.searchsorted(tr_s)
             n_w = rows.searchsorted(oos_e, side="right")     # rows up to the OOS end
             train = px.iloc[lo:rows.searchsorted(oos_s)]       # [tr_s, oos_s): T9.1
-            if len(train) < 60 or n_w - lo < Z_WIN + 10:
+            # Eligibility from rows before oos_s only (R40): ≥ 60 and ≥ Z_WIN + 10
+            # training rows (the per-window engine counts its rows up to oos_e).
+            if len(train) < max(60, Z_WIN + 10):
                 continue
             cost, borrow, leg_costs = pair_cost(t1, t2, train)
             ctx = window_ctx[w - 1]
@@ -1459,6 +1602,16 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         raise ValueError("cfg.vwz needs the volumes frame (volumes_daily.csv)")
     if cfg.exec_mode == "vwap" and vwap is None:
         raise ValueError("cfg.exec_mode 'vwap' needs the vwap frame (vwap_daily.csv)")
+    if cfg.kalman and cfg.hmm != "off" and not cfg.legacy_window_reset:
+        # R41 (audit T9): the continuous engine's Kalman path carries no HMM
+        # gate (neither did the pre-audit Kalman path): the gate would be ignored.
+        raise ValueError(f"cfg.hmm {cfg.hmm!r} with cfg.kalman: the Kalman path has no macro-HMM "
+                         "gate, it would be ignored (audit T9, R41)")
+    if cfg.exec_mode == "vwap" and (cfg.kalman or cfg.vwz):
+        # Audit T9: only the static-β path builds VWAP fills; here the fills
+        # would be next closes under a "next-day VWAP" header.
+        raise ValueError("cfg.exec_mode 'vwap' fills at the next-day VWAP on the static-β path "
+                         "only; with cfg.kalman / cfg.vwz it is not supported (audit T9)")
     if not cfg.legacy_window_reset and (cfg.legacy_same_close or cfg.legacy_spread_pnl):
         raise ValueError("cfg.legacy_same_close / cfg.legacy_spread_pnl describe the pre-T3 "
                          "per-window engine: use them with cfg.legacy_window_reset "
@@ -1484,15 +1637,15 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
 
     # Macro returns for HMM.  Prefer SPY; otherwise use an equal-weighted
     # cross-sectional mean of log-returns as a market-wide panic proxy.
+    # Audit T9: the EW proxy over US closes only (`macro_proxy`); the states
+    # from the forward filter (`macro_states`); legacy_hmm_viterbi: every
+    # column, the Viterbi path of the window.
     spy_returns = None
     hmm_active = (cfg.hmm != "off")
     if hmm_active:
-        if "SPY" in closes.columns:
-            spy_returns = np.log(closes["SPY"]).diff()
-            print(f"  hmm mode: {cfg.hmm}   macro proxy: SPY")
-        else:
-            spy_returns = np.log(closes).diff().mean(axis=1)
-            print(f"  hmm mode: {cfg.hmm}   macro proxy: EW mean of {closes.shape[1]} names")
+        spy_returns, proxy_label = macro_proxy(closes, legacy=cfg.legacy_hmm_viterbi)
+        print(f"  hmm mode: {cfg.hmm}   macro proxy: {proxy_label}"
+              + ("" if cfg.legacy_hmm_viterbi else "   states: causal forward filter (argmax)"))
 
     vwap_daily = None
     if cfg.exec_mode == "vwap":
@@ -1655,6 +1808,8 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 if t1 not in closes.columns or t2 not in closes.columns:
                     continue
                 tr_slice = closes.loc[tr_s:tr_e, [t1, t2]].dropna()
+                if not cfg.legacy_window_reset:          # T9.1: rows strictly before oos_s
+                    tr_slice = tr_slice[tr_slice.index < oos_s]
                 if len(tr_slice) < 60:
                     continue
                 beta = estimate_beta(tr_slice[t1], tr_slice[t2])
@@ -1700,16 +1855,21 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                       f"top: {dict((k, round(v,2)) for k,v in top.items())}  "
                       f"bot: {dict((k, round(v,2)) for k,v in bot.items())}")
 
-        # Window-scoped Macro-HMM: fit on macro-returns(train), predict on full slice.
+        # Window-scoped Macro-HMM: fit on macro-returns(train), the state of
+        # each day of [tr_s, oos_e] from the forward filter (audit T9: from the
+        # returns up to that day; legacy_hmm_viterbi: the Viterbi path).
         panic_full = None
         panic_size_mult = 0.0   # 0 = block, 0.5 = half size, etc.
         if hmm_active and spy_returns is not None:
-            spy_train = spy_returns.loc[tr_s:tr_e].dropna().values
+            spy_train = spy_returns.loc[tr_s:tr_e]
+            if not (cfg.legacy_window_reset or cfg.legacy_hmm_viterbi):
+                spy_train = spy_train[spy_train.index < oos_s]          # T9.1
+            spy_train = spy_train.dropna().values
             spy_full  = spy_returns.loc[tr_s:oos_e].dropna()
             n_comp = 3 if cfg.hmm == "extreme-3state" else 2
             m, panic_st = fit_macro_hmm(spy_train, n_components=n_comp)
             if m is not None and len(spy_full) > 0:
-                states = m.predict(spy_full.values.reshape(-1, 1))
+                states = macro_states(m, spy_full.values, viterbi=cfg.legacy_hmm_viterbi)
                 if cfg.hmm == "block-calm":
                     # Invert: panic-flag = "in calm state" (block in calm)
                     panic_mask = (states != panic_st)
@@ -1762,7 +1922,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             no_entry = None if zero_ret is None else (zero_ret[t1] | zero_ret[t2])
 
             if cfg.kalman:
-                sp, z_kal, beta_kal = kalman_spread_z(full, t1, t2)
+                # Audit T9: the prior β_{t|t−1} (legacy_kalman_posterior: posterior).
+                sp, z_kal, beta_kal = kalman_spread_z(full, t1, t2,
+                                                      prior=not cfg.legacy_kalman_posterior)
                 tr = backtest_pair(sp, oos_s, oos_e, cost_log,
                                    cusum_h=cfg.cusum, z_series=z_kal,
                                    borrow_per_day=borrow_per_day,
@@ -1892,7 +2054,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     trades["entry_signal"] = pd.to_datetime(trades["entry_signal"])
     trades["exit_signal"]  = pd.to_datetime(trades["exit_signal"])
 
-    # ── volvol: per-entry size ∝ 1/recent_20d_spread_vol (window-normalised)
+    # ── volvol: per-entry size ∝ 1/recent_20d_spread_vol, normalised by the
+    # mean multiplier of the trades decided up to this one's entry decision
+    # (audit T9; legacy_sizing_lookahead: by the mean over ALL trades, later
+    # ones included).
     if cfg.volvol:
         size_multipliers = []
         for _, row in trades.sort_values("entry").iterrows():
@@ -1910,32 +2075,23 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         # Normalise so mean = 1, clip to [0.3, 3.0]
         idx, mults = zip(*size_multipliers)
         mults = np.array(mults)
-        mults = (mults / mults.mean()).clip(0.3, 3.0)
+        if cfg.legacy_sizing_lookahead:
+            norm = mults.mean()
+        else:
+            # Running mean in (entry_signal, pair) order — one decision per pair
+            # and day — up to the last trade decided on the same day.
+            key = trades.loc[list(idx), ["entry_signal", "pair"]].assign(m=mults)
+            key = key.sort_values(["entry_signal", "pair"])
+            run_mean = key["m"].cumsum() / np.arange(1, len(key) + 1)
+            norm = run_mean.groupby(key["entry_signal"]).transform("last").loc[list(idx)].to_numpy()
+        mults = (mults / norm).clip(0.3, 3.0)
         mult_series = pd.Series(mults, index=idx)
         trades["pnl"]  = trades["pnl"]  * mult_series
         trades["size"] = trades.get("size", 1.0) * mult_series
 
     # ── pairmom: scale trade by rolling Sharpe of prior same-pair trades
     if cfg.pairmom:
-        N_LOOKBACK = 10
-        adjusted = []
-        for pair, grp in trades.sort_values("entry").groupby("pair"):
-            past = []
-            for _, row in grp.iterrows():
-                if len(past) < 3:
-                    mult = 1.0
-                else:
-                    arr = np.array(past[-N_LOOKBACK:])
-                    if arr.std() > 0:
-                        sh = arr.mean() / arr.std()
-                        # Map Sharpe ∈ [-2, +2] → multiplier ∈ [0.5, 1.5]
-                        mult = float(np.clip(1.0 + 0.25 * sh, 0.5, 1.5))
-                    else:
-                        mult = 1.0
-                adjusted.append((row.name, mult))
-                past.append(row["pnl"])
-        idx, mults = zip(*adjusted)
-        mult_series = pd.Series(mults, index=idx)
+        mult_series = pair_momentum(trades, legacy_open_trades=cfg.legacy_sizing_lookahead)
         trades["pnl"]  = trades["pnl"]  * mult_series
         trades["size"] = trades.get("size", 1.0) * mult_series
 
@@ -2004,7 +2160,8 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
 
     # ── Portfolio vol targeting (Option B §7) ─────────────────────────────
     if cfg.voltarget > 0:
-        trades = apply_vol_target(trades, cfg.voltarget, oos_idx)
+        trades = apply_vol_target(trades, cfg.voltarget, oos_idx,
+                                  legacy_fill_date=cfg.legacy_sizing_lookahead)
         print(f"  → voltarget={cfg.voltarget*100:.1f}%: causal leverage applied")
 
     if not cfg.legacy_same_close:

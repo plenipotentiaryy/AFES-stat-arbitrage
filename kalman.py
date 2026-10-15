@@ -3,15 +3,20 @@ import numpy as np
 
 def kalman_hedge(p1: np.ndarray, p2: np.ndarray,
                  delta: float = 1e-4,
-                 beta_init: float = 1.0) -> tuple:
+                 beta_init: float = 1.0,
+                 return_prior: bool = False) -> tuple:
     """
     Kalman Filter for time-varying hedge ratio with scale-invariant observation noise.
     Observation model: p1[t] = alpha[t] + beta[t] * p2[t] + noise
     State transition:  [alpha, beta] follows a random walk (Q = delta/(1-delta) * I)
 
     Returns: (alpha_arr, beta_arr, innovations, innovation_var)
+      - beta_arr     : the posterior β_{t|t}, updated with the observation p1[t]
       - innovations  : residuals e[t] = p1[t] - predicted p1[t]
       - innovation_var: theoretical variance of each innovation
+    return_prior (audit T9): one more output, beta_prior — the one-step-ahead
+      prior β_{t|t−1}, the state before the update with p1[t] (beta_init on
+      t = 0, else β_{t−1|t−1}): the β known before the day-t close.
     """
     n = len(p1)
     theta = np.array([0.0, beta_init])
@@ -27,9 +32,11 @@ def kalman_hedge(p1: np.ndarray, p2: np.ndarray,
     beta_out  = np.empty(n)
     innov     = np.empty(n)
     innov_var = np.empty(n)
+    beta_prior = np.empty(n)
 
     for t in range(n):
         H = np.array([1.0, p2[t]])
+        beta_prior[t] = theta[1]         # β_{t|t−1}: before the update with p1[t]
 
         P = P + Q                        # predict covariance
         e = p1[t] - H @ theta            # innovation
@@ -44,4 +51,6 @@ def kalman_hedge(p1: np.ndarray, p2: np.ndarray,
         innov[t]     = e
         innov_var[t] = S
 
+    if return_prior:
+        return alpha_out, beta_out, innov, innov_var, beta_prior
     return alpha_out, beta_out, innov, innov_var

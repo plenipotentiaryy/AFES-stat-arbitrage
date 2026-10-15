@@ -43,7 +43,8 @@ VARIANTS: dict[str, tuple[WfoConfig, Callable]] = {
     "legacy": (replace(GROSS, legacy_same_close=True, legacy_spread_pnl=True,
                        legacy_stale_prints=True, legacy_window_reset=True,
                        legacy_exit_date_pnl=True, legacy_no_entry_guards=True,
-                       legacy_flat_cost=True),
+                       legacy_flat_cost=True, legacy_kalman_posterior=True,
+                       legacy_hmm_viterbi=True, legacy_sizing_lookahead=True),
                synthetic.build_async_panel),
     "fixed":  (GROSS, synthetic.build_async_panel_fixed),
 }

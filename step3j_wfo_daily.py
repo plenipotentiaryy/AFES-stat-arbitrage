@@ -149,6 +149,15 @@ def cross_listed_table(excluded: pd.DataFrame, trades: pd.DataFrame | None = Non
 PIT_UNIVERSE_FILE = re.compile(r"universe_pit_(\d{4}-\d{2}-\d{2})\.csv")
 NON_HEADLINE_BANNER = ("NON-HEADLINE RUN: pairs file is not a frozen point-in-time universe "
                        "(hindsight / survivorship)")
+# Audit T9: options no truncation-invariance test clears (tests/
+# test_remaining_lookahead.py), with the reason.  A run that would otherwise
+# be HEADLINE is refused; any other run names them in its banner.
+HEADLINE_FORBIDDEN = {
+    "metagate": "crashes before its first window (UnboundLocalError, Ruling R7), so no "
+                "truncation-invariance test can run it",
+    "hrp": "crashes before its first window (UnboundLocalError, Ruling R7), so no "
+           "truncation-invariance test can run it",
+}
 
 
 def non_headline_reasons(pairs_file: str, pairs_df: pd.DataFrame, first_oos,
@@ -369,7 +378,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--step",   type=int, default=STEP_MO,
                    help=f"Walk-forward step in months (default {STEP_MO}).")
     p.add_argument("--kalman", action="store_true",
-                   help="Use Kalman dynamic β (innovations as spread, e/√S as z).")
+                   help="Use Kalman dynamic β: a trade is sized with the one-step prior "
+                        "β_{t|t−1} of its decision row t and enters on the rolling z of "
+                        "log p1 − β_{t|t−1}·log p2, the spread it then exits on (audit T9).")
     p.add_argument("--vwz",    action="store_true",
                    help="Use volume-weighted z + VR≥0.5 liquidity gate.")
     p.add_argument("--metagate", action="store_true",
@@ -384,10 +395,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "mean-normalized to 1. Simpler/more robust than HRP.")
     p.add_argument("--volvol", action="store_true",
                    help="Dynamic vol-targeting: per-entry size ∝ 1/recent_20d_spread_vol, "
-                        "normalised against window mean. Pro-cyclical.")
+                        "normalised by the mean of the trades decided up to its entry decision "
+                        "(audit T9). Pro-cyclical.")
     p.add_argument("--pairmom", action="store_true",
                    help="Rolling-Sharpe pair momentum: hot pair → up-weight, cold → down. "
-                        "Causal: only uses pair's executed OOS trades so far.")
+                        "Causal: only the pair's trades closed by the entry decision (audit T9).")
     p.add_argument("--maxconc", type=int, default=0,
                    help="Hard cap on concurrent open trades across all pairs "
                         "(post-hoc filter, 0 = no cap).")
@@ -402,7 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["next_close", "vwap"], dest="exec_mode",
                    help="Fill of an order decided at close t: next_close = close "
                         "t+1 (default); vwap = next-day VWAP (signal still computed "
-                        "on close). vwap requires data/vwap_daily.csv.")
+                        "on close). vwap requires data/vwap_daily.csv and the static-β "
+                        "path (not with --kalman / --vwz, audit T9).")
     p.add_argument("--vwap-exec", action="store_const", const="vwap", dest="exec_mode",
                    help="Alias of --exec vwap.")
     p.add_argument("--legacy-same-close", action="store_true", dest="legacy_same_close",
@@ -437,6 +450,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "per unit size per held day (flat: --borrow; almgren: leg 2's tier). "
                         "Needed by --legacy-spread-pnl. Comparison only; never for headline "
                         "results.")
+    p.add_argument("--legacy-kalman-posterior", action="store_true", dest="legacy_kalman_posterior",
+                   help="LEGACY: the pre-T9 --kalman path — β_t already updated with the day-t "
+                        "close (posterior: look-ahead) sizes the trade, and the entry z is the "
+                        "z of the dynamic-β spread. Comparison only; never for headline results.")
+    p.add_argument("--legacy-hmm-viterbi", action="store_true", dest="legacy_hmm_viterbi",
+                   help="LEGACY: the pre-T9 --hmm gate — states from the Viterbi path of the "
+                        "whole window (uses later returns), the HMM fitted on rows up to and "
+                        "including the OOS start, the EW proxy over every column (*_USD legs "
+                        "too). Comparison only; never for headline results.")
+    p.add_argument("--legacy-sizing-lookahead", action="store_true", dest="legacy_sizing_lookahead",
+                   help="LEGACY: the pre-T9 sizing of --volvol (normalised by the mean over ALL "
+                        "trades, later ones too), --pairmom (from same-pair trades not yet closed "
+                        "at the entry decision) and --voltarget (leverage at the fill date, from "
+                        "exits filled after the decision). Comparison only; never for headline "
+                        "results.")
     p.add_argument("--final-holdout", action="store_true", dest="final_holdout",
                    help="Allow the run to use the final holdout (dates from "
                         f"{HOLDOUT_START.date()}). Recorded in HOLDOUT_USES.md before the "
@@ -452,7 +480,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "with SR_6m < 0 for the current quarter.")
     p.add_argument("--voltarget", type=float, default=0.0,
                    help="Portfolio vol target (annualised, e.g. 0.10 = 10%%). "
-                        "Applied as causal leverage scaling. 0 = off.")
+                        "Applied as causal leverage scaling (the leverage at the entry "
+                        "decision, audit T9). 0 = off.")
     p.add_argument("--closes",   type=str, default="closes_daily.csv",
                    help="Closes file in data/ (extended universe support).")
     p.add_argument("--hmm",    type=str, default="off",
@@ -460,7 +489,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "size-panic", "extreme-3state"],
                    help="HMM mode: off / block-panic / block-calm (invert) / "
                         "size-panic (50%% size in panic) / extreme-3state "
-                        "(3-state, block only highest-vol).")
+                        "(3-state, block only highest-vol). States from a causal forward "
+                        "filter on SPY or the EW mean of the US closes (audit T9).")
     p.add_argument("--cusum",  type=float, default=None,
                    help="CUSUM break threshold h (e.g. 5.0). If unset, CUSUM off.")
     p.add_argument("--tag",    type=str, default="",
@@ -536,6 +566,21 @@ def main():
     holdout = holdout_violation(closes, cfg)
     if holdout:
         raise SystemExit(holdout)
+
+    # Audit T5: HEADLINE only on a frozen point-in-time universe.
+    windows = make_windows(closes, cfg.train, cfg.oos, cfg.step, start=cfg.start, end=cfg.end)
+    first_oos = windows[0][2] if windows else None
+    legacy = [f"--{k.replace('_', '-')}" for k, v in vars(args).items() if k.startswith("legacy_") and v]
+    reasons = non_headline_reasons(args.pairs, pairs_df, first_oos, legacy)
+    # Audit T9: refused before anything is recorded (holdout use, trial).
+    forbidden = {f"--{k}": why for k, why in HEADLINE_FORBIDDEN.items() if getattr(args, k)}
+    if forbidden:
+        why = "; ".join(f"{k}: {w}" for k, w in forbidden.items())
+        if not reasons:
+            raise SystemExit(f"{', '.join(forbidden)} refused in a headline run (audit T9): {why}")
+        reasons.append(f"NON-HEADLINE RUN: options without a truncation-invariance test "
+                       f"(audit T9): {why}")
+
     chash = config_hash(cfg, DATA_DIR / args.pairs, args.closes, run_pairs, volumes is not None)
     dev_run = run_last_date(closes, cfg) < HOLDOUT_START
     if cfg.final_holdout:
@@ -544,12 +589,6 @@ def main():
               + (f"the run ends on {run_last_date(closes, cfg).date()}, before the holdout"
                  if dev_run else
                  f"FINAL HOLDOUT RUN: uses dates from {HOLDOUT_START.date()}"))
-
-    # Audit T5: HEADLINE only on a frozen point-in-time universe.
-    windows = make_windows(closes, cfg.train, cfg.oos, cfg.step, start=cfg.start, end=cfg.end)
-    first_oos = windows[0][2] if windows else None
-    legacy = [f"--{k.replace('_', '-')}" for k, v in vars(args).items() if k.startswith("legacy_") and v]
-    reasons = non_headline_reasons(args.pairs, pairs_df, first_oos, legacy)
     digest = hashlib.sha256((DATA_DIR / args.pairs).read_bytes()).hexdigest()
     print(f"UNIVERSE: {DATA_DIR / args.pairs}  SHA-256 {digest}")
     banner = headline_block(reasons, args.pairs, first_oos)
