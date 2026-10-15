@@ -12,8 +12,9 @@ ticker-overlap) will be layered back in subsequent phases on top of this
 backbone, each justified by an A/B comparison vs. this raw baseline.
 
 The engine lives in `wfo_daily_core.py` (`run_wfo_daily`); this file is the
-CLI: it reads data/, builds the `WfoConfig`, prints the summary and writes
-the trades CSV and the equity chart.
+CLI: it reads data/, builds the `WfoConfig`, applies the headline-universe
+policy to the pair list (audit T2), prints the summary and the separate
+cross-listed table, and writes the trades CSV and the equity chart.
 
 CLI:
     python step3j_wfo_daily.py --pairs pairs_baseline14.csv
@@ -30,9 +31,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from config import DATA_DIR, OUTPUT_DIR, BAR_TIMEFRAME
+from cross_listing import close_time
 from wfo_daily_core import (
     TRAIN_INIT_MO, OOS_MO, STEP_MO,
-    WfoConfig, run_wfo_daily, summarise,
+    WfoConfig, run_wfo_daily, summarise, trade_stats,
 )
 
 
@@ -47,6 +49,63 @@ def save_equity_chart(tr: pd.DataFrame, path: Path):
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+# ── Headline universe (audit T2) ────────────────────────────────────────────
+
+def headline_exclusions(pairs: list[str], unknown_ok: bool = False) -> pd.DataFrame:
+    """Pairs the headline run excludes, with their legs' exchanges and the
+    reasons: a leg is fx_unaligned (a "*_USD" leg: a local leg converted
+    without an FX rate observed at its own close — this repo has no intraday
+    FX), trades on an exchange without NYSE session overlap (ASX, TSE: both
+    legs can never fill together), or trades on a European exchange (allowed
+    only with synchronous 09:30–11:30 ET snapshots, which this repo lacks).
+    A leg with an unknown exchange suffix raises KeyError naming the ticker
+    (cross_listing.close_time) unless `unknown_ok` (the --legacy-cross-listed
+    run), where the pair is listed with the reason "unknown exchange"."""
+    rows = {}
+    for pair in pairs:
+        legs = pair.split("-")
+        names, reasons = [], []
+        if any(t.endswith("_USD") for t in legs):
+            reasons.append("fx_unaligned")
+        for t in legs:
+            try:
+                ex = close_time(t)
+            except KeyError:
+                if not unknown_ok:
+                    raise
+                names.append("unknown")
+                reasons.append(f"unknown exchange ({t})")
+                continue
+            seen = ex.name in names
+            names.append(ex.name)
+            if seen:                                    # one reason per exchange
+                continue
+            if not ex.overlaps_nyse:
+                reasons.append(f"{ex.name}: no session overlap with NYSE")
+            if ex.region == "Europe":
+                reasons.append(f"{ex.name}: no synchronous 09:30-11:30 ET snapshots")
+        if reasons:
+            rows[pair] = {"exchanges": " + ".join(names), "reasons": "; ".join(reasons)}
+    return pd.DataFrame.from_dict(rows, orient="index", columns=["exchanges", "reasons"])
+
+
+def cross_listed_table(excluded: pd.DataFrame, trades: pd.DataFrame | None = None) -> str:
+    """The separate table of the pairs the headline excludes.  With `trades`
+    (a --legacy-cross-listed run) it adds their numbers, labelled LEGACY —
+    NOT VALID."""
+    title = f"CROSS-LISTED PAIRS (not in headline): {len(excluded)}"
+    table = excluded.copy()
+    if trades is not None:
+        title += "  — numbers: LEGACY — NOT VALID (--legacy-cross-listed)"
+        mine = trades[trades["pair"].isin(excluded.index)].groupby("pair")["pnl"]
+        table["trades"] = mine.count().reindex(table.index, fill_value=0)
+        table["win_rate"] = (mine.apply(lambda p: (p > 0).mean()).reindex(table.index)
+                             .map(lambda w: "—" if pd.isna(w) else f"{w:.1%}"))
+        table["total_pnl"] = mine.sum().reindex(table.index, fill_value=0.0).round(4)
+    bar = "=" * 70
+    return f"{bar}\n{title}\n{bar}\n{table.to_string() if len(table) else '(none)'}"
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -110,6 +169,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="LEGACY: restore the pre-audit fills at the close that made "
                         "the signal (impossible fills). For before/after comparison "
                         "only; never use for headline results.")
+    p.add_argument("--legacy-spread-pnl", action="store_true", dest="legacy_spread_pnl",
+                   help="LEGACY: book trade PnL as the spread change between the fills "
+                        "instead of from the legs' fill prices. Comparison only; never "
+                        "for headline results.")
+    p.add_argument("--legacy-stale-prints", action="store_true", dest="legacy_stale_prints",
+                   help="LEGACY: keep exactly unchanged closes with zero/missing volume "
+                        "as prints and allow entries on a zero-return signal day. "
+                        "Comparison only; never for headline results.")
+    p.add_argument("--legacy-cross-listed", action="store_true", dest="legacy_cross_listed",
+                   help="LEGACY: keep the cross-listed pairs (fx_unaligned, ASX/TSE or "
+                        "European legs) in the run; their numbers are NOT VALID. "
+                        "Comparison only; never for headline results.")
     p.add_argument("--rotation", action="store_true",
                    help="Quarterly per-pair S_perf rescaling (§5): trades sized by "
                         "rolling pair-Sharpe with Bayesian shrinkage. Drop pairs "
@@ -165,26 +236,52 @@ def main():
             raise SystemExit("vwap_daily.csv missing — run build_vwap_daily.py")
         vwap_daily = pd.read_csv(vp, parse_dates=["Date"]).set_index("Date").sort_index()
 
-    # volumes_daily.csv: required by --vwz; used by almgren for the $ ADV if present.
+    # volumes_daily.csv: required by --vwz; if present, used for the stale-print
+    # mask (audit T2) and by almgren for the $ ADV.
     volumes = None
     vol_path = DATA_DIR / "volumes_daily.csv"
     if args.vwz:
         if not vol_path.exists():
             raise SystemExit("volumes_daily.csv missing — run build_volumes_daily.py")
         volumes = pd.read_csv(vol_path, parse_dates=["Date"]).set_index("Date").sort_index()
-    elif args.execution_model == "almgren" and vol_path.exists():
+    elif vol_path.exists():
         volumes = pd.read_csv(vol_path, parse_dates=["Date"]).set_index("Date").sort_index()
 
+    # Headline universe (audit T2).  Every *_USD leg is a local leg converted
+    # with a daily FX close (no intraday FX at its close time exists here):
+    # fx_unaligned.  The legacy run lists unclassifiable legs instead of stopping.
+    excluded = headline_exclusions(pairs, unknown_ok=args.legacy_cross_listed)
+    run_pairs = pairs if args.legacy_cross_listed else [p for p in pairs if p not in excluded.index]
+    print("HEADLINE UNIVERSE: excludes pairs with an fx_unaligned leg (*_USD), an ASX/TSE leg "
+          "(no NYSE overlap) or a European leg (no synchronous 09:30-11:30 ET snapshots)")
+    if args.legacy_cross_listed:
+        print(f"  LEGACY (--legacy-cross-listed): all {len(pairs)} pairs run; the "
+              f"{len(excluded)} cross-listed pairs' numbers are NOT VALID")
+    else:
+        print(f"  headline pairs: {len(run_pairs)} / {len(pairs)}  "
+              f"({len(excluded)} cross-listed pairs excluded, listed at the end)")
+
     cfg = WfoConfig(**{f.name: getattr(args, f.name) for f in dataclasses.fields(WfoConfig)})
-    result = run_wfo_daily(closes, pairs, cfg, volumes=volumes, vwap=vwap_daily)
+    result = run_wfo_daily(closes, run_pairs, cfg, volumes=volumes, vwap=vwap_daily)
     if result.trades.empty:
         print("\nNo trades.")
+        print("\n" + cross_listed_table(excluded))
         return
     trades = result.trades
 
     summarise(trades, label=f"NET {args.cost} bps/leg",
-              n_windows=result.stats["n_windows"], n_pairs=len(pairs),
+              n_windows=result.stats["n_windows"], n_pairs=len(run_pairs),
               oos_index=result.daily_pnl.index)
+    if args.legacy_cross_listed:
+        print("\n" + cross_listed_table(excluded, trades))
+        cross = trades[trades["pair"].isin(excluded.index)]
+        if not cross.empty:
+            st = trade_stats(cross, result.stats["n_windows"], len(excluded), result.daily_pnl.index)
+            print(f"  cross-listed block (LEGACY — NOT VALID): {st['n_trades']} trades, "
+                  f"win {st['win_rate']:.1%}, total PnL {st['total_pnl']:+.4f}, "
+                  f"Sharpe(full) {st['sharpe_full']:+.3f}")
+    else:
+        print("\n" + cross_listed_table(excluded))
 
     suffix = f"_{args.tag}" if args.tag else ""
     out_csv = DATA_DIR / f"wfo_daily_results{suffix}.csv"

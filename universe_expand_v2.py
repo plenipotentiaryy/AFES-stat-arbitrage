@@ -17,8 +17,18 @@ Layer F — Cross-asset (5 pairs, structural relationships):
 Output:
     data/closes_daily_extended_v2.csv      — extended price panel
     data/production_universe_v2.csv        — extended candidate definitions (48 rows)
+
+Audit T2: by default the downloaded US-listed series are reindexed to the
+reference calendar without any fill, and the Canadian local legs are not
+converted: no intraday FX observed at the TSX close exists in this repo and
+a daily FX close is never used, so no {loc}_USD column is written and the
+dual-listing rows carry fx_unaligned=True.  The new universe rows record
+fx_unaligned, exchange and close_time; Canadian dual listings are no longer
+labelled "us_us".  --legacy-daily-fx restores the pre-audit output.  Needs
+the network.
 """
 from __future__ import annotations
+import argparse
 from pathlib import Path
 import time
 
@@ -26,7 +36,10 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from cross_listing import align_to_ref_calendar, build_cross_listed_usd
+from cross_listing import (
+    align_to_ref_calendar, build_cross_listed_usd, build_cross_listed_usd_at_close,
+    close_time, reindex_to_calendar,
+)
 
 DATA = Path("data")
 START = "2006-01-01"
@@ -102,7 +115,25 @@ def align(df: pd.DataFrame, ref_index: pd.DatetimeIndex, max_stale: int = 3) -> 
     return align_to_ref_calendar(df, ref_index, max_stale)
 
 
+def leg_fields(legs: list[str], fx_unaligned: bool) -> dict:
+    """Audit T2 universe-row fields: fx_unaligned, the legs' exchanges and close times."""
+    exs = [close_time(t) for t in legs]
+    return {"fx_unaligned": fx_unaligned,
+            "exchange": " + ".join(e.name for e in exs),
+            "close_time": " + ".join(f"{e.close:%H:%M} {e.tz}" for e in exs)}
+
+
 def main():
+    ap = argparse.ArgumentParser(description="Second-wave universe extension (needs the network).")
+    ap.add_argument("--legacy-daily-fx", action="store_true", dest="legacy_daily_fx",
+                    help="LEGACY: forward-fill every series onto the reference calendar and "
+                         "convert local legs with the daily FX close of the same date "
+                         "(pre-audit output: stale prices and look-ahead).")
+    args = ap.parse_args()
+    legacy = args.legacy_daily_fx
+    # Audit T2: no forward fill of any price unless --legacy-daily-fx.
+    align_us = align if legacy else reindex_to_calendar
+
     existing = (pd.read_csv(DATA / "closes_daily_extended.csv", parse_dates=["Date"])
                   .set_index("Date").sort_index())
     print(f"Existing extended panel: {existing.shape}")
@@ -135,18 +166,27 @@ def main():
         print("\nDownloading US tickers …")
         us_df = batched_download(us_missing, START, END)
         if not us_df.empty:
-            us_df = align(us_df, ref_index)
+            us_df = align_us(us_df, ref_index)
             cov = (us_df.notna().sum() / len(ref_index) * 100).round(1)
             for t in us_df.columns:
                 print(f"  {t:<8s} {cov[t]:>5.1f}% history")
             parts.append(us_df)
 
     local_usd_df = pd.DataFrame(index=ref_index)
+    fx_unaligned = dict.fromkeys(local_tickers, True)
     if local_missing or fx_missing:
         print("\nDownloading local + FX …")
         local_df = batched_download(local_missing, START, END) if local_missing else pd.DataFrame()
-        fx_df    = batched_download(fx_missing, START, END) if fx_missing else pd.DataFrame()
-        if not local_df.empty:
+        # Daily FX closes are used only by the legacy conversion.
+        fx_df    = (batched_download(fx_missing, START, END) if fx_missing and legacy
+                    else pd.DataFrame())
+        if not local_df.empty and not legacy:
+            # Audit T2: no intraday FX at the local close → no conversion.
+            local_usd_df, fx_unaligned = build_cross_listed_usd_at_close(
+                local_df, None, CANADIAN_DUAL, fx_quote="local_per_usd")
+            print(f"  fx_unaligned (not converted, excluded from headline runs): "
+                  f"{sorted(loc for loc, flag in fx_unaligned.items() if flag)}")
+        elif not local_df.empty:
             # USDCAD=X is "1 USD = X CAD", so CAD-price-in-USD = CAD / USDCAD.
             local_usd_df = build_cross_listed_usd(
                 local_df, fx_df, CANADIAN_DUAL, ref_index, fx_quote="local_per_usd")
@@ -171,7 +211,7 @@ def main():
     # Layer C: Canadian cross-listings
     for adr, (loc, fx) in CANADIAN_DUAL.items():
         loc_usd = f"{loc}_USD"
-        new_rows.append({
+        row = {
             "pair": f"{adr}-{loc_usd}",
             "leg1": adr, "leg2": loc_usd,
             "source_layer": "canadian_dual_listing",
@@ -180,7 +220,16 @@ def main():
             "structure_type": "pair",
             "requires_fx": True, "local_leg": loc, "fx_ticker": fx, "currency": "CAD",
             "rationale": f"Canadian dual listing {adr}/{loc}, CAD-normalized via USDCAD.",
-        })
+        }
+        if not legacy:
+            # Audit T2: a TSX listing (own holidays, own close, CAD) — not "us_us".
+            row["market_overlap"] = f"us_{close_time(loc).name.lower()}"
+            row.update(leg_fields([adr, loc_usd], fx_unaligned.get(loc, True)))
+            if row["fx_unaligned"]:
+                row["rationale"] = (f"Canadian dual listing {adr}/{loc}; needs USDCAD at the "
+                                    f"TSX close, which this repo lacks: not converted, no "
+                                    f"{loc_usd} column (fx_unaligned).")
+        new_rows.append(row)
 
     # Layer D: Canadian intra-sector
     for a, b, theme in CANADIAN_INTRA:
@@ -191,6 +240,7 @@ def main():
             "market_overlap": "us_us", "structure_type": "pair",
             "requires_fx": False, "currency": "USD",
             "rationale": f"Canadian intra-sector ({theme}) US-listing pair.",
+            **({} if legacy else leg_fields([a, b], False)),
         })
 
     # Layer E: Style ETFs
@@ -202,6 +252,7 @@ def main():
             "market_overlap": "us_us", "structure_type": "pair",
             "requires_fx": False, "currency": "USD",
             "rationale": f"Style ETF pair ({theme}).",
+            **({} if legacy else leg_fields([a, b], False)),
         })
 
     # Layer F: Cross-asset
@@ -213,6 +264,7 @@ def main():
             "market_overlap": "us_us", "structure_type": "pair",
             "requires_fx": False, "currency": "USD",
             "rationale": f"Cross-asset structural pair ({theme}).",
+            **({} if legacy else leg_fields([a, b], False)),
         })
 
     new_df = pd.DataFrame(new_rows)

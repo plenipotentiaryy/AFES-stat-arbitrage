@@ -7,9 +7,11 @@ the same arguments, must reproduce every fixture byte for byte.  Later tasks
 run these cases with their legacy_* flags on (LEGACY_FLAGS), so the legacy
 path keeps reproducing the pre-audit code.
 
-The same inputs also run in the default (corrected) mode (audit T1): every
-fill on the pair's next row after its decision, nothing after cfg.end, and
-the booked PnL equal to the spread change between the fill dates.
+The same inputs also run in the default (corrected) mode (audit T1, T2):
+every fill on the pair's next row with genuine prints of both legs after its
+decision, nothing after cfg.end, and the booked PnL rebuilt from the fill
+prices — the legs' prices with quantities fixed at the entry fill (T2), or,
+with legacy_spread_pnl, the spread change between the fill dates (T1).
 """
 import contextlib
 import dataclasses
@@ -27,6 +29,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from cross_listing import mask_stale_prints  # noqa: E402
 from step3j_wfo_daily import build_parser  # noqa: E402
 from wfo_daily_core import WfoConfig, estimate_beta, make_windows, run_wfo_daily  # noqa: E402
 
@@ -37,7 +40,13 @@ _spec.loader.exec_module(make_golden)
 
 # WfoConfig fields that select the pre-audit behaviour; each audit task adds
 # its legacy_* flag here.
-LEGACY_FLAGS: dict = {"legacy_same_close": True}
+LEGACY_FLAGS: dict = {"legacy_same_close": True, "legacy_spread_pnl": True,
+                      "legacy_stale_prints": True}
+# All of them off: the corrected defaults.
+DEFAULTS: dict = dict.fromkeys(LEGACY_FLAGS, False)
+# CLI options that are not WfoConfig fields: file IO, and the headline
+# universe policy the CLI applies to the pair list before the core (T2).
+CLI_ONLY = {"pairs", "closes", "tag", "legacy_cross_listed"}
 
 
 def as_cli_reads(df: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -86,8 +95,8 @@ def test_core_reproduces_pre_refactor_cli(case):
 
 @pytest.mark.parametrize("case", ["flat", "vwap_exec"])
 def test_default_next_bar_fills_do_not_reproduce_the_pre_audit_trades(case):
-    # The legacy flag matters: without it the case's trades change.
-    res = run_case(case, legacy_same_close=False)
+    # The legacy flags matter: without them the case's trades change.
+    res = run_case(case, **DEFAULTS)
     cols = fixture_columns(case)
     assert res.trades[cols].to_csv(index=False).encode() != make_golden.fixture_path(case).read_bytes()
 
@@ -95,7 +104,7 @@ def test_default_next_bar_fills_do_not_reproduce_the_pre_audit_trades(case):
 @pytest.mark.parametrize("legacy", [True, False], ids=["legacy", "default"])
 def test_result_daily_pnl_and_stats_match_trades(legacy):
     # default: one exit decided on the last OOS bar fills on the next row.
-    res = run_case("flat", legacy_same_close=legacy)
+    res = run_case("flat", **({} if legacy else DEFAULTS))
     tr, daily = res.trades, res.daily_pnl
     assert daily.index.is_monotonic_increasing and daily.index.is_unique
     assert daily.sum() == pytest.approx(tr["pnl"].sum(), abs=1e-12)
@@ -108,7 +117,7 @@ def test_result_daily_pnl_and_stats_match_trades(legacy):
 def test_cli_options_are_the_wfo_config_fields_with_same_defaults():
     defaults = vars(build_parser().parse_args([]))
     fields = {f.name for f in dataclasses.fields(WfoConfig)}
-    assert set(defaults) - {"pairs", "closes", "tag"} == fields
+    assert set(defaults) - CLI_ONLY == fields
     assert {k: defaults[k] for k in fields} == dataclasses.asdict(WfoConfig())
 
 
@@ -145,14 +154,15 @@ def test_default_mode_fills_on_the_pairs_next_row(case):
     # Every option case: each fill is the pair's next row with both legs after
     # its decision (never after cfg.end); an end_of_data exit fills on its
     # decision date, where no such row is left; a pair's positions never
-    # overlap; daily_pnl holds every trade's PnL.
-    res = run_case(case, legacy_same_close=False)
+    # overlap; daily_pnl holds every trade's PnL.  Rows = genuine prints of
+    # both legs (the stale-print mask the engine applies, T2).
+    res = run_case(case, **DEFAULTS)
     tr = res.trades
     if tr.empty:                    # only where the pre-refactor CLI had none either
         assert not make_golden.fixture_path(case).exists()
         return
     inp = make_golden.case_inputs(case)
-    closes = as_cli_reads(inp["closes"])
+    closes = mask_stale_prints(as_cli_reads(inp["closes"]), as_cli_reads(inp["volumes"]))
     end = cli_config(inp["args"]).end
     data_end = pd.Timestamp(end) if end else closes.index.max()
     for pair, g in tr.sort_values("entry_signal").groupby("pair"):
@@ -195,34 +205,50 @@ def test_no_data_after_cfg_end_is_used(window, days_after):
     assert full.daily_pnl.index.max() <= end
 
 
+@pytest.mark.parametrize("pnl", ["legs", "spread"])
 @pytest.mark.parametrize("exec_mode", ["next_close", "vwap"])
-def test_booked_pnl_is_the_spread_change_between_the_fill_dates(exec_mode):
-    # Zero costs: each trade books side × size × (spread on its exit fill date
-    # − spread on its entry fill date), the spread being log P1 − β·log P2
-    # with the window's train β, of closes or (vwap mode) of VWAPs — an exit
-    # without a VWAP or at the end of the data at the close.  So every fill
-    # price belongs to its fill date, the fill-only bar included.
+def test_booked_pnl_is_rebuilt_from_the_fill_prices(exec_mode, pnl):
+    # Zero costs.  Each fill price belongs to its fill date (the fill-only bar
+    # included): the close or (vwap mode) the VWAP — an exit at the end of the
+    # data, or a leg without a VWAP, at the close; β = the window's train β.
+    # legs (default, T2): quantities fixed at the entry fill, q1 = 1/P1 and
+    # q2 = β/P2; the trade books size × side × (q1·ΔP1 − q2·ΔP2).
+    # spread (legacy_spread_pnl, T1): size × side × Δ(log P1 − β·log P2).
     inp = make_golden.case_inputs("vwap_exec")
     closes, vwap = inp["closes"], inp["vwap"]
-    cfg = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0, exec_mode=exec_mode)
+    cfg = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0, exec_mode=exec_mode,
+                    legacy_spread_pnl=pnl == "spread")
     tr = run_quiet(closes, inp["pairs"], cfg, vwap=vwap).trades
     windows = make_windows(closes, cfg.train, cfg.oos, cfg.step)
+    use_vwap = exec_mode == "vwap"
     rebuilt, exits_after_window = [], 0
     for _, t in tr.iterrows():
         a, b = t["pair"].split("-")
         tr_s, tr_e, _, oos_e = windows[t["window"] - 1]
         train = closes.loc[tr_s:tr_e, [a, b]].dropna()
         beta = estimate_beta(train[a], train[b])
+        assert t["beta"] == beta
 
-        def spread(px: pd.DataFrame, day) -> float:
-            return np.log(px.at[day, a]) - beta * np.log(px.at[day, b])
+        def fill_px(day, leg: str, at_exit: bool) -> float:
+            vw = vwap.at[day, leg] if use_vwap and not (at_exit and t["reason"] == "end_of_data") else np.nan
+            return closes.at[day, leg] if np.isnan(vw) else vw
 
-        use_vwap = exec_mode == "vwap"
-        entry = spread(vwap if use_vwap else closes, t["entry"])
-        exit_ = spread(vwap, t["exit"]) if use_vwap and t["reason"] != "end_of_data" else np.nan
-        if np.isnan(exit_):
-            exit_ = spread(closes, t["exit"])
-        rebuilt.append(t["size"] * t["side"] * (exit_ - entry))
+        if pnl == "spread":
+            def spread(px: pd.DataFrame, day) -> float:
+                return np.log(px.at[day, a]) - beta * np.log(px.at[day, b])
+
+            entry = spread(vwap if use_vwap else closes, t["entry"])
+            exit_ = spread(vwap, t["exit"]) if use_vwap and t["reason"] != "end_of_data" else np.nan
+            if np.isnan(exit_):
+                exit_ = spread(closes, t["exit"])
+            rebuilt.append(t["size"] * t["side"] * (exit_ - entry))
+        else:
+            p1e, p2e = fill_px(t["entry"], a, False), fill_px(t["entry"], b, False)
+            p1x, p2x = fill_px(t["exit"], a, True), fill_px(t["exit"], b, True)
+            q1, q2 = 1 / p1e, beta / p2e
+            assert (t["p1_entry"], t["p2_entry"], t["p1_exit"], t["p2_exit"]) == (p1e, p2e, p1x, p2x)
+            assert (t["q1"], t["q2"]) == (q1, q2)
+            rebuilt.append(t["size"] * t["side"] * (q1 * (p1x - p1e) - q2 * (p2x - p2e)))
         exits_after_window += t["exit"] > oos_e
     assert len(tr) > 100 and exits_after_window > 0
     np.testing.assert_allclose(tr["pnl"].to_numpy(), rebuilt, rtol=0, atol=1e-12)

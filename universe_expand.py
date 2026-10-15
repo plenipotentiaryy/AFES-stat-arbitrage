@@ -18,8 +18,17 @@ Tier B — ADR vs local share (currency-normalised to USD):
     Plus FX series for currency normalisation.
 
 Output: data/closes_daily_extended.csv merged with existing closes_daily.
+
+Audit T2: by default the downloaded US-listed series are reindexed to the US
+calendar without any fill (a missing print stays NaN), and the Tier B local
+legs are not converted: no intraday FX observed at the local close exists in
+this repo and a daily FX close is never used, so no {loc}_USD column is
+written and the pairs are reported fx_unaligned.  --legacy-daily-fx restores
+the pre-audit output (forward-filled series, local legs converted with the
+daily FX close of the same date).  Needs the network.
 """
 from __future__ import annotations
+import argparse
 from pathlib import Path
 import time
 
@@ -27,7 +36,10 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from cross_listing import align_to_ref_calendar, build_cross_listed_usd
+from cross_listing import (
+    align_to_ref_calendar, build_cross_listed_usd, build_cross_listed_usd_at_close,
+    reindex_to_calendar,
+)
 
 DATA = Path("data")
 START = "2006-01-01"
@@ -101,6 +113,15 @@ def align_to_us_calendar(df: pd.DataFrame, ref_index: pd.DatetimeIndex,
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Download the extended universe (needs the network).")
+    ap.add_argument("--legacy-daily-fx", action="store_true", dest="legacy_daily_fx",
+                    help="LEGACY: forward-fill every series onto the US calendar and convert "
+                         "local legs with the daily FX close of the same date (pre-audit "
+                         "output: stale prices and look-ahead).")
+    args = ap.parse_args()
+    # Audit T2: no forward fill of any price unless --legacy-daily-fx.
+    align_us = align_to_us_calendar if args.legacy_daily_fx else reindex_to_calendar
+
     print(f"Loading existing closes_daily.csv …")
     existing = pd.read_csv(DATA / "closes_daily.csv",
                             parse_dates=["Date"]).set_index("Date").sort_index()
@@ -112,7 +133,7 @@ def main():
     print(f"\nTier A — downloading {len(new_a)} ETFs not in existing data: {new_a}")
     tier_a = batched_download(new_a, START, END)
     if not tier_a.empty:
-        tier_a = align_to_us_calendar(tier_a, ref_index)
+        tier_a = align_us(tier_a, ref_index)
         # Drop rows with all NaN
         coverage_a = tier_a.notna().sum()
         print(f"  Tier A coverage (days with price):")
@@ -129,12 +150,20 @@ def main():
     print(f"  local: {local_tickers}")
     print(f"  FX:    {fx_tickers}")
     tier_b_local = batched_download(local_tickers, START, END)
-    tier_b_fx    = batched_download(fx_tickers, START, END)
+    # Daily FX closes are used only by the legacy conversion.
+    tier_b_fx    = (batched_download(fx_tickers, START, END) if args.legacy_daily_fx
+                    else pd.DataFrame())
     print(f"  Local shape: {tier_b_local.shape}, FX shape: {tier_b_fx.shape}")
 
     # Currency-normalise local prices to USD.
     tier_b_local_usd = pd.DataFrame(index=ref_index)
-    if not tier_b_fx.empty:
+    if not args.legacy_daily_fx:
+        # Audit T2: no intraday FX at the local close → no conversion.
+        tier_b_local_usd, fx_unaligned = build_cross_listed_usd_at_close(
+            tier_b_local, None, TIER_B_ADRS, fx_quote="usd_per_local")
+        print(f"\n  fx_unaligned (not converted, excluded from headline runs): "
+              f"{sorted(loc for loc, flag in fx_unaligned.items() if flag)}")
+    elif not tier_b_fx.empty:
         # Local price × (1 / FX-rate) → USD. YF FX uses local/USD direction
         # e.g. AUDUSD=X = AUD-quoted-in-USD → multiply by it to get USD.
         tier_b_local_usd = build_cross_listed_usd(
@@ -150,7 +179,7 @@ def main():
         print(f"\n  Downloading missing ADR US tickers: {adr_us}")
         adr_us_df = batched_download(adr_us, START, END)
         if not adr_us_df.empty:
-            adr_us_df = align_to_us_calendar(adr_us_df, ref_index)
+            adr_us_df = align_us(adr_us_df, ref_index)
         else:
             adr_us_df = pd.DataFrame(index=ref_index)
     else:

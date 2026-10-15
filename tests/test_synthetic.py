@@ -67,10 +67,16 @@ def test_async_calendars_holidays_and_sample_times():
                                   raw.fx_grid.loc[fx_time].to_numpy())
 
 
-def test_async_without_lags_holidays_or_noise_gives_identical_legs_and_no_pnl():
+@pytest.mark.parametrize("builder,fx_lag_hours", [
+    (synthetic.build_async_panel, 0),
+    # The corrected builder converts at the local close itself: the daily FX
+    # close time does not matter.
+    (synthetic.build_async_panel_fixed, 2),
+], ids=["legacy", "fixed"])
+def test_async_without_lags_holidays_or_noise_gives_identical_legs_and_no_pnl(builder, fx_lag_hours):
     raw = synthetic.async_same_asset(close_lag_hours=0, holidays_per_year=0,
-                                     fx_lag_hours=0, print_noise_bp=0, seed=0)
-    closes, pairs = synthetic.build_async_panel(raw)
+                                     fx_lag_hours=fx_lag_hours, print_noise_bp=0, seed=0)
+    closes, pairs = builder(raw)
     assert pairs == [f"XU{i}-XL{i}.SY_USD" for i in range(10)]
     for pair in pairs:
         us, local_usd = pair.split("-")
@@ -81,6 +87,30 @@ def test_async_without_lags_holidays_or_noise_gives_identical_legs_and_no_pnl():
     # and the core's OLS β is 1 ± a few ulp, so the z-score of a ~1e-16
     # spread can still cross ±2; such trades must book nothing but float noise.
     assert res.trades.empty or res.trades["pnl"].abs().max() < 1e-12
+
+
+@pytest.mark.parametrize("lag", [4.5, 15])
+def test_fixed_async_panel_converts_at_the_local_close_on_the_union_calendar(lag):
+    # Audit T2: each local print is converted with the grid FX at its own close
+    # (16:00 − lag ET), on its own trading dates; the panel is the union
+    # calendar with NaN local prints on local holidays, nothing filled.
+    raw = synthetic.async_same_asset(n_years=3, n_pairs=2, close_lag_hours=lag,
+                                     holidays_per_year=5, fx_lag_hours=2, seed=1)
+    closes, pairs = synthetic.build_async_panel_fixed(raw)
+    days = synthetic.business_days(3)
+    assert pairs == ["XU0-XL0.SY_USD", "XU1-XL1.SY_USD"]
+    assert closes.index.equals(days) and list(closes.columns) == ["XU0", "XU1", "XL0.SY_USD", "XL1.SY_USD"]
+    pd.testing.assert_frame_equal(closes[["XU0", "XU1"]], raw.us, check_names=False)
+    local_close = (raw.local.index + pd.Timedelta(hours=16 - lag)).tz_localize(synthetic.ET)
+    fx = raw.fx_grid.loc[local_close].to_numpy()
+    for i in range(2):
+        usd = closes[f"XL{i}.SY_USD"]
+        assert usd.isna().to_numpy().tolist() == days.isin(raw.holidays).tolist()
+        np.testing.assert_array_equal(usd.dropna().to_numpy(), raw.local[f"XL{i}.SY"].to_numpy() * fx)
+    # The legacy panel converts with the daily FX close (2 h later) instead.
+    legacy, _ = synthetic.build_async_panel(raw)
+    assert not np.allclose(legacy["XL0.SY_USD"].loc[raw.local.index], closes["XL0.SY_USD"].dropna(),
+                           rtol=1e-9, atol=0)
 
 
 def test_ou_spread_half_life_and_sd_match_the_request():

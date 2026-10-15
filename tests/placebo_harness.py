@@ -34,11 +34,13 @@ GROSS = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0)
 
 # Variant table — the single place later tasks edit: name → (cfg, builder of
 # the async panel from AsyncRaw).  "legacy" = GROSS with every legacy_* flag
-# on (the pre-audit behaviour); "fixed" = GROSS with the corrected defaults.
-# Each task adds its legacy_* cfg field to "legacy"; T2 gives "fixed" its builder.
+# on and the legacy panel builder (the pre-audit behaviour); "fixed" = GROSS
+# with the corrected defaults and the corrected builder (since T2).  Each
+# task adds its legacy_* cfg field to "legacy".
 VARIANTS: dict[str, tuple[WfoConfig, Callable]] = {
-    "legacy": (replace(GROSS, legacy_same_close=True), synthetic.build_async_panel),
-    "fixed":  (GROSS, synthetic.build_async_panel),
+    "legacy": (replace(GROSS, legacy_same_close=True, legacy_spread_pnl=True,
+                       legacy_stale_prints=True), synthetic.build_async_panel),
+    "fixed":  (GROSS, synthetic.build_async_panel_fixed),
 }
 
 # name → (generator, kwargs).  AsyncRaw outputs go through the variant's builder.

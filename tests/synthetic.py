@@ -4,6 +4,8 @@
   async_same_asset     one efficient price per pair printed on two exchanges
                        whose closes are hours apart, a daily FX close sampled
                        at yet another time, and local holidays — no edge.
+                       Panels: `build_async_panel` (legacy builder) or
+                       `build_async_panel_fixed` (corrected builder, audit T2).
   ou_positive_control  synchronous legs whose log-spread is an OU process —
                        a real edge.
 
@@ -15,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from datetime import time
 
 import numpy as np
 import pandas as pd
@@ -24,7 +27,10 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from cross_listing import align_to_ref_calendar, build_cross_listed_usd  # noqa: E402
+from cross_listing import (  # noqa: E402
+    Exchange, align_to_ref_calendar, assemble_panel, build_cross_listed_usd,
+    build_cross_listed_usd_at_close,
+)
 
 START = pd.Timestamp("2005-01-03")
 ET = "America/New_York"
@@ -138,6 +144,28 @@ def build_async_panel(raw: AsyncRaw) -> tuple[pd.DataFrame, list[str]]:
     local_usd = build_cross_listed_usd(raw.local, raw.fx_daily, raw.adrs,
                                        ref_index, "usd_per_local")
     closes = pd.concat([us, local_usd], axis=1)
+    pairs = [f"{u}-{loc}_USD" for u, (loc, _) in raw.adrs.items()]
+    return closes, pairs
+
+
+def build_async_panel_fixed(raw: AsyncRaw) -> tuple[pd.DataFrame, list[str]]:
+    """Corrected panel builder (audit T2), through the repo's `cross_listing` code.
+
+    Each local print, on its own trading dates, is converted with the grid FX
+    (`raw.fx_grid` as intraday FX) observed at its own close: the synthetic
+    exchange `.SY` (tz America/New_York, close 16:00 − lag).  The panel is the
+    union calendar of the US and the local dates, NaN local prints on local
+    holidays, nothing filled.
+    """
+    exchanges = {}
+    for loc, _ in raw.adrs.values():
+        minutes = round(raw.close_time_et[loc] * 60)
+        # overlaps_nyse / region are never read for the synthetic exchange.
+        exchanges[loc] = Exchange("SY", ET, time(minutes // 60, minutes % 60), False, "synthetic")
+    local_usd, unaligned = build_cross_listed_usd_at_close(
+        raw.local, raw.fx_grid.to_frame(), raw.adrs, "usd_per_local", exchanges=exchanges)
+    assert not any(unaligned.values())
+    closes = assemble_panel(raw.us, local_usd)
     pairs = [f"{u}-{loc}_USD" for u, (loc, _) in raw.adrs.items()]
     return closes, pairs
 

@@ -24,8 +24,6 @@ ASYNC_BUG = ("pre-T1 behaviour: same-close fills on date-aligned, forward-filled
              "prints converted with a mistimed daily FX close (T1/T2), and positions "
              "open at a window end dropped (T3)")
 T3_PENDING = "T3 pending: positions still open at a window end are dropped"
-T2_PENDING = ("T2 pending: fills on local-holiday dates at the forward-filled stale "
-              "local print")
 
 # Expected outcomes, measured at T0 and re-measured by each task (Ruling R5):
 # (variant, dataset, test) → reason of a strict xfail.  Absent = must pass.
@@ -43,10 +41,10 @@ XFAIL = {
     ("legacy", "async_lag15_hol5",  "tstat"):  ASYNC_BUG,
     ("fixed",  "independent_rw",    "sharpe"): T3_PENDING,
     ("fixed",  "independent_rw",    "tstat"):  T3_PENDING,
-    ("fixed",  "async_lag4.5_hol5", "sharpe"): T2_PENDING,
-    ("fixed",  "async_lag4.5_hol5", "tstat"):  T2_PENDING,
-    ("fixed",  "async_lag15_hol5",  "sharpe"): T2_PENDING,
-    ("fixed",  "async_lag15_hol5",  "tstat"):  T2_PENDING,
+    # Measured at T2: the positions dropped at window ends are winners here
+    # (closed trades biased negative); see AUDIT_FIX_LOG.md, T2.
+    ("fixed",  "async_lag4.5_hol0", "sharpe"): T3_PENDING,
+    ("fixed",  "async_lag4.5_hol0", "tstat"):  T3_PENDING,
 }
 
 TRUNCATION_DATASETS = ["independent_rw", "async_lag15_hol5", "ou_positive_control"]
