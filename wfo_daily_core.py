@@ -796,7 +796,9 @@ class WfoResult:
                    notional) on every business day of the OOS span, zeros on
                    empty days (audit T4, `mtm.daily_mtm`); legacy_exit_date_pnl:
                    trade PnL booked on exit dates over the panel's OOS days.
-    stats:         summary metrics, see `run_stats` (legacy: `trade_stats`).
+    stats:         summary metrics, see `run_stats` (legacy: `trade_stats`), and
+                   headline = False (audit T5): only step3j_wfo_daily.py marks a
+                   run HEADLINE, on a frozen point-in-time universe file.
     daily_returns: daily_pnl / capital, capital = the run's pairs × CAPITAL_PER_PAIR.
     daily_pnl_pairs: the daily MTM PnL per pair (dates of daily_pnl × the
                    run's pairs, `mtm.daily_mtm_pairs`); its columns, added in
@@ -1586,6 +1588,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             by_pair = pd.DataFrame(0.0, index=span, columns=list(pairs))
             daily_pnl = portfolio_pnl(by_pair)
             stats = run_stats(no_trades, len(windows), len(pairs), daily_pnl, capital)
+        stats["headline"] = False           # audit T5: only the CLI certifies a headline run
         return WfoResult(trades=no_trades, daily_pnl=daily_pnl, stats=stats,
                          daily_returns=daily_pnl / capital, daily_pnl_pairs=by_pair)
 
@@ -1756,5 +1759,6 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         daily_pnl = portfolio_pnl(by_pair)
         assert np.isclose(daily_pnl.sum(), trades["pnl"].sum(), rtol=1e-9, atol=1e-9)   # nothing dropped
         stats = run_stats(trades, len(windows), len(pairs), daily_pnl, capital)
+    stats["headline"] = False               # audit T5: only the CLI certifies a headline run
     return WfoResult(trades=trades, daily_pnl=daily_pnl, stats=stats,
                      daily_returns=daily_pnl / capital, daily_pnl_pairs=by_pair)

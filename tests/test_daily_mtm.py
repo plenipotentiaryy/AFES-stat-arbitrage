@@ -257,8 +257,8 @@ def test_legacy_exit_date_pnl_restores_the_exit_date_booking(ou_runs):
     oos_idx = closes.loc[windows[0][2]:max(windows[-1][3], res.trades["exit"].max())].index
     pd.testing.assert_series_equal(leg.daily_pnl, core.exit_date_daily_pnl(res.trades, oos_idx))
     old = core.trade_stats(res.trades, len(windows), len(pairs), oos_idx)
-    assert leg.stats.keys() == old.keys()
-    assert all(leg.stats[k] == old[k] for k in old)
+    assert leg.stats.keys() == old.keys() | {"headline"}      # + T5's headline = False
+    assert all(leg.stats[k] == old[k] for k in old) and leg.stats["headline"] is False
 
 
 def test_legacy_spread_pnl_needs_the_exit_date_booking(ou_runs):

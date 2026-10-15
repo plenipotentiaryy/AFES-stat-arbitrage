@@ -28,6 +28,7 @@ synthetic data whose true edge is known.
 | `test_headline_universe.py` | the CLI's headline-universe filter and cross-listed table (T2) |
 | `test_continuous_positions.py` | one position per pair across windows, β per window for new entries, end-of-run close (T3) |
 | `test_daily_mtm.py` | daily mark-to-market PnL, capital, the one Sharpe, date-ordered MaxDD; the downstream scripts read the MTM file (T4) |
+| `test_universe_pit.py` | the point-in-time universe (`build_universe_pit.py`): as-of members, mechanical pairs, screens on prices up to the as-of date, survivorship gap, truncation acceptance; the CLI's HEADLINE marker; step7's guard (T5) |
 
 ### Variants
 
@@ -222,6 +223,51 @@ its own close, on the union calendar, NaN on local holidays).
   runs and labels its output "LEGACY exit-date booking"; an MTM file that
   does not sum to the trades file (or a per-pair file that does not match)
   stops them ("does not match").
+- **Point-in-time universe** (`test_universe_pit.py`, T5).  The builder
+  `build_universe_pit.py --asof D --constituents <csv> --closes <csv>
+  [--cross-listings <csv>] [--out <csv>]` reads a historical-constituents
+  file — one row per ticker and index-membership spell: `ticker`, `start`,
+  `end` (the date it left; empty = still a member), `sector` (as of the as-of
+  date) and optionally `industry` (used for the pairs when present) — and an
+  optional cross-listing rule (`leg1`, `leg2`, `start`, `end`); the members
+  as of D are the rows with start ≤ D < end or end empty.  It writes
+  `universe_pit_<D>.csv` (pair, leg1, leg2, sector, corr, beta, hl_days,
+  johansen_stat, asof; sorted by pair, floats %.12g) and
+  `universe_pit_<D>.missing.csv` (the members without a close up to D) and
+  prints their SHA-256.  On a synthetic panel (2010–2019, as of 2014-12-31;
+  two factors, each name its factor + an OU spread; a member delisted in
+  2017, one with prices only from 2016, one without a column, a name joining
+  in 2016 and one leaving in 2013 — both cointegrated with members — and a
+  member of another sector cointegrated with them): the members are the
+  spells covering D (boundaries: joins on D = member, leaves on D = not;
+  a ticker with two classifications at D, a row without a start date and
+  an as-of member or cross-listing leg whose ticker contains "-" — the CLI
+  splits pair names on "-" — are refused); the pairs are all
+  same-sector pairs (same-industry when the column exists, leg1 < leg2; a
+  member without a classification pairs with nobody); the universe is
+  exactly the four screened same-sector pairs, the delisted member among
+  them, and its corr / beta / hl_days equal `bias_test.select_pairs_on_train`
+  on the panel cut at D bit for bit (`johansen_stat` = the Johansen trace
+  statistic); the survivorship gap "2 of 9 as-of members (22.2%)" and the
+  sidecar; **acceptance** — the CLI on the full closes and on the closes cut
+  at D writes byte-identical files; post-D prices perturbed wildly (other
+  values, holes, new prints, a new column) give identical files, one pre-D
+  price changed gives a different file; a cross-listing enters only through
+  a rule row in force at D (sector "cross-listing") and the CLI's T2 policy
+  then excludes it.  The CLI (`step3j_wfo_daily.py`, in a temp run dir) marks
+  a run HEADLINE (`stats["headline"] = True`, the pairs file's SHA-256 in the
+  header) only for `universe_pit_<D>.csv` with the builder's columns, a value
+  in every cell and that one D in the `asof` of every row, D strictly before
+  the run's first OOS date, and no `--legacy-*` option; a manual pair list, a
+  missing or mismatched `asof`, a hand-appended pair with a blank `asof` or
+  `corr`, a renamed file with only `pair, asof`, D on or after the first OOS
+  date or a legacy option print the NON-HEADLINE banner in the header and the
+  summary and `headline=False`; the builder's own output file (built in the
+  test) certifies a HEADLINE run from D, and a tampered copy does not;
+  `run_wfo_daily` alone always records `headline = False`.  T2's policy line
+  reads `HEADLINE UNIVERSE POLICY: excludes …`.  `step7_curate_universe.py` stops (`SystemExit`)
+  without `--legacy-oos-curation` and writes nothing; with it, its output is
+  unchanged, under a banner saying it may never be used in a headline run.
 
 ### Statistic definitions
 
@@ -299,3 +345,4 @@ for the per-window engine), the pool ≈ 35 s; the T3 tests add ≈ 1 s.
 At T4 ≈ 50 s: the daily mark-to-market adds ≈ 0.02 s per run (`independent_rw`
 seed 0, best of 5: 0.297 s vs 0.276 s with `legacy_exit_date_pnl`); the T4
 tests add ≈ 3 s.
+At T5 ≈ 52–57 s: the T5 tests add ≈ 3.5 s (15 tests).

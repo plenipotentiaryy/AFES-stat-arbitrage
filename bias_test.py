@@ -30,6 +30,8 @@ SPLIT_DATE = "2014-12-31"          # first 8.5y → select; last 11+y → test
 CORR_MIN   = 0.30                  # min daily-return correlation (relaxed)
 HL_MAX     = 90                    # max half-life (days)
 JOH_CRIT   = 0.90                  # Johansen crit level (relaxed for half-sample)
+JOH_DET_ORDER = 0                  # Johansen test spec: constant term
+JOH_K_AR_DIFF = 1                  # Johansen test spec: lagged differences
 N_TOP_BY_CORR = 200                # cap candidate pair list before Johansen
 
 
@@ -49,7 +51,7 @@ def johansen_coint(p1: pd.Series, p2: pd.Series, crit=0.95) -> tuple[bool, float
     if len(df) < 100:
         return False, np.nan
     try:
-        r = coint_johansen(df, det_order=0, k_ar_diff=1)
+        r = coint_johansen(df, det_order=JOH_DET_ORDER, k_ar_diff=JOH_K_AR_DIFF)
         crit_idx = {0.90: 0, 0.95: 1, 0.99: 2}[crit]
         trace = float(r.lr1[0])
         crit_val = float(r.cvt[0, crit_idx])
@@ -59,6 +61,31 @@ def johansen_coint(p1: pd.Series, p2: pd.Series, crit=0.95) -> tuple[bool, float
         return True, float(-v[1] / v[0])
     except Exception:
         return False, np.nan
+
+
+def screen_pair(closes_train: pd.DataFrame, t1: str, t2: str) -> dict | None:
+    """The selection gates for one pair on the train slice: ≥ 500 rows with
+    both legs, return correlation ≥ CORR_MIN, Johansen at JOH_CRIT with
+    0.1 ≤ |β| ≤ 15, half-life in (0, HL_MAX].  {"corr", "beta", "hl_days"} if
+    the pair passes, else None.  (Also used by build_universe_pit.py, audit T5.)
+    """
+    if t1 not in closes_train.columns or t2 not in closes_train.columns:
+        return None
+    slc = closes_train[[t1, t2]].dropna()
+    if len(slc) < 500:        # need ≥ 2y of daily data
+        return None
+    rets = np.log(slc).diff().dropna()
+    corr = rets[t1].corr(rets[t2])
+    if pd.isna(corr) or corr < CORR_MIN:
+        return None
+    ok, beta = johansen_coint(np.log(slc[t1]), np.log(slc[t2]), crit=JOH_CRIT)
+    if not ok or not (0.1 <= abs(beta) <= 15.0):
+        return None
+    sp = np.log(slc[t1]) - beta * np.log(slc[t2])
+    hl = half_life(sp)
+    if not (0 < hl <= HL_MAX):
+        return None
+    return {"corr": corr, "beta": beta, "hl_days": hl}
 
 
 def select_pairs_on_train(closes_train: pd.DataFrame,
@@ -72,23 +99,9 @@ def select_pairs_on_train(closes_train: pd.DataFrame,
     rows = []
     for pair in candidate_pairs:
         t1, t2 = pair.split("-")
-        if t1 not in closes_train.columns or t2 not in closes_train.columns:
-            continue
-        slc = closes_train[[t1, t2]].dropna()
-        if len(slc) < 500:        # need ≥ 2y of daily data
-            continue
-        rets = np.log(slc).diff().dropna()
-        corr = rets[t1].corr(rets[t2])
-        if pd.isna(corr) or corr < CORR_MIN:
-            continue
-        ok, beta = johansen_coint(np.log(slc[t1]), np.log(slc[t2]), crit=JOH_CRIT)
-        if not ok or not (0.1 <= abs(beta) <= 15.0):
-            continue
-        sp = np.log(slc[t1]) - beta * np.log(slc[t2])
-        hl = half_life(sp)
-        if not (0 < hl <= HL_MAX):
-            continue
-        rows.append({"pair": pair, "corr": corr, "beta": beta, "hl_days": hl})
+        row = screen_pair(closes_train, t1, t2)
+        if row is not None:
+            rows.append({"pair": pair, **row})
     df = pd.DataFrame(rows)
     if df.empty:
         return df

@@ -18,7 +18,10 @@ cross-listed table, and writes the trades CSV, the daily mark-to-market
 series (wfo_daily_mtm<tag>.csv: Date, pnl, ret — audit T4; the input of
 bootstrap_sharpe / dashboard_daily / stress_crisis_analysis /
 factor_attribution), the per-pair daily MTM PnL (wfo_daily_mtm_pairs<tag>.csv,
-read by dashboard_daily) and the equity chart.
+read by dashboard_daily) and the equity chart.  A run is HEADLINE only on a
+frozen point-in-time universe (audit T5, `non_headline_reasons`); every other
+run prints a NON-HEADLINE banner in its header and summary, and
+`WfoResult.stats["headline"]` records the verdict.
 
 CLI:
     python step3j_wfo_daily.py --pairs pairs_baseline14.csv
@@ -27,6 +30,8 @@ CLI:
 from __future__ import annotations
 import argparse
 import dataclasses
+import hashlib
+import re
 from pathlib import Path
 
 import matplotlib
@@ -35,10 +40,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from config import DATA_DIR, OUTPUT_DIR, BAR_TIMEFRAME
+from build_universe_pit import COLUMNS as PIT_COLUMNS
 from cross_listing import close_time
 from wfo_daily_core import (
     TRAIN_INIT_MO, OOS_MO, STEP_MO,
-    WfoConfig, run_wfo_daily, summarise, trade_stats,
+    WfoConfig, make_windows, run_wfo_daily, summarise, trade_stats,
 )
 
 
@@ -117,6 +123,50 @@ def cross_listed_table(excluded: pd.DataFrame, trades: pd.DataFrame | None = Non
         table["total_pnl"] = mine.sum().reindex(table.index, fill_value=0.0).round(4)
     bar = "=" * 70
     return f"{bar}\n{title}\n{bar}\n{table.to_string() if len(table) else '(none)'}"
+
+
+# ── Headline run (audit T5) ─────────────────────────────────────────────────
+
+PIT_UNIVERSE_FILE = re.compile(r"universe_pit_(\d{4}-\d{2}-\d{2})\.csv")
+NON_HEADLINE_BANNER = ("NON-HEADLINE RUN: pairs file is not a frozen point-in-time universe "
+                       "(hindsight / survivorship)")
+
+
+def non_headline_reasons(pairs_file: str, pairs_df: pd.DataFrame, first_oos,
+                         legacy: list[str]) -> list[str]:
+    """Why a run is not a headline run; empty = HEADLINE.  A headline run
+    reads a frozen point-in-time universe written by build_universe_pit.py — a
+    file named universe_pit_<asof>.csv with the builder's columns, a value in
+    each of them on every row, and that one as-of date in the `asof` column
+    of every row (a hand-appended pair is not frozen) — whose as-of date is
+    strictly before the run's first OOS date (`first_oos`, None if the run has
+    no window), and uses no legacy option (`legacy`, the --legacy-* options
+    given; hard rule 5).  Manual pair lists, step7's OOS-PnL curation and every
+    other pairs file are not headline."""
+    reasons = []
+    name = PIT_UNIVERSE_FILE.fullmatch(Path(pairs_file).name)
+    frozen = (name is not None and len(pairs_df) > 0
+              and all(c in pairs_df.columns for c in PIT_COLUMNS)
+              and bool(pairs_df[PIT_COLUMNS].notna().all().all())
+              and bool((pairs_df["asof"].astype(str) == name.group(1)).all()))
+    if not frozen:
+        reasons.append(NON_HEADLINE_BANNER)
+    elif first_oos is None or not pd.Timestamp(name.group(1)) < first_oos:
+        first = "none (no window)" if first_oos is None else first_oos.date()
+        reasons.append(f"{NON_HEADLINE_BANNER}: as of {name.group(1)}, not before the first "
+                       f"OOS date {first}")
+    if legacy:
+        reasons.append("NON-HEADLINE RUN: legacy options " + ", ".join(legacy))
+    return reasons
+
+
+def headline_block(reasons: list[str], pairs_file: str, first_oos) -> str:
+    """The banner of a non-headline run, or the headline line."""
+    if reasons:
+        bar = "!" * 70
+        return "\n".join([bar, *reasons, bar])
+    return (f"HEADLINE RUN: frozen point-in-time universe {Path(pairs_file).name}, "
+            f"first OOS date {first_oos.date()}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
@@ -248,7 +298,8 @@ def main():
 
     closes_path = DATA_DIR / args.closes
     closes = pd.read_csv(closes_path, parse_dates=["Date"]).set_index("Date").sort_index()
-    pairs  = pd.read_csv(DATA_DIR / args.pairs)["pair"].tolist()
+    pairs_df = pd.read_csv(DATA_DIR / args.pairs)
+    pairs  = pairs_df["pair"].tolist()
 
     vwap_daily = None
     if args.exec_mode == "vwap":
@@ -273,7 +324,7 @@ def main():
     # fx_unaligned.  The legacy run lists unclassifiable legs instead of stopping.
     excluded = headline_exclusions(pairs, unknown_ok=args.legacy_cross_listed)
     run_pairs = pairs if args.legacy_cross_listed else [p for p in pairs if p not in excluded.index]
-    print("HEADLINE UNIVERSE: excludes pairs with an fx_unaligned leg (*_USD), an ASX/TSE leg "
+    print("HEADLINE UNIVERSE POLICY: excludes pairs with an fx_unaligned leg (*_USD), an ASX/TSE leg "
           "(no NYSE overlap) or a European leg (no synchronous 09:30-11:30 ET snapshots)")
     if args.legacy_cross_listed:
         print(f"  LEGACY (--legacy-cross-listed): all {len(pairs)} pairs run; the "
@@ -283,11 +334,25 @@ def main():
               f"({len(excluded)} cross-listed pairs excluded, listed at the end)")
 
     cfg = WfoConfig(**{f.name: getattr(args, f.name) for f in dataclasses.fields(WfoConfig)})
+
+    # Audit T5: HEADLINE only on a frozen point-in-time universe.
+    windows = make_windows(closes, cfg.train, cfg.oos, cfg.step, start=cfg.start, end=cfg.end)
+    first_oos = windows[0][2] if windows else None
+    legacy = [f"--{k.replace('_', '-')}" for k, v in vars(args).items() if k.startswith("legacy_") and v]
+    reasons = non_headline_reasons(args.pairs, pairs_df, first_oos, legacy)
+    digest = hashlib.sha256((DATA_DIR / args.pairs).read_bytes()).hexdigest()
+    print(f"UNIVERSE: {DATA_DIR / args.pairs}  SHA-256 {digest}")
+    banner = headline_block(reasons, args.pairs, first_oos)
+    print(banner)
+
     result = run_wfo_daily(closes, run_pairs, cfg, volumes=volumes, vwap=vwap_daily)
+    result.stats["headline"] = not reasons
+    verdict = f"{banner}\nheadline={result.stats['headline']}"
     if result.trades.empty:
         print("\nNo trades.")
         print("\n" + cross_listed_table(excluded))
-        return
+        print("\n" + verdict)
+        return result
     trades = result.trades
 
     legacy_pnl = args.legacy_exit_date_pnl
@@ -305,6 +370,7 @@ def main():
                   + (f", Sharpe(full) {st['sharpe_full']:+.3f}" if legacy_pnl else ""))
     else:
         print("\n" + cross_listed_table(excluded))
+    print("\n" + verdict)
 
     suffix = f"_{args.tag}" if args.tag else ""
     out_csv = DATA_DIR / f"wfo_daily_results{suffix}.csv"
@@ -321,6 +387,7 @@ def main():
         result.daily_pnl_pairs.rename_axis("Date").to_csv(out_pairs)
         print(f"MTM    → {out_mtm} ({len(result.daily_pnl)} business days), per pair → {out_pairs}")
     print(f"Chart  → {chart}")
+    return result
 
 
 if __name__ == "__main__":
