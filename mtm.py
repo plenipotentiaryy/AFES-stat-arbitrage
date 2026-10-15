@@ -10,8 +10,14 @@ exit fill price (a VWAP fill is marked to the close on its fill date):
 
 so a trade's daily PnL sums to its gross PnL; a leg without a print on a
 date books nothing that date (its next print carries the move, no price is
-filled).  Costs are charged on the fill dates (half the round trip on each),
-borrow on each of the pair's rows with both legs in (entry fill, exit fill].
+filled).  Costs are charged on the fill dates, borrow on each of the pair's
+rows with both legs in (entry fill, exit fill].  Audit T8: each fill costs
+rate_leg × |leg notional at the fill| summed over the legs (`fill_cost`;
+the trade's cost_entry on the entry fill date, cost_exit on the exit fill
+date), and each held row's borrow is rate × |q·P| of each short leg at that
+row's close (`borrow_rows`; the trade's borrow_rate1 / borrow_rate2, 0 for a
+long leg).  legacy_flat_cost trades (borrow rates NaN): half the round trip
+on each fill date and borrow / held on each held row, as before T8.
 
 Capital (ruling, audit T4): a constant, the number of pairs in the run ×
 CAPITAL_PER_PAIR = 2.0 USD per $1 of leg-1 notional (a pair with |β| = 1
@@ -48,6 +54,25 @@ LEGACY_LABEL = ("LEGACY exit-date booking: each trade's PnL on its exit date "
 MTM_LABEL = "daily mark-to-market PnL, USD per $1 of leg-1 notional"
 
 
+# ── Costs that scale with the position (audit T8) ───────────────────────────
+# Shared by the engines (wfo_daily_core) and the daily schedule below, so a
+# trade's cost and borrow and its daily charges are the same arithmetic.
+
+def fill_cost(rate1: float, rate2: float, q1: float, q2: float, p1: float, p2: float) -> float:
+    """Cost of one fill of both legs per unit size: Σ rate_leg · |q_leg · P_leg|,
+    the rates per leg per fill as fractions of the leg's notional at the fill
+    price P (per $1 of leg-1 notional the entry notionals are 1 and |β|)."""
+    return rate1 * abs(q1 * p1) + rate2 * abs(q2 * p2)
+
+
+def borrow_rows(rate1: float, rate2: float, q1: float, q2: float, p1, p2) -> np.ndarray:
+    """Borrow of each held row per unit size: Σ rate_leg · |q_leg · P_leg| at the
+    row's closes p1, p2 (arrays), with rate_leg the leg's borrow per day when
+    it is short and 0 when it is long."""
+    p1, p2 = np.asarray(p1, dtype=float), np.asarray(p2, dtype=float)
+    return rate1 * np.abs(q1 * p1) + rate2 * np.abs(q2 * p2)
+
+
 # ── Daily MTM ───────────────────────────────────────────────────────────────
 
 def _leg_steps(vals: np.ndarray, lo: int, hi: int, p_in: float,
@@ -73,17 +98,23 @@ def _trade_arrays(v1: np.ndarray, v2: np.ndarray, lo: int, hi: int,
     gross[rows - lo] += t.side * t.q1 * dp
     rows, dp = _leg_steps(v2, lo, hi, t.p2_entry, t.p2_exit)
     gross[rows - lo] -= t.side * t.q2 * dp
-    # Costs on the fill dates: half the round trip at the entry, half at the exit.
+    # Costs on the fill dates: the entry fill's at the entry, the exit fill's
+    # at the exit (legacy_flat_cost: half the round trip each).
     cost = np.zeros(n)
-    cost[0] += t.cost / 2
-    cost[-1] += t.cost / 2
+    cost[0] += t.cost_entry
+    cost[-1] += t.cost_exit
     # Borrow on each of the pair's rows (both legs print) in (entry, exit]:
     # `held` of them on the engine's panel.
     both = ~(np.isnan(v1[lo + 1:hi + 1]) | np.isnan(v2[lo + 1:hi + 1]))
     assert both.sum() == t.held, "the trade's held rows are the pair's rows of this panel"
     borrow = np.zeros(n)
     if t.held:
-        borrow[1:][both] = t.borrow / t.held
+        if np.isnan(t.borrow_rate1):           # legacy_flat_cost: per unit size per held row
+            borrow[1:][both] = t.borrow / t.held
+        else:                                  # audit T8: the short legs' notional at the row's close
+            rows = lo + 1 + np.flatnonzero(both)
+            borrow[rows - lo] = borrow_rows(t.borrow_rate1, t.borrow_rate2, t.q1, t.q2,
+                                            v1[rows], v2[rows])
     return gross, cost, borrow
 
 
@@ -109,7 +140,8 @@ def daily_mtm_pairs(trades: pd.DataFrame, closes: pd.DataFrame, index: pd.Dateti
     zeros on the other days.  Columns: the pairs with trades, in order of
     first appearance in `trades`, then the other `pairs` (all zeros).
     trades: the final trades table (after every filter; per-unit gross, cost,
-    borrow; pnl = size·(gross − cost − borrow)); closes: the engine's panel.
+    borrow, cost_entry, cost_exit, borrow_rate1, borrow_rate2; pnl =
+    size·(gross − cost − borrow)); closes: the engine's panel.
     Asserts that no date with PnL falls outside `index` and that each pair's
     series sums to its trades' PnL."""
     cols = {}

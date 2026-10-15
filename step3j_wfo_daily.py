@@ -18,12 +18,15 @@ cross-listed table, and writes the trades CSV, the daily mark-to-market
 series (wfo_daily_mtm<tag>.csv: Date, pnl, ret — audit T4; the input of
 bootstrap_sharpe / dashboard_daily / stress_crisis_analysis /
 factor_attribution), the per-pair daily MTM PnL (wfo_daily_mtm_pairs<tag>.csv,
-read by dashboard_daily) and the equity chart.  A run is HEADLINE only on a
-frozen point-in-time universe (audit T5, `non_headline_reasons`); every other
-run prints a NON-HEADLINE banner in its header and summary, and
-`WfoResult.stats["headline"]` records the verdict.  Final holdout (audit T6):
-a run that would use a date on or after wfo_daily_core.HOLDOUT_START
-(2024-01-01) stops unless --final-holdout, and every --final-holdout run is
+read by dashboard_daily), the run's description wfo_daily_meta<tag>.json (the
+cost model, the WfoConfig and its hash, the git revision, the pairs file's
+SHA-256 and the headline flag — audit T8) and the equity chart.  A run is
+HEADLINE only on a frozen point-in-time universe (audit T5,
+`non_headline_reasons`); every other run prints a NON-HEADLINE banner in its
+header and summary, and `WfoResult.stats["headline"]` records the verdict.
+Final holdout (audit T6): a run that would use a date on or after
+wfo_daily_core.HOLDOUT_START (2024-01-01) stops unless --final-holdout, and
+every --final-holdout run is
 recorded in HOLDOUT_USES.md before it starts; every run whose span lies in the
 development period is appended to the trials registry TRIALS.csv, and the
 summary prints the annualised Sharpe, PSR(0), the Deflated Sharpe Ratio and N
@@ -59,8 +62,8 @@ from cross_listing import close_time
 from perf_stats import deflated_sharpe, psr, sharpe_per_period, sr0_threshold
 from wfo_daily_core import (
     TRAIN_INIT_MO, OOS_MO, STEP_MO, HOLDOUT_START,
-    WfoConfig, holdout_violation, make_windows, run_last_date, run_wfo_daily, summarise,
-    trade_stats,
+    WfoConfig, cost_model, holdout_violation, make_windows, run_last_date, run_wfo_daily,
+    summarise, trade_stats,
 )
 
 
@@ -342,11 +345,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start",  type=str, default=None)
     p.add_argument("--end",    type=str, default=None)
     p.add_argument("--cost",   type=float, default=5.0,
-                   help="Commission + half-spread, bps per leg (default 5).")
+                   help="Commission + half-spread, bp per leg per fill × the leg's notional "
+                        "(flat model; default 5).")
     p.add_argument("--slip",   type=float, default=5.0,
-                   help="Slippage, bps per leg (default 5).")
+                   help="Slippage, bp per leg per fill × the leg's notional (flat model; "
+                        "default 5). Round trip = 2·(cost + slip)·(1 + |β|) per $1 of leg-1 "
+                        "notional at unchanged prices.")
     p.add_argument("--borrow", type=float, default=80.0,
-                   help="Borrow rate on short leg, bps/year (default 80).")
+                   help="Borrow on a short leg's notional (marked at each held row's close), "
+                        "bp/year, US listings (flat model; default 80).")
+    p.add_argument("--borrow-nonus", type=float, default=300.0, dest="borrow_nonus",
+                   help="Borrow on a short non-US (*_USD) leg's notional, bp/year (flat model; "
+                        "default 300 = the highest borrow tier of almgren_chriss_repricing."
+                        "TIER_TABLE: the hard-to-borrow / locate cost of foreign lines is "
+                        "unknown here). The almgren model uses its tier rates.")
+    p.add_argument("--fx-cost", type=float, default=2.0, dest="fx_cost",
+                   help="FX conversion cost, bp per fill of a *_USD leg (a local listing "
+                        "converted to USD) × its notional; both models (default 2).")
     p.add_argument("--train",  type=int, default=TRAIN_INIT_MO,
                    help=f"Initial train length in months (default {TRAIN_INIT_MO}).")
     p.add_argument("--oos",    type=int, default=OOS_MO,
@@ -416,6 +431,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="LEGACY: enter on any |z| > entry_z, as before the audit (no "
                         "|z| < stop_z limit: 5-10 sigma jumps, often stale prices, are "
                         "traded). Comparison only; never for headline results.")
+    p.add_argument("--legacy-flat-cost", action="store_true", dest="legacy_flat_cost",
+                   help="LEGACY: the pre-T8 cost per trade — one round trip whatever |β| "
+                        "(flat: 2·(cost + slip) bp; almgren: 2·(c1 + c2)), no FX cost, borrow "
+                        "per unit size per held day (flat: --borrow; almgren: leg 2's tier). "
+                        "Needed by --legacy-spread-pnl. Comparison only; never for headline "
+                        "results.")
     p.add_argument("--final-holdout", action="store_true", dest="final_holdout",
                    help="Allow the run to use the final holdout (dates from "
                         f"{HOLDOUT_START.date()}). Recorded in HOLDOUT_USES.md before the "
@@ -448,11 +469,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Conditional gate for Aussie/JP ADR pairs: entry_z>=2.5, "
                         "blackout when 5d realized spread vol > 95th-pct of trailing 252d, "
                         "require rolling 60d AR(1) half-life < 5 days.")
-    p.add_argument("--execution-model", type=str, default="almgren",
+    p.add_argument("--execution-model", type=str, default="flat",
                    choices=["flat", "almgren"], dest="execution_model",
-                   help="flat = commission+slip+borrow scalars (--cost --slip --borrow). "
-                        "almgren = per-pair tiered cost: half_spread + κ·σ·√(notional/ADV), "
-                        "plus tier-specific borrow on short leg.  Default: almgren.")
+                   help="Cost rate per fill per leg (× the leg's notional at the fill; audit "
+                        "T8): flat = --cost + --slip bp, borrow --borrow / --borrow-nonus; "
+                        "almgren = the leg's tier half_spread + κ·σ·√(notional/ADV), borrow at "
+                        "the short leg's tier rate.  Both add --fx-cost on *_USD legs.  "
+                        "Default: flat — the model with the lower development-period Sharpe "
+                        "(conservative ruling, AUDIT_FIX_LOG.md T8).")
     p.add_argument("--notional", type=float, default=100_000,
                    dest="notional",
                    help="USD notional per leg, used by Almgren-Chriss impact term. "
@@ -544,7 +568,7 @@ def main():
     trades = result.trades
 
     legacy_pnl = args.legacy_exit_date_pnl
-    summarise(trades, label=f"NET {args.cost} bps/leg",
+    summarise(trades, label=cost_model(cfg)["label"],         # audit T8 (legacy: NET <cost> bps/leg)
               n_windows=result.stats["n_windows"], n_pairs=len(run_pairs),
               oos_index=result.daily_pnl.index, stats=None if legacy_pnl else result.stats)
     if not legacy_pnl:
@@ -576,6 +600,24 @@ def main():
         out_pairs = DATA_DIR / f"wfo_daily_mtm_pairs{suffix}.csv"
         result.daily_pnl_pairs.rename_axis("Date").to_csv(out_pairs)
         print(f"MTM    → {out_mtm} ({len(result.daily_pnl)} business days), per pair → {out_pairs}")
+    # Audit T8: the run's description next to its results (read by T9–T11).
+    out_meta = DATA_DIR / f"wfo_daily_meta{suffix}.json"
+    meta = {
+        "cost_model": cost_model(cfg),
+        "config": dataclasses.asdict(cfg),
+        "config_hash": chash,
+        "git_revision": git_revision(),
+        "pairs_file": args.pairs,
+        "pairs_sha256": digest,
+        "closes_file": args.closes,
+        "headline": result.stats["headline"],
+        "legacy_options": legacy,
+        "files": {"trades": out_csv.name,
+                  "mtm": None if legacy_pnl else f"wfo_daily_mtm{suffix}.csv",
+                  "mtm_pairs": None if legacy_pnl else f"wfo_daily_mtm_pairs{suffix}.csv"},
+    }
+    out_meta.write_text(json.dumps(meta, indent=2) + "\n")
+    print(f"Meta   → {out_meta}")
     print(f"Chart  → {chart}")
     return result
 

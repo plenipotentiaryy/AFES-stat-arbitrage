@@ -29,8 +29,10 @@ for _p in (_ROOT, _HERE):
 import synthetic  # noqa: E402
 from wfo_daily_core import WfoConfig, run_wfo_daily  # noqa: E402
 
-# Gross = before costs: flat model with zero cost, slippage and borrow (Ruling R3).
-GROSS = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0)
+# Gross = before costs: flat model with zero cost, slippage and borrow (Ruling R3),
+# and (audit T8) zero FX conversion cost and non-US borrow.
+GROSS = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0, fx_cost=0.0,
+                  borrow_nonus=0.0)
 
 # Variant table — the single place later tasks edit: name → (cfg, builder of
 # the async panel from AsyncRaw).  "legacy" = GROSS with every legacy_* flag
@@ -40,7 +42,8 @@ GROSS = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0)
 VARIANTS: dict[str, tuple[WfoConfig, Callable]] = {
     "legacy": (replace(GROSS, legacy_same_close=True, legacy_spread_pnl=True,
                        legacy_stale_prints=True, legacy_window_reset=True,
-                       legacy_exit_date_pnl=True, legacy_no_entry_guards=True),
+                       legacy_exit_date_pnl=True, legacy_no_entry_guards=True,
+                       legacy_flat_cost=True),
                synthetic.build_async_panel),
     "fixed":  (GROSS, synthetic.build_async_panel_fixed),
 }

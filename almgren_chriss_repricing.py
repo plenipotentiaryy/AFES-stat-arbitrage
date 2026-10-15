@@ -101,8 +101,11 @@ def main():
     ap.add_argument("--notional", type=float, default=100_000,
                     help="USD notional per leg (default $100k).")
     ap.add_argument("--default-cost-bps", type=float, default=20.0,
-                    help="Round-trip cost embedded in source trades "
-                         "(2*(commission+slip)*2 = 20bps for 5/5).")
+                    help="Round-trip cost per trade embedded in the source trades. The default "
+                         "20 is what the pre-T8 flat model charged: 2*(commission+slip) = "
+                         "2*(5+5) = 20 bps per pair round trip, whatever |beta| (the formula "
+                         "2*(commission+slip)*2 would give 40 bps for 5/5). Trades written "
+                         "since audit T8 carry their own cost per trade in the 'cost' column.")
     ap.add_argument("--default-borrow-bps", type=float, default=80.0,
                     help="Annual borrow embedded in source trades.")
     ap.add_argument("--split",    default="2014-12-31")

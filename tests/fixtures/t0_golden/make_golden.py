@@ -136,15 +136,23 @@ SAME_AS_BASELINE = {
 }
 
 
+# The 46ffdfb CLI's default --execution-model.  Audit T8 made `flat` the
+# default, so a spec without the option names this one: the same trades from
+# the pre-refactor CLI, and the same config from the current one.
+PRE_AUDIT_MODEL = ["--execution-model", "almgren"]
+
+
 def inputs(spec: dict) -> dict:
-    """closes, pairs, volumes (or None), vwap (or None) and CLI args of a spec."""
+    """closes, pairs, volumes (or None), vwap (or None) and CLI args of a spec
+    (with PRE_AUDIT_MODEL unless the spec picks a model)."""
     closes, pairs = PANELS[spec.get("panel", "base")]()
+    args = spec["args"] if "--execution-model" in spec["args"] else [*PRE_AUDIT_MODEL, *spec["args"]]
     return {
         "closes": closes,
         "pairs": pairs,
         "volumes": volumes_for(closes) if spec.get("volumes", True) else None,
         "vwap": vwap_for(closes) if spec.get("vwap", False) else None,
-        "args": spec["args"],
+        "args": args,
     }
 
 

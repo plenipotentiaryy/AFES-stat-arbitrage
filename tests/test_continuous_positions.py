@@ -183,9 +183,10 @@ def test_pre_t3_legacy_flags_need_the_window_reset(flag):
     with pytest.raises(ValueError, match="legacy_window_reset"):
         run(closes, replace(GROSS, **{flag: True}))
     # (spread PnL has no leg quantities to mark daily: it also needs the
-    # exit-date booking, T4)
+    # exit-date booking, T4, and the per-trade cost, T8)
     run(closes, replace(GROSS, legacy_window_reset=True, **{flag: True},
-                        legacy_exit_date_pnl=flag == "legacy_spread_pnl"))
+                        legacy_exit_date_pnl=flag == "legacy_spread_pnl",
+                        legacy_flat_cost=flag == "legacy_spread_pnl"))
 
 
 # ── Engine level ────────────────────────────────────────────────────────────

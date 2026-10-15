@@ -46,7 +46,7 @@ from wfo_daily_core import WfoConfig, run_wfo_daily  # noqa: E402
 
 HOLDOUT = pd.Timestamp("2024-01-01")
 DEV_END = "2023-12-31"
-GROSS = dict(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0)
+GROSS = dict(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0, fx_cost=0.0, borrow_nonus=0.0)
 
 
 def panel_into_holdout(start: str = "2021-01-04", n_years: int = 4) -> tuple[pd.DataFrame, list[str]]:
@@ -122,7 +122,7 @@ def test_a_development_run_reads_nothing_from_the_holdout(case):
     closes, pairs = panel_into_holdout()
     cfg = {"gross": WfoConfig(end=DEV_END, **GROSS),
            "hmm_block_panic": WfoConfig(end=DEV_END, hmm="block-panic", **GROSS),
-           "almgren_volumes": WfoConfig(end=DEV_END)}[case]
+           "almgren_volumes": WfoConfig(end=DEV_END, execution_model="almgren")}[case]
     vol = synthetic_volumes(closes) if case == "almgren_volumes" else None
     full = quiet(closes, pairs, cfg, volumes=vol)
     cut = quiet(closes.loc[:DEV_END], pairs, cfg,

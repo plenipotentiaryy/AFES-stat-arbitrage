@@ -20,7 +20,7 @@ from dateutil.relativedelta import relativedelta
 from config import BAR_TIMEFRAME
 from cross_listing import mask_stale_prints, repeats_previous_print
 from kalman import kalman_hedge
-from mtm import CAPITAL_PER_PAIR, daily_mtm_pairs, mtm_stats, portfolio_pnl
+from mtm import CAPITAL_PER_PAIR, borrow_rows, daily_mtm_pairs, fill_cost, mtm_stats, portfolio_pnl
 from metagate_daily import (
     MetaGateDaily, FEATURE_NAMES as MG_FEATURES,
     entry_features as mg_entry_features,
@@ -159,9 +159,84 @@ def leg_gross(side: int, q1: float, q2: float, p1e: float, p2e: float,
     return side * (q1 * (p1x - p1e) - q2 * (p2x - p2e))
 
 
-def net_pnl(size: float, gross: float, cost: float, held: int, borrow_per_day: float) -> float:
-    """size·(gross − round-trip cost − held days of borrow)."""
-    return size * gross - size * cost - size * (held * borrow_per_day)
+def net_pnl(size: float, gross: float, cost: float, borrow: float) -> float:
+    """size·(gross − cost − borrow), cost and borrow per unit size (`Charges`)."""
+    return size * gross - size * cost - size * borrow
+
+
+# ── Costs that scale with the position (audit T8) ───────────────────────────
+
+class LegCosts(NamedTuple):
+    """Cost rates of a trade's legs (audit T8), fractions of the leg's notional.
+
+    fill1 / fill2: per fill of leg 1 / leg 2 (flat: commission + slippage;
+    almgren: leg 1's tier half-spread + impact at --notional, leg 2's tier
+    half-spread), plus the FX conversion cost on a `*_USD` leg.  impact2
+    (almgren; 0 for flat): leg 2's square-root impact at a participation of
+    --notional / ADV; a trade's leg 2 trades |β_e|·notional, so it pays
+    fill2 + impact2·√|β_e| per fill (Ruling R38: the leg's own notional, β_e
+    the trade's entry β; the entry participation sets the rate of both fills).
+    borrow1 / borrow2: per held day of the leg while it is short (US / non-US
+    rate, or the almgren tier rate)."""
+    fill1: float
+    fill2: float
+    borrow1: float
+    borrow2: float
+    impact2: float = 0.0
+
+
+class Charges(NamedTuple):
+    """A trade's costs per unit size: cost = cost_entry + cost_exit (charged on
+    the entry / exit fill dates), borrow over its held rows at the per-day
+    rates borrow_rate1 / borrow_rate2 of its short legs (0: a long leg; NaN:
+    legacy_flat_cost, borrow per unit size per held day)."""
+    cost: float
+    borrow: float
+    cost_entry: float
+    cost_exit: float
+    borrow_rate1: float
+    borrow_rate2: float
+
+
+def is_non_us_listing(ticker: str) -> bool:
+    """A local (non-US) listing converted to USD (`*_USD`): traded in a foreign
+    currency (an FX conversion on every fill) and borrowed abroad.  US
+    listings, ADRs included, trade in USD."""
+    return ticker.endswith("_USD")
+
+
+def short_borrow_rates(side: int, beta: float, borrow1: float, borrow2: float) -> tuple[float, float]:
+    """(rate1, rate2): the borrow rate of each leg that is short, 0 for a long
+    leg.  Leg 1 holds side·q1 (q1 > 0): short when side = −1; leg 2 holds
+    −side·q2 with q2 = β/P2: short when side·β > 0.  So with β < 0 a short
+    spread borrows both legs and a long spread neither."""
+    return (borrow1 if side < 0 else 0.0), (borrow2 if side * beta > 0 else 0.0)
+
+
+def trade_charges(leg_costs: LegCosts | None, cost_per_trade: float, borrow_per_day: float,
+                  held: int, side: int, beta: float, q1: float, q2: float,
+                  p1e: float, p2e: float, p1x: float, p2x: float,
+                  held_closes: np.ndarray | None) -> Charges:
+    """A trade's `Charges`.  Audit T8 (leg_costs): each fill costs Σ fill_leg ·
+    |q_leg · P_leg| at its fill prices (`mtm.fill_cost`; entry: 1 and |β| per
+    $1 of leg-1 notional; leg 2's rate fill2 + impact2·√|β|), and each of the
+    `held` rows borrows Σ rate_leg · |q_leg · P_leg| of the short legs at the
+    row's closes (`mtm.borrow_rows`; held_closes: [P1, P2] of the held rows).  leg_costs None
+    (legacy_flat_cost): the pre-T8 round trip cost_per_trade, whatever |β|,
+    half on each fill date, and held · borrow_per_day."""
+    if leg_costs is None:
+        nan = float("nan")
+        return Charges(cost_per_trade, held * borrow_per_day, cost_per_trade / 2, cost_per_trade / 2,
+                       nan, nan)
+    f2 = leg_costs.fill2
+    if leg_costs.impact2:                  # almgren: leg 2's participation is |β|·notional (R38)
+        f2 = f2 + leg_costs.impact2 * float(np.sqrt(abs(beta)))
+    ce = fill_cost(leg_costs.fill1, f2, q1, q2, p1e, p2e)
+    cx = fill_cost(leg_costs.fill1, f2, q1, q2, p1x, p2x)
+    r1, r2 = short_borrow_rates(side, beta, leg_costs.borrow1, leg_costs.borrow2)
+    assert held_closes is not None and len(held_closes) == held
+    borrow = float(borrow_rows(r1, r2, q1, q2, held_closes[:, 0], held_closes[:, 1]).sum())
+    return Charges(ce + cx, borrow, ce, cx, r1, r2)
 
 
 def entry_decision(i: int, zi: float, n: int, entry_z: float,
@@ -264,11 +339,13 @@ def tightened_stop(spread: pd.Series, i: int, stop_z: float,
 def trade_record(idx: pd.Index, entry_sig: int, entry_idx: int, exit_sig: int,
                  exit_idx: int, side: int, size: float, pnl: float, reason: str,
                  beta_e: float, p1e: float, p2e: float, p1x: float, p2x: float,
-                 q1: float, q2: float, gross: float, cost: float, borrow: float) -> dict:
+                 q1: float, q2: float, gross: float, ch: Charges) -> dict:
     """One row of the trades table (bar numbers → dates; fills `entry` /
     `exit`, decisions `entry_signal` / `exit_signal`).  gross, cost (round
     trip) and borrow (all held days) are per unit size and never rescaled, so
-    pnl = size·(gross − cost − borrow) after every sizing filter (audit T4)."""
+    pnl = size·(gross − cost − borrow) after every sizing filter (audit T4);
+    cost_entry / cost_exit and the borrow rates (`Charges`, audit T8) are what
+    the daily mark-to-market charges on each date."""
     return {
         "entry":  idx[entry_idx], "exit": idx[exit_idx],
         "held":   exit_idx - entry_idx, "side": side, "pnl": pnl,
@@ -277,7 +354,9 @@ def trade_record(idx: pd.Index, entry_sig: int, entry_idx: int, exit_sig: int,
         "entry_signal": idx[entry_sig], "exit_signal": idx[exit_sig],
         "beta": beta_e, "p1_entry": p1e, "p2_entry": p2e, "p1_exit": p1x,
         "p2_exit": p2x, "q1": q1, "q2": q2, "gross": gross,
-        "cost": cost, "borrow": borrow,
+        "cost": ch.cost, "borrow": ch.borrow,
+        "cost_entry": ch.cost_entry, "cost_exit": ch.cost_exit,
+        "borrow_rate1": ch.borrow_rate1, "borrow_rate2": ch.borrow_rate2,
     }
 
 
@@ -305,6 +384,7 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                   exec_leg_prices: pd.DataFrame | None = None,
                   beta: float | pd.Series | None = None,
                   legacy_no_entry_guards: bool = False,
+                  leg_costs: LegCosts | None = None,
                   ) -> pd.DataFrame:
     """Generate mean-reversion trades on a daily spread.
 
@@ -345,8 +425,13 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     exec_spread): each leg's VWAP of bar i+1 on row i; a leg fills at its
     VWAP, an exit leg without one at its close (an entry without a VWAP
     spread is not filled, as above).  Without leg_prices (legacy): gross =
-    side·(exit_spread − entry_spread).  Either way pnl = size·(gross −
-    cost_per_trade − held·borrow_per_day).
+    side·(exit_spread − entry_spread).
+
+    Costs (audit T8, `trade_charges`): leg_costs — each fill of each leg at
+    its rate × the leg's notional at the fill, borrow on the short legs'
+    notional at each held row's close (needs leg_prices); None
+    (legacy_flat_cost) — cost_per_trade per round trip and borrow_per_day
+    per held day.  Either way pnl = size·(gross − cost − borrow).
     """
     if z_series is None:
         z = rolling_z(spread_full, z_win)
@@ -381,6 +466,7 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     # Audit T2: leg prices and β; the open position's entry legs and quantities.
     assert leg_prices is None or (beta is not None
                                   and (exec_spread is None) == (exec_leg_prices is None))
+    assert leg_costs is None or leg_prices is not None, "position costs need the legs' prices"
     leg_vals = leg_prices.reindex(idx).to_numpy(dtype=float) if leg_prices is not None else None
     xleg_vals = (exec_leg_prices.reindex(idx).to_numpy(dtype=float)
                  if exec_leg_prices is not None else None)
@@ -400,11 +486,16 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             return side * (exit_spread - entry_spread)
         return leg_gross(side, q1, q2, p1e, p2e, p1x, p2x)
 
+    def charges(exit_idx: int, p1x: float, p2x: float) -> Charges:
+        """Costs of the open position closed on exit_idx at (p1x, p2x)."""
+        held_closes = None if leg_vals is None else leg_vals[entry_idx + 1:exit_idx + 1]
+        return trade_charges(leg_costs, cost_per_trade, borrow_per_day, exit_idx - entry_idx,
+                             side, beta_e, q1, q2, p1e, p2e, p1x, p2x, held_closes)
+
     def record(exit_sig: int, exit_idx: int, reason: str, p1x: float, p2x: float,
-               gross: float, pnl: float) -> dict:
+               gross: float, ch: Charges, pnl: float) -> dict:
         return trade_record(idx, entry_sig, entry_idx, exit_sig, exit_idx, side, entry_size,
-                            pnl, reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross,
-                            cost_per_trade, (exit_idx - entry_idx) * borrow_per_day)
+                            pnl, reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross, ch)
 
     def exit_fill(i: int, reason: str) -> tuple[int, float, float, float, str]:
         """(fill bar, fill spread, P1, P2, reason) of an exit decided on bar i."""
@@ -448,11 +539,11 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                 else:
                     exit_idx, exit_spread, p1x, p2x, reason = exit_fill(i, "cusum_break")
                 gross = gross_of(exit_spread, p1x, p2x)
-                pnl = net_pnl(entry_size, gross, cost_per_trade, exit_idx - entry_idx,
-                              borrow_per_day)
+                ch = charges(exit_idx, p1x, p2x)
+                pnl = net_pnl(entry_size, gross, ch.cost, ch.borrow)
                 assert legacy_same_close or (causal(entry_sig, entry_idx, "entry")
                                              and causal(i, exit_idx, reason))
-                trades.append(record(i, exit_idx, reason, p1x, p2x, gross, pnl))
+                trades.append(record(i, exit_idx, reason, p1x, p2x, gross, ch, pnl))
                 in_pos = False
 
         if broken:
@@ -504,11 +595,11 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                 else:
                     exit_idx, fill_spread_at_exit, p1x, p2x, reason = exit_fill(i, reason)
                 gross = gross_of(fill_spread_at_exit, p1x, p2x)
-                pnl = net_pnl(entry_size, gross, cost_per_trade, exit_idx - entry_idx,
-                              borrow_per_day)
+                ch = charges(exit_idx, p1x, p2x)
+                pnl = net_pnl(entry_size, gross, ch.cost, ch.borrow)
                 assert legacy_same_close or (causal(entry_sig, entry_idx, "entry")
                                              and causal(i, exit_idx, reason))
-                trades.append(record(i, exit_idx, reason, p1x, p2x, gross, pnl))
+                trades.append(record(i, exit_idx, reason, p1x, p2x, gross, ch, pnl))
                 in_pos = False
     return pd.DataFrame(trades)
 
@@ -526,8 +617,9 @@ class PairWindow:
     beta: float                          # β_w (OLS on the rows in [tr_s, oos_s)); NaN on the Kalman path
     z: np.ndarray                        # entry signal z
     entry_z: float = ENTRY_Z
-    cost: float = 0.0                    # round-trip cost of a trade entered in the window
-    borrow: float = 0.0                  # borrow per day of a trade entered in the window
+    cost: float = 0.0                    # legacy_flat_cost: round trip of a trade entered in the window
+    borrow: float = 0.0                  # legacy_flat_cost: its borrow per held day
+    leg_costs: LegCosts | None = None    # audit T8: the legs' cost rates (None: cost / borrow above)
     blackout: np.ndarray | None = None   # True = no entry decision (Aussie gate, zero-return guard)
     vr: np.ndarray | None = None         # --vwz liquidity ratio: no entry below vr_min
     panic: np.ndarray | None = None      # macro-HMM panic flags
@@ -571,9 +663,11 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
     decision row on the trade's own exit z — the z of the entry window
     (static / vwz: the z of log p1 − β_w·log p2), or exit_z_of(β_e) (Kalman:
     the rolling z of log p1 − β_e·log p2) — by target, stop or time; the exit
-    fills on the next row.  The trade keeps the cost and borrow of its entry
-    window.  CUSUM: from a window's break row no new entries in that window;
-    a break inside the window's OOS force-closes an open trade (next row).
+    fills on the next row.  The trade keeps the cost rates of its entry
+    window (`trade_charges`: pw.leg_costs, audit T8; None — pw.cost and
+    pw.borrow, legacy_flat_cost).  CUSUM: from a window's break row no new
+    entries in that window; a break inside the window's OOS force-closes an
+    open trade (next row).
     After the last decision row an open trade is closed at the next available
     close — the fill-only row, else the last row's close — with reason
     "end_of_data" and exit_signal = the last decision row.
@@ -602,6 +696,7 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
     in_pos = False
     side = entry_sig = entry_idx = w_e = 0
     size = beta_e = p1e = p2e = q1 = q2 = cost_e = borrow_e = cur_stop_z = 0.0
+    lc_e: LegCosts | None = None
     ez = None
 
     def close(decision: int, fill: int, reason: str) -> None:
@@ -612,12 +707,13 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
             p1x, p2x = leg_fill_prices(leg_vals, exec_leg_vals, fill,
                                        decision if vwap_rows else None)
         gross = leg_gross(side, q1, q2, p1e, p2e, p1x, p2x)
-        pnl = net_pnl(size, gross, cost_e, fill - entry_idx, borrow_e)
+        ch = trade_charges(lc_e, cost_e, borrow_e, fill - entry_idx, side, beta_e, q1, q2,
+                           p1e, p2e, p1x, p2x, leg_vals[entry_idx + 1:fill + 1])
+        pnl = net_pnl(size, gross, ch.cost, ch.borrow)
         assert (fill_is_causal(entry_sig, entry_idx, "entry", n)
                 and fill_is_causal(decision, fill, reason, n))
         trades.append({**trade_record(idx, entry_sig, entry_idx, decision, fill, side, size, pnl,
-                                      reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross,
-                                      cost_e, (fill - entry_idx) * borrow_e),
+                                      reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross, ch),
                        "window_entered": w_e, "window_exited": int(win_of[decision])})
 
     def exit_now(i: int, reason: str) -> None:
@@ -663,7 +759,7 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
         p1e, p2e = leg_fill_prices(leg_vals, exec_leg_vals, entry_idx, i if vwap_rows else None)
         beta_e = kalman_beta[i] if kalman_beta is not None else pw.beta
         q1, q2 = entry_quantities(p1e, p2e, beta_e)
-        cost_e, borrow_e = pw.cost, pw.borrow
+        cost_e, borrow_e, lc_e = pw.cost, pw.borrow, pw.leg_costs
         cur_stop_z = stop_at(i, pw.spread)
         ez = exit_z_of(beta_e) if exit_z_of is not None else pw.z
         in_pos = True
@@ -787,6 +883,8 @@ class WfoConfig:
     cost: float = 5.0
     slip: float = 5.0
     borrow: float = 80.0
+    borrow_nonus: float = 300.0
+    fx_cost: float = 2.0
     train: int = TRAIN_INIT_MO
     oos: int = OOS_MO
     step: int = STEP_MO
@@ -808,12 +906,13 @@ class WfoConfig:
     legacy_window_reset: bool = False
     legacy_exit_date_pnl: bool = False
     legacy_no_entry_guards: bool = False
+    legacy_flat_cost: bool = False
     rotation: bool = False
     voltarget: float = 0.0
     hmm: str = "off"
     cusum: float | None = None
     aussie_filter: bool = False
-    execution_model: str = "almgren"
+    execution_model: str = "flat"         # audit T8: the conservative default (lower dev Sharpe)
     notional: float = 100_000
     final_holdout: bool = False
 
@@ -835,6 +934,91 @@ def holdout_violation(closes: pd.DataFrame, cfg: WfoConfig) -> str | None:
     return (f"this run would use dates up to {last.date()}, inside the final holdout "
             f"(from {HOLDOUT_START.date()}). Pass --end {dev_end} (development period) "
             f"or --final-holdout (the run is then recorded in HOLDOUT_USES.md).")
+
+
+def fx_per_fill(cfg: WfoConfig, ticker: str) -> float:
+    """FX conversion cost per fill of a leg (fraction of its notional): cfg.fx_cost
+    bp for a `*_USD` leg, 0 for a USD listing (audit T8)."""
+    return cfg.fx_cost / 1e4 if is_non_us_listing(ticker) else 0.0
+
+
+def flat_borrow_per_day(cfg: WfoConfig, ticker: str) -> float:
+    """Flat model's borrow per day of a short leg (fraction of its notional):
+    cfg.borrow bp/yr for a US listing, cfg.borrow_nonus for a non-US one
+    (audit T8), over 252 days."""
+    return (cfg.borrow_nonus if is_non_us_listing(ticker) else cfg.borrow) / (252 * 1e4)
+
+
+def cost_model(cfg: WfoConfig) -> dict:
+    """The run's cost model (audit T8): its parameters and `description`, the
+    lines the run header prints; the CLI stores the dict in
+    wfo_daily_meta<tag>.json.  Units: fractions or bp of a leg's notional; the
+    PnL is per $1 of leg-1 notional (entry notionals 1 and |β|)."""
+    tiers = {name: {"half_spread_bp": hs, "kappa": k, "borrow_bp_per_year": b, "comment": c}
+             for name, (hs, k, b, c) in AC_TIER_TABLE.items()}
+    tier_line = ("tiers (half-spread bp / κ / borrow bp/yr): "
+                 + ", ".join(f"{n} {t['half_spread_bp']}/{t['kappa']}/{t['borrow_bp_per_year']}"
+                             for n, t in tiers.items()))
+    fx = (f"FX conversion {cfg.fx_cost} bp per fill of a *_USD leg (a non-USD listing) "
+          "× its notional at the fill")
+    short = ("each short leg (leg 1 if side = −1, leg 2 if side·β > 0) × its notional at the "
+             "close of each held row (both legs print), rate / 252 per day")
+    m = {"execution_model": cfg.execution_model, "legacy_flat_cost": cfg.legacy_flat_cost,
+         "notional_usd_per_leg": cfg.notional}
+    if cfg.legacy_flat_cost:
+        if cfg.execution_model == "almgren":
+            m.update(round_trip="2·(c1 + c2) per trade, c = each leg's one-way tier half-spread + "
+                                "κ·σ·√(notional/ADV), whatever |β|",
+                     borrow="leg 2's tier rate per unit size per held day, whatever side",
+                     fx_cost_bp=0.0, tiers=tiers, label=f"NET {cfg.cost} bps/leg")
+            m["description"] = [
+                f"LEGACY ALMGREN-CHRISS — 2·(c1 + c2) round trip per trade, whatever |β| "
+                f"(tiered per pair, notional=${cfg.notional:,.0f}/leg); no FX cost",
+                "borrow at leg 2's tier rate per unit size per held day, whatever side", tier_line]
+        else:
+            rt = 2 * (cfg.cost + cfg.slip)
+            m.update(round_trip_bp_per_trade=rt, commission_bp=cfg.cost, slippage_bp=cfg.slip,
+                     borrow_bp_per_year=cfg.borrow,
+                     borrow="per unit size per held day, whatever side", fx_cost_bp=0.0,
+                     label=f"NET {cfg.cost} bps/leg")
+            m["description"] = [
+                f"LEGACY FLAT — 2×({cfg.cost}+{cfg.slip}) = {rt:.1f} bp round trip per trade, "
+                "whatever |β|; no FX cost",
+                f"borrow {cfg.borrow} bp/yr per unit size per held day, whatever side"]
+        return m
+    m.update(fills="per fill per leg: rate × |the leg's notional at the fill| (entry: 1 and |β| per "
+                   "$1 of leg-1 notional; exit: |q1·P1|, |q2·P2| at the exit prices), on the fill date",
+             fx_cost_bp=cfg.fx_cost, fx_legs="*_USD legs (local listings converted to USD), every fill",
+             borrow=short)
+    if cfg.execution_model == "almgren":
+        m.update(fill_rate="tier half-spread + κ·σ·√(leg notional/ADV) per leg (σ: daily log-return "
+                           "std of the window's training rows; ADV: 20-day $ volume at the training "
+                           "end, else the tier default); leg notional: leg 1 = notional, leg 2 = "
+                           "|β|·notional with the trade's entry β (its impact × √|β|); the entry "
+                           "participation sets the rate of both fills",
+                 borrow_rate="the short leg's tier rate", tiers=tiers,
+                 label=f"NET almgren tiered + FX {cfg.fx_cost} bp")
+        m["description"] = [
+            f"ALMGREN-CHRISS — per fill per leg: tier half-spread + κ·σ·√(leg notional/ADV) "
+            f"(leg 1 ${cfg.notional:,.0f}, leg 2 |β|·${cfg.notional:,.0f} at the entry β; both fills) "
+            "× the leg's notional at the fill",
+            "round trip at unchanged prices = 2·(c1 + c2(|β|)·|β|) per $1 of leg-1 notional",
+            fx, f"borrow: {short}; at the leg's tier rate", tier_line]
+        return m
+    f = cfg.cost + cfg.slip
+    m.update(fill_bp_per_leg=f, commission_bp=cfg.cost, slippage_bp=cfg.slip,
+             borrow_bp_per_year_us=cfg.borrow, borrow_bp_per_year_non_us=cfg.borrow_nonus,
+             non_us_listing="*_USD legs", label=f"NET flat {f:.1f} bp/leg/fill + FX {cfg.fx_cost} bp")
+    m["description"] = [
+        f"FLAT — per fill per leg: commission {cfg.cost} + slippage {cfg.slip} = {f:.1f} bp "
+        "× the leg's notional at the fill",
+        f"round trip at unchanged prices = 2·(c + s)·(1 + |β|) per $1 of leg-1 notional "
+        f"({2 * f:.1f} bp at β = 0, {4 * f:.1f} bp at |β| = 1)",
+        fx,
+        f"borrow: {short}; {cfg.borrow} bp/yr US listings, {cfg.borrow_nonus} bp/yr non-US "
+        "(*_USD) listings",
+        f"notional: ${cfg.notional:,.0f} per leg (the Almgren-Chriss impact term only)"]
+    return m
 
 
 @dataclass
@@ -1100,7 +1284,8 @@ class WindowContext(NamedTuple):
 
 def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                       windows: list[tuple], window_ctx: list[WindowContext],
-                      pair_cost: Callable[[str, str, pd.DataFrame], tuple[float, float]],
+                      pair_cost: Callable[[str, str, pd.DataFrame],
+                                          tuple[float, float, LegCosts | None]],
                       has_px: pd.DataFrame, zero_ret: pd.DataFrame | None, data_end,
                       volumes: pd.DataFrame | None = None,
                       vwap_daily: pd.DataFrame | None = None) -> list[pd.DataFrame]:
@@ -1112,7 +1297,7 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     w the pair is eligible as in the per-window engine (≥ 60 training rows,
     ≥ Z_WIN + 10 rows in [tr_s, oos_e], 0.1 ≤ |β_w| ≤ 15 except on the Kalman
     path), with the training rows strictly before oos_s (T9.1): β_w, and the
-    cost / borrow of trades entered in w (pair_cost).  window_ctx[w − 1]: the
+    cost rates of trades entered in w (pair_cost).  window_ctx[w − 1]: the
     WindowContext of window w, built by the run's window loop; a trade is
     sized with its entry window's weight.
     Returns one trades frame per pair (columns as the per-window engine, then
@@ -1164,10 +1349,11 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             train = px.iloc[lo:rows.searchsorted(oos_s)]       # [tr_s, oos_s): T9.1
             if len(train) < 60 or n_w - lo < Z_WIN + 10:
                 continue
-            cost, borrow = pair_cost(t1, t2, train)
+            cost, borrow, leg_costs = pair_cost(t1, t2, train)
             ctx = window_ctx[w - 1]
             if cfg.kalman:
-                p = PairWindow(beta=nan, z=z_kal, cost=cost, borrow=borrow, blackout=no_entry)
+                p = PairWindow(beta=nan, z=z_kal, cost=cost, borrow=borrow, leg_costs=leg_costs,
+                               blackout=no_entry)
             else:
                 beta = estimate_beta(train[t1], train[t2])
                 if not (0.1 <= abs(beta) <= 15.0):
@@ -1176,7 +1362,7 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 if cfg.vwz:
                     _, z_vw, vr = vwz_spread_z(px, volumes, t1, t2, beta)
                     p = PairWindow(beta=beta, z=z_vw.to_numpy(), cost=cost, borrow=borrow,
-                                   blackout=no_entry, vr=vr.to_numpy(), panic=panic,
+                                   leg_costs=leg_costs, blackout=no_entry, vr=vr.to_numpy(), panic=panic,
                                    panic_size_mult=ctx.panic_size_mult)
                 else:
                     sp = spread_series(px, t1, t2, beta).reindex(rows)
@@ -1190,8 +1376,8 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                     exec_ok = (None if vw is None else
                                (np.log(vw[t1]) - beta * np.log(vw[t2])).shift(-1).notna().to_numpy())
                     p = PairWindow(beta=beta, z=rolling_z(sp).to_numpy(), entry_z=entry_z,
-                                   cost=cost, borrow=borrow, blackout=blackout, panic=panic,
-                                   panic_size_mult=ctx.panic_size_mult, exec_ok=exec_ok,
+                                   cost=cost, borrow=borrow, leg_costs=leg_costs, blackout=blackout,
+                                   panic=panic, panic_size_mult=ctx.panic_size_mult, exec_ok=exec_ok,
                                    spread=sp)
             if cfg.cusum is not None:
                 # The window's CUSUM on its z over its decision rows [tr_s, oos_e].
@@ -1261,6 +1447,11 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     Final holdout (audit T6): ValueError if the run would use a date on or
     after HOLDOUT_START (`run_last_date`: cfg.end, else the panel's last date)
     unless cfg.final_holdout.
+
+    Costs (audit T8, `cost_model`): each fill of each leg costs its rate ×
+    the leg's notional at the fill (+ FX on *_USD legs), borrow accrues on the
+    short legs' notional; cfg.legacy_flat_cost restores the pre-T8 round trip
+    per trade (needed by legacy_spread_pnl, which has no leg notionals).
     """
     if cfg.exec_mode not in ("next_close", "vwap"):
         raise ValueError(f"cfg.exec_mode must be 'next_close' or 'vwap', not {cfg.exec_mode!r}")
@@ -1276,6 +1467,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         raise ValueError("cfg.legacy_spread_pnl books the spread change, which has no leg "
                          "quantities to mark to market daily: use it with "
                          "cfg.legacy_exit_date_pnl (--legacy-exit-date-pnl)")
+    if cfg.legacy_spread_pnl and not cfg.legacy_flat_cost:
+        raise ValueError("cfg.legacy_spread_pnl books the spread change, which has no leg "
+                         "notionals to charge per fill: use it with cfg.legacy_flat_cost "
+                         "(--legacy-flat-cost)")
     holdout = holdout_violation(closes, cfg)      # audit T6: the final holdout
     if holdout:
         raise ValueError(holdout)
@@ -1306,7 +1501,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
 
     windows = make_windows(closes, cfg.train, cfg.oos, cfg.step,
                             start=cfg.start, end=cfg.end)
-    # Cost breakdown:
+    # Costs (audit T8): the legs' rates per fill and per held day (`LegCosts`,
+    # `leg_costs_of`), charged on the legs' notionals (`trade_charges`).
+    # legacy_flat_cost, the pre-T8 scalars per trade:
     #   flat:    commission+slippage round-trip = 2 × (cost + slip) bps
     #   almgren: per-pair tiered cost, computed inside per-pair loop
     cost_log_flat       = 2 * (cfg.cost + cfg.slip) / 1e4
@@ -1328,8 +1525,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         "aussie_adr_us":    2.5e8, "aussie_local":   3.0e7,
     }
 
-    def ac_pair_cost(t1: str, t2: str, train_df: pd.DataFrame) -> tuple[float, float]:
-        """Return (round-trip cost_log, per-day borrow_log) for an Almgren-Chriss pair."""
+    def ac_leg_inputs(t1: str, t2: str, train_df: pd.DataFrame) -> tuple[tuple[float, float], ...]:
+        """(σ, $ADV) of each leg: the daily log-return std of the training rows and
+        the 20-day $ volume at the training end (else the tier default)."""
         rets = np.log(train_df).diff()
         sig1 = float(rets[t1].std()) if t1 in rets.columns else 0.015
         sig2 = float(rets[t2].std()) if t2 in rets.columns else 0.015
@@ -1344,12 +1542,49 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                     return float(v)
             return AC_FALLBACK_ADV[ac_classify(tk)]
 
-        c1 = ac_leg_cost(t1, sig1, cfg.notional, _adv(t1))
-        c2 = ac_leg_cost(t2, sig2, cfg.notional, _adv(t2))
+        return (sig1, _adv(t1)), (sig2, _adv(t2))
+
+    def ac_leg_costs(t1: str, t2: str, train_df: pd.DataFrame) -> tuple[float, float]:
+        """Each leg's one-way Almgren-Chriss cost (log units) at --notional: tier
+        half-spread + impact (legacy_flat_cost)."""
+        (sig1, adv1), (sig2, adv2) = ac_leg_inputs(t1, t2, train_df)
+        return ac_leg_cost(t1, sig1, cfg.notional, adv1), ac_leg_cost(t2, sig2, cfg.notional, adv2)
+
+    def ac_pair_cost(t1: str, t2: str, train_df: pd.DataFrame) -> tuple[float, float]:
+        """Return (round-trip cost_log, per-day borrow_log) for an Almgren-Chriss pair
+        (legacy_flat_cost)."""
+        c1, c2 = ac_leg_costs(t1, t2, train_df)
         round_trip = 2 * (c1 + c2)   # 2 legs × 2 sides (enter+exit)
         # Borrow on the short leg (leg2 by convention).
         borrow_per_d = ac_borrow_per_day(t2)
         return round_trip, borrow_per_d
+
+    def leg_costs_of(t1: str, t2: str, train_df: pd.DataFrame) -> LegCosts:
+        """Audit T8: each leg's cost per fill (flat: cost + slip bp; almgren: its
+        one-way Almgren-Chriss cost on its own notional — leg 1 at --notional,
+        leg 2 at |β_e|·notional through impact2, R38) plus the FX conversion of a
+        *_USD leg, and its borrow per day when short (flat: US / non-US rate;
+        almgren: tier)."""
+        impact2 = 0.0
+        if cfg.execution_model == "almgren":
+            (sig1, adv1), (sig2, adv2) = ac_leg_inputs(t1, t2, train_df)
+            c1 = ac_leg_cost(t1, sig1, cfg.notional, adv1)
+            c2 = ac_leg_cost(t2, sig2, 0.0, adv2)                     # half-spread (no participation)
+            impact2 = ac_leg_cost(t2, sig2, cfg.notional, adv2) - c2   # impact at --notional
+            b1, b2 = ac_borrow_per_day(t1), ac_borrow_per_day(t2)
+        else:
+            c1 = c2 = (cfg.cost + cfg.slip) / 1e4
+            b1, b2 = flat_borrow_per_day(cfg, t1), flat_borrow_per_day(cfg, t2)
+        return LegCosts(c1 + fx_per_fill(cfg, t1), c2 + fx_per_fill(cfg, t2), b1, b2, impact2)
+
+    def pair_cost(t1: str, t2: str, train: pd.DataFrame) -> tuple[float, float, LegCosts | None]:
+        """(round trip, borrow per day, None) of the pre-T8 model under
+        legacy_flat_cost, else (0, 0, the legs' LegCosts)."""
+        if not cfg.legacy_flat_cost:
+            return 0.0, 0.0, leg_costs_of(t1, t2, train)
+        if cfg.execution_model == "almgren":
+            return (*ac_pair_cost(t1, t2, train), None)
+        return cost_log_flat, borrow_per_day_flat, None
 
     print(f"DAILY WFO  (BAR_TIMEFRAME={BAR_TIMEFRAME})")
     print(f"  closes:     {closes.shape[0]} days × {closes.shape[1]} tickers")
@@ -1357,15 +1592,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     print(f"  pairs:      {len(pairs)}")
     print(f"  windows:    {len(windows)}  (init={cfg.train}m / oos={cfg.oos}m / step={cfg.step}m)")
     print(f"  z-window:   {Z_WIN}d  | entry/exit/stop = {ENTRY_Z}/{EXIT_Z}/{STOP_Z}  | hold≤{MAX_HOLD}d")
-    if cfg.execution_model == "flat":
-        print(f"  costs:      FLAT — commission+slip = 2×({cfg.cost}+{cfg.slip}) bps = "
-              f"{cost_log_flat*1e4:.1f} bps round-trip")
-        print(f"              borrow on short = {cfg.borrow} bps/year "
-              f"= {borrow_per_day_flat*1e4:.3f} bps/day")
-    else:
-        print(f"  costs:      ALMGREN-CHRISS — tiered per-pair, notional=${cfg.notional:,.0f}/leg")
-        print(f"              half_spread + κ·σ·√(notional/ADV) per leg, "
-              f"borrow per-tier (50-300 bps/yr)")
+    cost_lines = cost_model(cfg)["description"]          # audit T8: the full cost model
+    print(f"  costs:      {cost_lines[0]}")
+    for line in cost_lines[1:]:
+        print(f"              {line}")
     print(f"  kalman:     {'ON' if cfg.kalman else 'off'}   "
           f"vwz:       {'ON' if cfg.vwz else 'off'}   "
           f"hmm:       {cfg.hmm}   "
@@ -1522,11 +1752,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 if both.any():
                     full = pd.concat([full, closes[[t1, t2]].iloc[[after_lo + int(both.argmax())]]])
 
-            # Per-pair cost: flat scalars OR Almgren-Chriss tiered.
-            if cfg.execution_model == "almgren":
-                cost_log, borrow_per_day = ac_pair_cost(t1, t2, train)
-            else:
-                cost_log, borrow_per_day = cost_log_flat, borrow_per_day_flat
+            # Per-pair cost: the legs' rates (audit T8), or the pre-T8 scalars
+            # (legacy_flat_cost: flat or Almgren-Chriss tiered).
+            cost_log, borrow_per_day, leg_costs = pair_cost(t1, t2, train)
 
             # Audit T2: PnL from the legs' fill prices (legacy: from the spread);
             # the zero-return entry guard on the pair's rows (legacy: none).
@@ -1543,7 +1771,8 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                                    legacy_same_close=cfg.legacy_same_close,
                                    decision_end=oos_e,
                                    leg_prices=legs, beta=beta_kal,
-                                   legacy_no_entry_guards=cfg.legacy_no_entry_guards)
+                                   legacy_no_entry_guards=cfg.legacy_no_entry_guards,
+                                   leg_costs=leg_costs)
             elif cfg.vwz:
                 beta = estimate_beta(train[t1], train[t2])
                 if not (0.1 <= abs(beta) <= 15.0):
@@ -1562,6 +1791,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                     decision_end=oos_e,
                     leg_prices=legs, beta=beta,
                     legacy_no_entry_guards=cfg.legacy_no_entry_guards,
+                    leg_costs=leg_costs,
                 )
             else:
                 beta = estimate_beta(train[t1], train[t2])
@@ -1609,6 +1839,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                     decision_end=oos_e,
                     leg_prices=legs, exec_leg_prices=exec_legs, beta=beta,
                     legacy_no_entry_guards=cfg.legacy_no_entry_guards,
+                    leg_costs=leg_costs,
                 )
             if not tr.empty:
                 # HRP / inverse-vol: scale the entire trade (pnl is linear in
@@ -1630,11 +1861,6 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
               f"→  {win_trades_n} trades   P&L = {win_pnl:+.4f}")
 
     if not cfg.legacy_window_reset and windows:
-        def pair_cost(t1: str, t2: str, train: pd.DataFrame) -> tuple[float, float]:
-            if cfg.execution_model == "almgren":
-                return ac_pair_cost(t1, t2, train)
-            return cost_log_flat, borrow_per_day_flat
-
         all_trades = continuous_trades(closes, pairs, cfg, windows, window_ctx, pair_cost,
                                        has_px, zero_ret, data_end, volumes, vwap_daily)
 
@@ -1809,6 +2035,8 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     assert np.allclose(trades["pnl"], trades["size"] * (trades["gross"] - trades["cost"]
                                                         - trades["borrow"]),
                        rtol=1e-9, atol=1e-12)
+    # Audit T8: the fills' costs make up the trade's cost (the MTM schedule).
+    assert (trades["cost"] == trades["cost_entry"] + trades["cost_exit"]).all()
     by_pair = None
     if cfg.legacy_exit_date_pnl:
         # Legacy: each trade's PnL on its exit date over the panel's OOS days.

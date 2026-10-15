@@ -75,7 +75,9 @@ def trade(px: pd.DataFrame, entry: int, exit_: int, side: int = 1, size: float =
             "side": side, "size": size, "beta": beta, "q1": q1, "q2": q2,
             "p1_entry": p1e, "p2_entry": p2e, "p1_exit": p1x, "p2_exit": p2x,
             "gross": gross, "cost": cost, "borrow": held * borrow_per_day,
-            "pnl": core.net_pnl(size, gross, cost, held, borrow_per_day), "reason": "target"}
+            # The pre-T8 cost schedule (legacy_flat_cost; T8: test_position_costs.py).
+            "cost_entry": cost / 2, "cost_exit": cost / 2, "borrow_rate1": nan, "borrow_rate2": nan,
+            "pnl": core.net_pnl(size, gross, cost, held * borrow_per_day), "reason": "target"}
 
 
 def table(*rows: dict) -> pd.DataFrame:
@@ -267,7 +269,7 @@ def test_legacy_spread_pnl_needs_the_exit_date_booking(ou_runs):
     legacy = replace(cfg, legacy_window_reset=True, legacy_spread_pnl=True)
     with pytest.raises(ValueError, match="legacy_exit_date_pnl"):
         quiet(closes, pairs, legacy)
-    quiet(closes, pairs, replace(legacy, legacy_exit_date_pnl=True))
+    quiet(closes, pairs, replace(legacy, legacy_exit_date_pnl=True, legacy_flat_cost=True))
 
 
 def test_summary_prints_the_mtm_figures_and_no_exit_day_sharpe(ou_runs):
