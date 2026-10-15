@@ -170,16 +170,21 @@ def entry_decision(i: int, zi: float, n: int, entry_z: float,
                    blackout: np.ndarray | None = None,
                    size_gate: Callable[[int, int], float] | None = None,
                    exec_ok: np.ndarray | None = None,
-                   same_close: bool = False) -> tuple[int, float, int] | None:
+                   same_close: bool = False,
+                   stop_z: float | Callable[[int], float] = STOP_Z,
+                   legacy_no_entry_guards: bool = False) -> tuple[int, float, int] | None:
     """(side, size, fill bar) of an entry decided on bar i with z = zi, or None.
 
     The checks, in this order: liquidity gate (vr[i] < vr_min: no entry);
     macro-HMM panic (panic[i]: no entry when panic_size_mult ≤ 0, else size
     panic_size_mult); blackout[i] (Aussie gate, zero-return guard); the z
-    threshold (z > entry_z: short spread, z < −entry_z: long); size_gate(i,
-    side) (MetaGate size multiplier, ≤ 0: no entry); the fill bar — bar i+1
-    (legacy same_close: bar i), none past the data; exec_ok[i] False (VWAP
-    mode: no VWAP spread for the fill): not filled.
+    window (z > entry_z: short spread, z < −entry_z: long; audit T7: and
+    |z| < stop_z, the stop of the trade this entry would open — a number, or a
+    function of the bar for the vol-tight stop — so a jump past the stop is no
+    entry; legacy_no_entry_guards: any |z| > entry_z); size_gate(i, side)
+    (MetaGate size multiplier, ≤ 0: no entry); the fill bar — bar i+1 (legacy
+    same_close: bar i), none past the data; exec_ok[i] False (VWAP mode: no
+    VWAP spread for the fill): not filled.
     """
     if vr is not None:
         vri = vr[i]
@@ -199,6 +204,8 @@ def entry_decision(i: int, zi: float, n: int, entry_z: float,
     side = -1 if zi > entry_z else (+1 if zi < -entry_z else 0)
     if side == 0:
         return None
+    if not legacy_no_entry_guards and abs(zi) >= (stop_z(i) if callable(stop_z) else stop_z):
+        return None                                  # audit T7: entry_z < |z| < stop_z
     mg_size = 1.0
     if size_gate is not None:
         mg_size = size_gate(i, side)
@@ -297,6 +304,7 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                   leg_prices: pd.DataFrame | None = None,
                   exec_leg_prices: pd.DataFrame | None = None,
                   beta: float | pd.Series | None = None,
+                  legacy_no_entry_guards: bool = False,
                   ) -> pd.DataFrame:
     """Generate mean-reversion trades on a daily spread.
 
@@ -323,6 +331,9 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     decision_end: no entry, exit or CUSUM decision on bars after this date
                   (fill-only bars).
     legacy_same_close: pre-audit fills on the deciding bar itself.
+    Entry window (audit T7, `entry_decision`): entry_z < |z| < the stop of the
+    trade the entry would open (stop_z, or the vol-tight stop); a jump past
+    the stop is no entry.  legacy_no_entry_guards: any |z| > entry_z.
 
     PnL (audit T2).  leg_prices: the pair's two USD closes [P1, P2] on the
     rows of spread_full; beta: the β the spread was built with (a scalar, or
@@ -408,6 +419,11 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     def causal(decision: int, fill: int, reason: str) -> bool:
         return fill_is_causal(decision, fill, reason, n)
 
+    def stop_at(i: int) -> float:
+        """stop_z of a trade entered on bar i: the vol-tight stop if that option is on."""
+        return (tightened_stop(spread_full, i, stop_z, vol_tight_threshold, vol_tight_stop_z)
+                if vol_tight_stop else stop_z)
+
     # CUSUM on every bar (train+oos) so the test is informed: the break bar.
     cusum_at = cusum_break_row(z_vals, 0, n_decide, cusum_h) if cusum_h is not None else None
     exec_ok_vals = pd.notna(exec_vals) if exec_vals is not None else None
@@ -452,7 +468,7 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             # i+1 (audit T1); legacy_same_close: the close of bar i.
             entry = entry_decision(i, zi, n, entry_z, vr_vals, vr_min, panic_vals,
                                    panic_size_mult, blackout_vals, mg_gate, exec_ok_vals,
-                                   legacy_same_close)
+                                   legacy_same_close, stop_at, legacy_no_entry_guards)
             if entry is None:
                 continue
             side, entry_size, fill_idx = entry
@@ -465,9 +481,7 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             beta_e = (beta_vals[i] if beta_vals is not None
                       else (nan if beta is None else float(beta)))
             q1, q2 = entry_quantities(p1e, p2e, beta_e)
-            cur_stop_z = (tightened_stop(spread_full, i, stop_z, vol_tight_threshold,
-                                         vol_tight_stop_z)
-                          if vol_tight_stop else stop_z)
+            cur_stop_z = stop_at(i)
         else:
             reason = exit_reason(side, zi, i - entry_idx, exit_z, cur_stop_z, max_hold)
             if reason is not None:
@@ -533,6 +547,7 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
                              vol_tight_stop: bool = False,
                              vol_tight_threshold: float = 1.5,
                              vol_tight_stop_z: float = 2.5,
+                             legacy_no_entry_guards: bool = False,
                              ) -> pd.DataFrame:
     """One continuous position state for a pair over the whole walk-forward
     timeline (audit T3): no reset at a window end, never a second position.
@@ -550,6 +565,8 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
     gates exactly as in `backtest_pair`, filled on row i+1 (exec_leg_vals: each
     leg's VWAP of the next row on row i, with pair_windows[w].exec_ok), with
     q1 = 1/P1, q2 = β_e/P2 and β_e = β_w (kalman_beta: β of the decision row).
+    Only entry_z < |z| < the trade's stop enters (audit T7, `entry_decision`;
+    legacy_no_entry_guards: any |z| > entry_z).
     Open: every later decision row, whatever window it is in, is an exit-
     decision row on the trade's own exit z — the z of the entry window
     (static / vwz: the z of log p1 − β_w·log p2), or exit_z_of(β_e) (Kalman:
@@ -607,6 +624,11 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
         fill, end_of_data = exit_fill_bar(i, n)
         close(i, fill, "end_of_data" if end_of_data else reason)
 
+    def stop_at(i: int, spread: pd.Series | None) -> float:
+        """stop_z of a trade entered on row i (spread: its window's): the vol-tight stop if on."""
+        return (tightened_stop(spread, i, stop_z, vol_tight_threshold, vol_tight_stop_z)
+                if vol_tight_stop and spread is not None else stop_z)
+
     for i in range(n_decide):
         if in_pos:
             if cusum_close[i]:
@@ -631,7 +653,9 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
         if pd.isna(zi):
             continue
         entry = entry_decision(i, zi, n, pw.entry_z, pw.vr, vr_min, pw.panic,
-                               pw.panic_size_mult, pw.blackout, exec_ok=pw.exec_ok)
+                               pw.panic_size_mult, pw.blackout, exec_ok=pw.exec_ok,
+                               stop_z=lambda j: stop_at(j, pw.spread),
+                               legacy_no_entry_guards=legacy_no_entry_guards)
         if entry is None:
             continue
         side, size, entry_idx = entry
@@ -640,8 +664,7 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
         beta_e = kalman_beta[i] if kalman_beta is not None else pw.beta
         q1, q2 = entry_quantities(p1e, p2e, beta_e)
         cost_e, borrow_e = pw.cost, pw.borrow
-        cur_stop_z = (tightened_stop(pw.spread, i, stop_z, vol_tight_threshold, vol_tight_stop_z)
-                      if vol_tight_stop and pw.spread is not None else stop_z)
+        cur_stop_z = stop_at(i, pw.spread)
         ez = exit_z_of(beta_e) if exit_z_of is not None else pw.z
         in_pos = True
 
@@ -784,6 +807,7 @@ class WfoConfig:
     legacy_stale_prints: bool = False
     legacy_window_reset: bool = False
     legacy_exit_date_pnl: bool = False
+    legacy_no_entry_guards: bool = False
     rotation: bool = False
     voltarget: float = 0.0
     hmm: str = "off"
@@ -1176,7 +1200,8 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
 
         tr = backtest_pair_continuous(rows, px.to_numpy(dtype=float), n_decide, windows, pw,
                                       exec_leg_vals=exec_legs, kalman_beta=kalman_beta,
-                                      exit_z_of=exit_z_of, vol_tight_stop=cfg.vol_tight_stop)
+                                      exit_z_of=exit_z_of, vol_tight_stop=cfg.vol_tight_stop,
+                                      legacy_no_entry_guards=cfg.legacy_no_entry_guards)
         if tr.empty:
             continue
         if cfg.hrp or cfg.ivol:
@@ -1355,6 +1380,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                                if cfg.legacy_stale_prints else
                                "unchanged close with zero/missing volume = no print; "
                                "no entry on a zero-return signal day"))
+    print("  entries:    " + ("LEGACY — any |z| > entry_z enters (no stop_z limit)"
+                               if cfg.legacy_no_entry_guards else
+                               "entry_z < |z| < stop_z (the stop of the trade)"))
     print("  pnl:        " + ("LEGACY — spread change between the fills" if cfg.legacy_spread_pnl
                                else "leg fills, q1 = 1/P1 and q2 = β/P2 fixed at the entry fill"))
     print("  positions:  " + ("LEGACY — reset per window; open at a window end = dropped; "
@@ -1514,7 +1542,8 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                                                    else no_entry.reindex(sp.index)),
                                    legacy_same_close=cfg.legacy_same_close,
                                    decision_end=oos_e,
-                                   leg_prices=legs, beta=beta_kal)
+                                   leg_prices=legs, beta=beta_kal,
+                                   legacy_no_entry_guards=cfg.legacy_no_entry_guards)
             elif cfg.vwz:
                 beta = estimate_beta(train[t1], train[t2])
                 if not (0.1 <= abs(beta) <= 15.0):
@@ -1532,6 +1561,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                     legacy_same_close=cfg.legacy_same_close,
                     decision_end=oos_e,
                     leg_prices=legs, beta=beta,
+                    legacy_no_entry_guards=cfg.legacy_no_entry_guards,
                 )
             else:
                 beta = estimate_beta(train[t1], train[t2])
@@ -1578,6 +1608,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                     legacy_same_close=cfg.legacy_same_close,
                     decision_end=oos_e,
                     leg_prices=legs, exec_leg_prices=exec_legs, beta=beta,
+                    legacy_no_entry_guards=cfg.legacy_no_entry_guards,
                 )
             if not tr.empty:
                 # HRP / inverse-vol: scale the entire trade (pnl is linear in

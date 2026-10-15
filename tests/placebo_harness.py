@@ -40,7 +40,7 @@ GROSS = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0)
 VARIANTS: dict[str, tuple[WfoConfig, Callable]] = {
     "legacy": (replace(GROSS, legacy_same_close=True, legacy_spread_pnl=True,
                        legacy_stale_prints=True, legacy_window_reset=True,
-                       legacy_exit_date_pnl=True),
+                       legacy_exit_date_pnl=True, legacy_no_entry_guards=True),
                synthetic.build_async_panel),
     "fixed":  (GROSS, synthetic.build_async_panel_fixed),
 }

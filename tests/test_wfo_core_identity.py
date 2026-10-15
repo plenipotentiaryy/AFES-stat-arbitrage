@@ -46,7 +46,7 @@ _spec.loader.exec_module(make_golden)
 # its legacy_* flag here.
 LEGACY_FLAGS: dict = {"legacy_same_close": True, "legacy_spread_pnl": True,
                       "legacy_stale_prints": True, "legacy_window_reset": True,
-                      "legacy_exit_date_pnl": True}
+                      "legacy_exit_date_pnl": True, "legacy_no_entry_guards": True}
 # All of them off: the corrected defaults.
 DEFAULTS: dict = dict.fromkeys(LEGACY_FLAGS, False)
 # CLI options that are not WfoConfig fields: file IO, and the headline

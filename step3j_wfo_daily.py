@@ -412,6 +412,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "Sharpe(exit)) and MaxDD over trades in table order, instead of the daily "
                         "mark-to-market on constant capital; no MTM file is written. Needed by "
                         "--legacy-spread-pnl. Comparison only; never for headline results.")
+    p.add_argument("--legacy-no-entry-guards", action="store_true", dest="legacy_no_entry_guards",
+                   help="LEGACY: enter on any |z| > entry_z, as before the audit (no "
+                        "|z| < stop_z limit: 5-10 sigma jumps, often stale prices, are "
+                        "traded). Comparison only; never for headline results.")
     p.add_argument("--final-holdout", action="store_true", dest="final_holdout",
                    help="Allow the run to use the final holdout (dates from "
                         f"{HOLDOUT_START.date()}). Recorded in HOLDOUT_USES.md before the "

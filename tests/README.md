@@ -31,6 +31,7 @@ synthetic data whose true edge is known.
 | `test_universe_pit.py` | the point-in-time universe (`build_universe_pit.py`): as-of members, mechanical pairs, screens on prices up to the as-of date, survivorship gap, truncation acceptance; the CLI's HEADLINE marker; step7's guard (T5) |
 | `test_perf_stats.py` | the one Sharpe, PSR and the Deflated Sharpe Ratio (`perf_stats.py`) against hand computations (T6) |
 | `test_holdout_trials.py` | the final-holdout guard (core and CLI), `HOLDOUT_USES.md`, the `TRIALS.csv` registry and the CLI's SR / PSR(0) / DSR / N lines, the back-fill's per-trial Sharpe (T6) |
+| `test_entry_guards.py` | the entry window entry_z < \|z\| < stop_z in both engines, the vol-tight stop, `legacy_no_entry_guards`; the T2 structural guards pinned: genuine prints on the signal date, a z window without no-print days (T7) |
 | `conftest.py` | session-wide: points the CLI's `TRIALS_FILE` / `HOLDOUT_USES_FILE` to a temp dir, so no test writes the committed repo-root files (T6) |
 
 ### Variants
@@ -38,14 +39,16 @@ synthetic data whose true edge is known.
 `placebo_harness.VARIANTS`: `legacy` = the gross config with every `legacy_*`
 flag on (T1: `legacy_same_close`, the pre-audit same-close fills; T2:
 `legacy_spread_pnl`, `legacy_stale_prints`; T3: `legacy_window_reset`, the
-per-window engine; T4: `legacy_exit_date_pnl`, PnL booked on exit dates) and
+per-window engine; T4: `legacy_exit_date_pnl`, PnL booked on exit dates; T7:
+`legacy_no_entry_guards`, any |z| > entry_z enters) and
 the legacy async panel builder
 `build_async_panel` (local prints forward-filled onto the US calendar,
 converted with the daily FX close); `fixed` = the gross config with the
 corrected defaults (T1: an order decided at close t fills at close t+1; T2:
 stale prints masked, no entry on a zero-return day, PnL from the leg fills;
 T3: one continuous position per pair across windows; T4: `daily_pnl` = the
-daily mark-to-market of the trades over every business day) and
+daily mark-to-market of the trades over every business day; T7: an entry
+only if entry_z < |z| < stop_z) and
 `build_async_panel_fixed` (each local print converted with the grid FX at
 its own close, on the union calendar, NaN on local holidays).
 
@@ -130,7 +133,7 @@ its own close, on the union calendar, NaN on local holidays).
 - **Identity** (`test_wfo_core_identity.py`): `run_wfo_daily` with
   `LEGACY_FLAGS` (`legacy_same_close`, T1; `legacy_spread_pnl` and
   `legacy_stale_prints`, T2; `legacy_window_reset`, T3; `legacy_exit_date_pnl`,
-  T4) reproduces the
+  T4; `legacy_no_entry_guards`, T7) reproduces the
   trades CSV of `step3j_wfo_daily.py` at commit 46ffdfb on 26 small synthetic
   cases that cover every CLI option, compared on the fixture's columns (later
   tasks add columns; the legacy `entry_signal` / `exit_signal` equal `entry` /
@@ -316,6 +319,39 @@ its own close, on the union calendar, NaN on local holidays).
   PnL on the business days from the first OOS start (or entry) to
   2023-12-31 or an earlier end, later exits dropped, a pnl column override;
   the back-fill on a fake tree writes one distinct config hash per row.
+- **Entry guards** (`test_entry_guards.py`, T7).  An entry is decided only if
+  entry_z < |z| < stop_z (strict at both ends; ENTRY_Z = 2, STOP_Z = 3.5, or the
+  tightened stop 2.5 of `--vol-tight-stop` at a bar where it applies), in
+  `entry_decision`, the one helper both engines call; `legacy_no_entry_guards`
+  (`--legacy-no-entry-guards`) restores "any |z| > entry_z", and no other legacy
+  flag removes the guard.  `entry_decision`: z = ±3.5 and ±6 → None, the float
+  just below 3.5 enters, z = 2 does not, `stop_z` as a number or a function of the
+  bar; for the same z the entry window is the complement of `exit_reason`'s stop
+  (nothing that enters would be stopped on its own bar; helper level — on the Kalman
+  continuous path the exit z is that of the trade's own β spread, not the entry z).  Both engines (`backtest_pair` and
+  `backtest_pair_continuous`, hand-made z, zero costs): z = ±6, ±3.5 → no trade,
+  ±(3.5 − ε) and ±2.5 → one trade, the legacy flag enters at ±6 and 3.5, the
+  engine's `stop_z` argument moves the limit (z = 3.0: no entry at `stop_z` 3.0,
+  entry at 3.01), and the bar after a blocked jump is a normal entry bar; with the vol-tight stop (80 bars, 20 / 60-bar spread-std
+  ratio > 1.5 at bar 75): z = 3.0 and 2.5 → no entry, 2.4 → entry, option off →
+  entry at 3.0.  **Acceptance**, run level (`run_wfo_daily`, zero costs, 2020
+  panel, log PA = 1.5·log PB + s, s alternating ±SIG so that |z| ≈ 1 and nothing
+  else enters): a single-day +6·SIG jump (z = 5.11 > 3.5, asserted) → no trade by
+  default, in the continuous engine and with `legacy_window_reset`, and with
+  `legacy_stale_prints` / all the older legacy flags; with the flag one short
+  spread decided on the jump day (filled the next day); −6·SIG likewise (long);
+  +2·SIG (z = 2.76) enters with or without the flag.  Structural guards of T2:
+  the rolling z at rows around and after no-print days of either leg equals the
+  hand z over the last 60 rows *with both prints* (the window skips the gaps and
+  spans more than 60 rows of the union calendar); on a noisy 3-year panel with
+  ~8% no-print days per leg (> 100 days, > 80 of them in OOS) no trade has an
+  `entry_signal`, `entry`, `exit_signal` or `exit` on a no-print day, and every
+  series passed to `rolling_z` (spy) consists of the pair's both-print rows, none
+  skipped, in both engines; the run-level assertion of T2 (both legs have a print
+  on every entry's signal and fill date, on the masked closes) refuses a table
+  whose entry signal is moved onto a no-print day.  The identity fixtures need
+  `legacy_no_entry_guards` too: without it 21 of the 26 cases differ from the
+  pre-audit CSVs (of the other 5, one has no trades and four have no entry beyond the stop).
 
 ### Statistic definitions
 
@@ -360,6 +396,9 @@ from nothing; on the async datasets they were winners (+37 to +65 bp), which
 biased the closed trades negative (`async_lag4.5_hol0` −0.247, t = −3.4).
 With one continuous position per pair (T3) `independent_rw` gives +0.006
 (t = +0.0) and `async_lag4.5_hol0` −0.166 (t = −2.3).
+At T7 (daily mark-to-market since T4, entry window) the `fixed` null means are +0.005
+(`independent_rw`), −0.118, −0.008, +0.024, +0.039 (|t| ≤ 2.3) and the OU control +6.613;
+`legacy` is unchanged.
 
 ### How later tasks update the harness
 
@@ -395,3 +434,5 @@ seed 0, best of 5: 0.297 s vs 0.276 s with `legacy_exit_date_pnl`); the T4
 tests add ≈ 3 s.
 At T5 ≈ 52–57 s: the T5 tests add ≈ 3.5 s (15 tests).
 At T6 ≈ 54 s: the T6 tests add ≈ 4 s (25 tests).
+At T7 ≈ 55 s: the T7 tests add ≈ 1.5 s (27 tests); a default run is as fast as before (one
+extra comparison per flat bar with |z| > entry_z).
