@@ -7,11 +7,13 @@ the same arguments, must reproduce every fixture byte for byte.  Later tasks
 run these cases with their legacy_* flags on (LEGACY_FLAGS), so the legacy
 path keeps reproducing the pre-audit code.
 
-The same inputs also run in the default (corrected) mode (audit T1, T2):
+The same inputs also run in the default (corrected) mode (audit T1, T2, T3):
 every fill on the pair's next row with genuine prints of both legs after its
-decision, nothing after cfg.end, and the booked PnL rebuilt from the fill
-prices — the legs' prices with quantities fixed at the entry fill (T2), or,
-with legacy_spread_pnl, the spread change between the fill dates (T1).
+decision, nothing after cfg.end, one position per pair across windows, and
+the booked PnL rebuilt from the fill prices — the legs' prices with
+quantities fixed at the entry fill and β from the training rows before the
+OOS start (T2, T3), or, with legacy_spread_pnl on the per-window engine, the
+spread change between the fill dates (T1).
 """
 import contextlib
 import dataclasses
@@ -41,7 +43,7 @@ _spec.loader.exec_module(make_golden)
 # WfoConfig fields that select the pre-audit behaviour; each audit task adds
 # its legacy_* flag here.
 LEGACY_FLAGS: dict = {"legacy_same_close": True, "legacy_spread_pnl": True,
-                      "legacy_stale_prints": True}
+                      "legacy_stale_prints": True, "legacy_window_reset": True}
 # All of them off: the corrected defaults.
 DEFAULTS: dict = dict.fromkeys(LEGACY_FLAGS, False)
 # CLI options that are not WfoConfig fields: file IO, and the headline
@@ -121,12 +123,14 @@ def test_cli_options_are_the_wfo_config_fields_with_same_defaults():
     assert {k: defaults[k] for k in fields} == dataclasses.asdict(WfoConfig())
 
 
+@pytest.mark.parametrize("legacy", [True, False], ids=["legacy", "default"])
 @pytest.mark.parametrize("flag", ["metagate", "hrp"])
-def test_metagate_and_hrp_keep_pre_existing_unbound_local_error(flag):
+def test_metagate_and_hrp_keep_pre_existing_unbound_local_error(flag, legacy):
     # Ruling R7: main() referenced cost_log before assignment with these flags;
-    # T0 preserves the failure (see AUDIT_FIX_LOG.md, known limitations).
+    # T0 preserves the failure (see AUDIT_FIX_LOG.md, known limitations), in
+    # both engines (T3).
     with pytest.raises(UnboundLocalError):
-        run_case("flat", **{flag: True})
+        run_case("flat", **{flag: True, **({} if legacy else DEFAULTS)})
 
 
 @pytest.mark.parametrize("flags", [{"vwz": True}, {"exec_mode": "vwap"}], ids=["vwz", "vwap"])
@@ -152,10 +156,13 @@ def run_quiet(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig, **frames):
 @pytest.mark.parametrize("case", list(make_golden.CASES))
 def test_default_mode_fills_on_the_pairs_next_row(case):
     # Every option case: each fill is the pair's next row with both legs after
-    # its decision (never after cfg.end); an end_of_data exit fills on its
-    # decision date, where no such row is left; a pair's positions never
-    # overlap; daily_pnl holds every trade's PnL.  Rows = genuine prints of
-    # both legs (the stale-print mask the engine applies, T2).
+    # its decision (never after cfg.end); only an end_of_data exit without
+    # such a row fills on its decision date.  One continuous position per
+    # pair (T3): positions never overlap, a trade may exit in a later window
+    # than it entered, and what is open at the end of the last window is
+    # closed (end_of_data) after the pair's last decision row, on the next
+    # row.  daily_pnl holds every trade's PnL.  Rows = genuine prints of both
+    # legs (the stale-print mask the engine applies, T2).
     res = run_case(case, **DEFAULTS)
     tr = res.trades
     if tr.empty:                    # only where the pre-refactor CLI had none either
@@ -163,22 +170,32 @@ def test_default_mode_fills_on_the_pairs_next_row(case):
         return
     inp = make_golden.case_inputs(case)
     closes = mask_stale_prints(as_cli_reads(inp["closes"]), as_cli_reads(inp["volumes"]))
-    end = cli_config(inp["args"]).end
-    data_end = pd.Timestamp(end) if end else closes.index.max()
+    cfg = cli_config(inp["args"])
+    data_end = pd.Timestamp(cfg.end) if cfg.end else closes.index.max()
+    windows = make_windows(closes, cfg.train, cfg.oos, cfg.step, start=cfg.start, end=cfg.end)
+    oos_s = pd.DatetimeIndex([w[2] for w in windows])
+    oos_e = pd.DatetimeIndex([w[3] for w in windows])
     for pair, g in tr.sort_values("entry_signal").groupby("pair"):
         rows = closes[pair.split("-")].dropna().index
         rows = rows[rows <= data_end]
         nxt_in = rows.searchsorted(g["entry_signal"], side="right")
         nxt_out = rows.searchsorted(g["exit_signal"], side="right")
         eod = (g["reason"] == "end_of_data").to_numpy()
-        assert (nxt_in < len(rows)).all() and (nxt_out[~eod] < len(rows)).all()
+        has_next = nxt_out < len(rows)
+        assert (nxt_in < len(rows)).all() and (has_next | eod).all()
         assert (rows[nxt_in] == g["entry"].to_numpy()).all()
-        assert (rows[nxt_out[~eod]] == g["exit"].to_numpy()[~eod]).all()
-        assert (nxt_out[eod] == len(rows)).all()
-        assert (g["exit"] == g["exit_signal"])[eod].all()
+        assert (rows[nxt_out[has_next]] == g["exit"].to_numpy()[has_next]).all()
+        assert (g["exit"] == g["exit_signal"]).to_numpy()[~has_next].all()
+        assert (g["exit_signal"][eod] == rows[rows <= oos_e[-1]][-1]).all()
         prev_exit = g["exit"].shift()
-        assert (g["entry"] >= prev_exit).iloc[1:].all()
-        assert (g["entry"] > prev_exit)[g["window"] == g["window"].shift()].all()
+        assert (g["entry"] > prev_exit).iloc[1:].all()
+        # Windows: entered in the OOS of window_entered; window_exited = the
+        # latest-starting window whose OOS has begun on the exit decision date.
+        we, wx = g["window_entered"].to_numpy() - 1, g["window_exited"].to_numpy() - 1
+        assert (g["window"] == g["window_entered"]).all()
+        assert ((oos_s[we] <= g["entry_signal"]) & (g["entry_signal"] < oos_e[we])).all()
+        assert (wx == oos_s.searchsorted(g["exit_signal"], side="right") - 1).all()
+        assert (wx >= we).all()
     assert res.daily_pnl.sum() == pytest.approx(tr["pnl"].sum(), abs=1e-9)
     assert set(tr["exit"].dt.normalize()) <= set(res.daily_pnl.index)
 
@@ -210,22 +227,26 @@ def test_no_data_after_cfg_end_is_used(window, days_after):
 def test_booked_pnl_is_rebuilt_from_the_fill_prices(exec_mode, pnl):
     # Zero costs.  Each fill price belongs to its fill date (the fill-only bar
     # included): the close or (vwap mode) the VWAP — an exit at the end of the
-    # data, or a leg without a VWAP, at the close; β = the window's train β.
-    # legs (default, T2): quantities fixed at the entry fill, q1 = 1/P1 and
-    # q2 = β/P2; the trade books size × side × (q1·ΔP1 − q2·ΔP2).
-    # spread (legacy_spread_pnl, T1): size × side × Δ(log P1 − β·log P2).
+    # data, or a leg without a VWAP, at the close; β = the entry window's train β.
+    # legs (default, T2/T3): quantities fixed at the entry fill, q1 = 1/P1 and
+    # q2 = β/P2, β from the training rows before oos_s; the trade books
+    # size × side × (q1·ΔP1 − q2·ΔP2).
+    # spread (legacy_spread_pnl, T1, on the per-window engine whose train
+    # includes oos_s): size × side × Δ(log P1 − β·log P2).
     inp = make_golden.case_inputs("vwap_exec")
     closes, vwap = inp["closes"], inp["vwap"]
     cfg = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0, exec_mode=exec_mode,
-                    legacy_spread_pnl=pnl == "spread")
+                    legacy_spread_pnl=pnl == "spread", legacy_window_reset=pnl == "spread")
     tr = run_quiet(closes, inp["pairs"], cfg, vwap=vwap).trades
     windows = make_windows(closes, cfg.train, cfg.oos, cfg.step)
     use_vwap = exec_mode == "vwap"
     rebuilt, exits_after_window = [], 0
     for _, t in tr.iterrows():
         a, b = t["pair"].split("-")
-        tr_s, tr_e, _, oos_e = windows[t["window"] - 1]
+        tr_s, tr_e, oos_s, oos_e = windows[t["window"] - 1]
         train = closes.loc[tr_s:tr_e, [a, b]].dropna()
+        if pnl == "legs":       # T3 / T9.1: the training rows strictly before oos_s
+            train = train[train.index < oos_s]
         beta = estimate_beta(train[a], train[b])
         assert t["beta"] == beta
 

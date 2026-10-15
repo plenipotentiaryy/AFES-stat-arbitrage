@@ -4,7 +4,7 @@ Run everything from the repo root (pytest.ini sets `testpaths = tests`):
 
     python -m pytest -q
 
-The suite runs offline and never reads `data/`. Wall time ≈ 75–90 s on a 10-core
+The suite runs offline and never reads `data/`. Wall time ≈ 50–90 s on a 10-core
 Mac (the limit is ~2 minutes). The older unittest modules (`test_lookahead.py`,
 `test_risk_governor.py`, …) run under pytest unchanged.
 
@@ -26,23 +26,33 @@ synthetic data whose true edge is known.
 | `test_leg_fills.py` | PnL from leg fills; no signal or fill on a stale print, no entry on a zero-return day (T2) |
 | `test_diag_stale_entries.py` | `diag_stale_entries.py` on hand-made prices and the async holiday dataset (T2) |
 | `test_headline_universe.py` | the CLI's headline-universe filter and cross-listed table (T2) |
+| `test_continuous_positions.py` | one position per pair across windows, β per window for new entries, end-of-run close (T3) |
 
 ### Variants
 
 `placebo_harness.VARIANTS`: `legacy` = the gross config with every `legacy_*`
 flag on (T1: `legacy_same_close`, the pre-audit same-close fills; T2:
-`legacy_spread_pnl`, `legacy_stale_prints`) and the legacy async panel builder
+`legacy_spread_pnl`, `legacy_stale_prints`; T3: `legacy_window_reset`, the
+per-window engine) and the legacy async panel builder
 `build_async_panel` (local prints forward-filled onto the US calendar,
 converted with the daily FX close); `fixed` = the gross config with the
 corrected defaults (T1: an order decided at close t fills at close t+1; T2:
-stale prints masked, no entry on a zero-return day, PnL from the leg fills)
-and `build_async_panel_fixed` (each local print converted with the grid FX at
+stale prints masked, no entry on a zero-return day, PnL from the leg fills;
+T3: one continuous position per pair across windows) and
+`build_async_panel_fixed` (each local print converted with the grid FX at
 its own close, on the union calendar, NaN on local holidays).
 
 ### What it checks
 
-- **Null tests** (no edge exists, so with causal fills every leg is a martingale
-  and the expected gross PnL is exactly 0). Datasets: `independent_rw` (20 pairs,
+- **Null tests** (no edge exists: log prices are martingales and fills are
+  causal, so no rule can forecast them).  In USD the legs, held in quantities
+  fixed at the entry fill, are not exact martingales: a zero-log-drift price
+  has E[ΔP/P] = e^{σ²h/2} − 1 over h days, so a trade's expected gross is
+  side·(1 − β)·(e^{σ²h/2} − 1) — on `independent_rw` ≈ +25 bp per long-spread
+  and ≈ −25 bp per short-spread trade (seeds 0–19 at T3: measured +23.9 bp /
+  −23.3 bp).  The z-score is sign-symmetric, so the two sides cancel and the
+  expected pooled gross PnL is ≈ 0 (measured +0.3 bp per trade), which is
+  what the null tests check. Datasets: `independent_rw` (20 pairs,
   two independent zero-drift random walks each) and `async_same_asset` (one
   efficient price per pair printed by a US and a local exchange) with close lag
   4.5 h or 15 h × 0 or 5 local holidays per year. Gross config: flat model with
@@ -61,13 +71,16 @@ its own close, on the union calendar, NaN on local holidays).
   seeds 0–9: mean Sharpe > 1.0. If it fails, the pipeline is broken —
   investigate; never change the strategy's parameters to make it pass.
 - **Truncation invariance**: seed 0 of `independent_rw`, `async_lag15_hol5`
-  and `ou_positive_control`, panel cut at its middle date D (inclusive). Among
-  the trades of the windows the truncated run has (windows still reset per
-  pair until T3), every trade whose exit was decided before D is identical in
-  all columns, and every entry decided before D has the same `entry_signal`,
-  `entry` (fill), `side` and `size` (T1; at T0 whole windows were compared,
-  Ruling R4). Decisions at or after D are excluded: an exit decided on D fills
-  on D+1 in the full run and at D's close (`end_of_data`) in the truncated one.
+  and `ou_positive_control`, run on the panel cut at its middle date D
+  (inclusive) and on the full panel.  With C = min(D, the truncated run's
+  last OOS end): every entry decided before C has the same `entry_signal`,
+  `entry` (fill), `side`, `size`, `beta` and entry leg prices, and every exit
+  decided before C is identical in all columns (exit fill, `reason`, exit leg
+  prices, `pnl`, …) (T3, the plan's full form; at T0 whole windows were
+  compared, Ruling R4, at T1/T2 the trades of the truncated run's windows).
+  Decisions at or after C are excluded, and so are the truncated run's
+  `end_of_data` closes: it decides nothing after its last OOS end and closes
+  what is open then at the next available close.
 - **Cross-listed data layer** (`test_cross_listing.py`, T2): `close_time`
   by ticker suffix (unknown suffix → `KeyError`); `repeats_previous_print`
   (the zero-return rule shared by the mask, the entry guard and the
@@ -109,7 +122,7 @@ its own close, on the union calendar, NaN on local holidays).
   (not filled), `decision_end` (no decision on fill-only bars) and the VWAP path.
 - **Identity** (`test_wfo_core_identity.py`): `run_wfo_daily` with
   `LEGACY_FLAGS` (`legacy_same_close`, T1; `legacy_spread_pnl` and
-  `legacy_stale_prints`, T2) reproduces the
+  `legacy_stale_prints`, T2; `legacy_window_reset`, T3) reproduces the
   trades CSV of `step3j_wfo_daily.py` at commit 46ffdfb on 26 small synthetic
   cases that cover every CLI option, compared on the fixture's columns (later
   tasks add columns; the legacy `entry_signal` / `exit_signal` equal `entry` /
@@ -124,17 +137,47 @@ its own close, on the union calendar, NaN on local holidays).
   may change the last digits of the floats (and then the byte comparison).
   `--metagate` / `--hrp` keep their pre-existing `UnboundLocalError` (Ruling R7).
 - **Default mode on the identity inputs** (`test_wfo_core_identity.py`, T1,
-  T2): all 26 cases run with the corrected defaults (`DEFAULTS` = every
-  legacy flag off); every fill is the pair's next row with genuine prints of
-  both legs after its decision (never after `cfg.end`; `end_of_data` only
-  where no such row is left), a pair's positions never overlap, and
+  T2, T3): all 26 cases run with the corrected defaults (`DEFAULTS` = every
+  legacy flag off, i.e. the continuous engine); every fill is the pair's
+  next row with genuine prints of both legs after its decision (never after
+  `cfg.end`; on the decision date only for an `end_of_data` close with no
+  such row left), a pair's positions never overlap (each entry fill after
+  the previous exit fill), every entry lies in the OOS of its
+  `window_entered`, `window_exited` is the latest-starting window whose OOS
+  has begun on the exit decision date (≥ `window_entered`), an `end_of_data`
+  close is decided on the pair's last row up to the last OOS end, and
   `daily_pnl` holds every trade's PnL. With `cfg.end` set, the run on the
   full panel equals the run on the panel cut at `cfg.end` (the fill-only bar
   never lies after it, Ruling R15). With zero costs, each trade's PnL is
   rebuilt from its fill prices, in `next_close` and `vwap` mode: by default
-  from the legs (q1 = 1/P1, q2 = β/P2 at the entry fill; a leg without a VWAP
-  at its close), with `legacy_spread_pnl` as the spread (or VWAP spread)
-  change between the fill dates.
+  from the legs (q1 = 1/P1, q2 = β/P2 at the entry fill, β from the entry
+  window's training rows before its OOS start; a leg without a VWAP at its
+  close), with `legacy_spread_pnl` (on the per-window engine) as the spread
+  (or VWAP spread) change between the fill dates.
+- **Continuous positions** (`test_continuous_positions.py`, T3): run level,
+  on a hand-made two-leg panel (zero costs): the acceptance case — a short
+  spread decided on the last days of window 1, open at the cut, stopped out
+  in window 2 at a loss: it is in `trades` (`window_entered` 1,
+  `window_exited` 2, PnL from the leg fills) and in `daily_pnl`; it keeps
+  β of window 1 (β1 ≠ β2) and exits on the rolling z of log PA − β1·log PB;
+  window 2's z is above ENTRY_Z while it is open, yet no second position
+  opens (the per-window reset opens one and drops the window-1 trade); new
+  window-2 entries use β2; the end-of-run close at the next row with both
+  legs (a missing print skips a day; with `cfg.end` at the last OOS end, at
+  the last decision row's close); β from the training rows strictly before
+  the OOS start (T9.1; the per-window reset keeps the slice that includes
+  it); `legacy_same_close` / `legacy_spread_pnl` without
+  `legacy_window_reset` raise `ValueError`.  Engine level
+  (`backtest_pair_continuous` on 32 hand-made rows, a hand-made z per
+  window): exits on the entry window's z whatever window the row is in;
+  no entries in an ineligible window or a gap, the latest-starting window
+  when OOS periods overlap; an entry decided on the last decision row is
+  closed on the fill-only row at once (held 0, costs charged); cost and
+  borrow of the entry window; CUSUM (a break in a window's OOS force-closes,
+  one in its training rows only blocks its entries); Kalman β of the entry
+  decision row and the exit z of its own spread; a pair whose rows end
+  before the last window: its end-of-run close is labelled with the window
+  of its last decision row.
 
 ### Statistic definitions
 
@@ -148,26 +191,25 @@ its own close, on the union calendar, NaN on local holidays).
   pooled over all seeds of a dataset. It is a t-statistic, not a Sharpe.
 - **Win rate**: share of pooled trades with pnl > 0.
 
-### Expected outcomes (measured at T2)
+### Expected outcomes (measured at T3)
 
 | test (null: mean Sharpe and per-trade t-stat) | `legacy` | `fixed` |
 |---|---|---|
-| null, `independent_rw` | strict xfail: pre-T1 behaviour (bug named in the reason) | strict xfail: "T3 pending: positions still open at a window end are dropped" |
-| null, `async_lag4.5_hol0` | strict xfail | strict xfail: "T3 pending: …" (since T2; passed at T1) |
+| null, `independent_rw` | strict xfail: pre-T1 behaviour (bug named in the reason) | pass (since T3) |
+| null, `async_lag4.5_hol0` | strict xfail | pass (since T3; passed at T1, failed at T2) |
 | null, `async_lag15_hol0` | strict xfail | pass (since T1) |
 | null, `async_lag4.5_hol5`, `async_lag15_hol5` | strict xfail | pass (since T2) |
-| OU positive control | — | pass (+6.26) |
+| OU positive control | — | pass (+6.68) |
 | truncation invariance (3 datasets) | pass | pass |
 
-The measured numbers are in `AUDIT_FIX_LOG.md` (T0, T1, T2). On
-`independent_rw` the whole bias (+0.76 Sharpe, t = +10.9 for `fixed`) comes
-from positions still open at a window end being dropped (T3): adding their
-mark-to-market at the cut brings the pooled t-stat to +0.04. On the async
-datasets the dropped positions are winners instead (+37 to +65 bp at the
-cut), which biases the closed trades negative: over seeds 20–79 the closed
-trades of `async_lag4.5_hol0` give −0.08 Sharpe and the marks bring it to
-0.00; on seeds 0–19 the closed trades give −0.247 (t = −3.4), with the marks
-−0.165 (t = −2.3).
+The measured numbers are in `AUDIT_FIX_LOG.md` (T0–T3). Until T2 the
+per-window engine dropped every position still open at a window end: on
+`independent_rw` those were losers (5541 positions, mean mark-to-market at
+the cut −195 bp, t = −25.3), which made the closed trades show +0.76 Sharpe
+from nothing; on the async datasets they were winners (+37 to +65 bp), which
+biased the closed trades negative (`async_lag4.5_hol0` −0.247, t = −3.4).
+With one continuous position per pair (T3) `independent_rw` gives +0.006
+(t = +0.0) and `async_lag4.5_hol0` −0.166 (t = −2.3).
 
 ### How later tasks update the harness
 
@@ -195,3 +237,6 @@ Runtime at T0: full suite ≈ 30 s wall, of which the placebo pool (110 runs,
 test 12 runs instead of 6; the default-mode runs on the identity inputs
 add ≈ 13 s.  At T2 ≈ 74–87 s: a default run costs ≈ 18% more (stale-print
 mask, entry guard, leg prices), the pool ≈ 51 s; the T2 tests add ≈ 6 s.
+At T3 ≈ 50–55 s: the continuous engine makes one pass per pair instead of one
+per pair and window (`independent_rw` seed 0, best of 5: 0.29 s vs 1.16 s
+for the per-window engine), the pool ≈ 35 s; the T3 tests add ≈ 1 s.

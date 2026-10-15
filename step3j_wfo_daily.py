@@ -177,6 +177,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="LEGACY: keep exactly unchanged closes with zero/missing volume "
                         "as prints and allow entries on a zero-return signal day. "
                         "Comparison only; never for headline results.")
+    p.add_argument("--legacy-window-reset", action="store_true", dest="legacy_window_reset",
+                   help="LEGACY: reset each pair's position state per walk-forward window "
+                        "(positions still open at a window end are dropped; the training "
+                        "slice includes the first OOS day). Needed by --legacy-same-close "
+                        "and --legacy-spread-pnl. Comparison only; never for headline results.")
     p.add_argument("--legacy-cross-listed", action="store_true", dest="legacy_cross_listed",
                    help="LEGACY: keep the cross-listed pairs (fx_unaligned, ASX/TSE or "
                         "European legs) in the run; their numbers are NOT VALID. "

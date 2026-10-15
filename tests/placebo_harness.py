@@ -39,7 +39,8 @@ GROSS = WfoConfig(execution_model="flat", cost=0.0, slip=0.0, borrow=0.0)
 # task adds its legacy_* cfg field to "legacy".
 VARIANTS: dict[str, tuple[WfoConfig, Callable]] = {
     "legacy": (replace(GROSS, legacy_same_close=True, legacy_spread_pnl=True,
-                       legacy_stale_prints=True), synthetic.build_async_panel),
+                       legacy_stale_prints=True, legacy_window_reset=True),
+               synthetic.build_async_panel),
     "fixed":  (GROSS, synthetic.build_async_panel_fixed),
 }
 

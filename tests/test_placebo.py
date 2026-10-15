@@ -1,8 +1,9 @@
 """Placebo tests of the daily WFO (audit task T0); see tests/README.md.
 
-Null datasets have no edge: with causal fills every leg is a martingale, so
-the mean gross Sharpe over 20 seeds must lie in [-0.2, +0.2] and the pooled
-per-trade gross PnL must have |t| < 3.  The OU positive control (a real
+Null datasets have no edge: log prices are martingales and fills are causal
+(the USD convexity of fixed-quantity legs cancels between long and short
+spreads, see tests/README.md), so the mean gross Sharpe over 20 seeds must
+lie in [-0.2, +0.2] and the pooled per-trade gross PnL must have |t| < 3.  The OU positive control (a real
 edge) must give a mean Sharpe > 1.0.  Truncating the data must not change
 the trades decided before the cut.
 """
@@ -18,16 +19,16 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import placebo_harness as ph  # noqa: E402
+from wfo_daily_core import make_windows  # noqa: E402
 
 RW_BUG = "pre-T1 behaviour: positions still open at a window end are dropped (T3)"
 ASYNC_BUG = ("pre-T1 behaviour: same-close fills on date-aligned, forward-filled local "
              "prints converted with a mistimed daily FX close (T1/T2), and positions "
              "open at a window end dropped (T3)")
-T3_PENDING = "T3 pending: positions still open at a window end are dropped"
 
 # Expected outcomes, measured at T0 and re-measured by each task (Ruling R5):
 # (variant, dataset, test) → reason of a strict xfail.  Absent = must pass.
-# The one table later tasks flip.
+# The one table later tasks flip.  Since T3 every "fixed" null passes.
 XFAIL = {
     ("legacy", "independent_rw",    "sharpe"): RW_BUG,
     ("legacy", "independent_rw",    "tstat"):  RW_BUG,
@@ -39,12 +40,6 @@ XFAIL = {
     ("legacy", "async_lag15_hol0",  "tstat"):  ASYNC_BUG,
     ("legacy", "async_lag15_hol5",  "sharpe"): ASYNC_BUG,
     ("legacy", "async_lag15_hol5",  "tstat"):  ASYNC_BUG,
-    ("fixed",  "independent_rw",    "sharpe"): T3_PENDING,
-    ("fixed",  "independent_rw",    "tstat"):  T3_PENDING,
-    # Measured at T2: the positions dropped at window ends are winners here
-    # (closed trades biased negative); see AUDIT_FIX_LOG.md, T2.
-    ("fixed",  "async_lag4.5_hol0", "sharpe"): T3_PENDING,
-    ("fixed",  "async_lag4.5_hol0", "tstat"):  T3_PENDING,
 }
 
 TRUNCATION_DATASETS = ["independent_rw", "async_lag15_hol5", "ou_positive_control"]
@@ -95,33 +90,41 @@ def test_ou_positive_control_shows_its_edge(placebo):
 @functools.lru_cache(maxsize=None)
 def full_and_truncated(key: tuple):
     """Runs of seed 0 on the full panel and on the panel cut at its middle
-    date D (inclusive), and D."""
+    date D (inclusive), and C = min(D, the truncated run's last OOS end)."""
     cfg, builder, dataset = key
     closes, pairs = ph.make_panel(dataset, 0, builder)
     cut = closes.index[len(closes) // 2]
-    return ph.run_quiet(closes, pairs, cfg), ph.run_quiet(closes.loc[:cut], pairs, cfg), cut
+    last_oos_e = make_windows(closes.loc[:cut], cfg.train, cfg.oos, cfg.step,
+                              start=cfg.start, end=cfg.end)[-1][3]
+    return (ph.run_quiet(closes, pairs, cfg), ph.run_quiet(closes.loc[:cut], pairs, cfg),
+            min(cut, last_oos_e))
+
+
+ENTRY_COLS = ["pair", "window_entered", "entry_signal", "entry", "side", "size", "beta",
+              "p1_entry", "p2_entry"]
 
 
 @pytest.mark.parametrize("variant,dataset", cases("truncation", TRUNCATION_DATASETS))
 def test_truncation_invariance(variant, dataset):
-    # Trades of the windows the truncated run has (windows still reset, T3):
-    # every trade whose exit was decided before the cut date D is identical
-    # in all columns, and every entry decided before D has the same decision
-    # date, fill date, side and size.  Decisions at or after D are excluded
-    # (an exit decided on D fills on D+1 or, in the truncated run, at D's
-    # close as end_of_data).
-    full, truncated, cut = full_and_truncated(ph.run_key(variant, dataset))
-    n = truncated.stats["n_windows"]
-    assert 0 < n < full.stats["n_windows"] and not truncated.trades.empty
-    ref = full.trades[full.trades["window"] <= n]
+    # Run on the panel cut at its middle date D and on the full panel.  With
+    # C = min(D, the truncated run's last OOS end): every entry decided before
+    # C has the same decision, fill, side, size, β and entry leg prices, and
+    # every exit decided before C is identical in all columns (exit date,
+    # reason, exit leg prices, pnl, ...).  Decisions at or after C are
+    # excluded: the truncated run decides nothing after its last OOS end and
+    # closes what is still open then as end_of_data (T3), so its end_of_data
+    # closes are excluded too.
+    full, truncated, c = full_and_truncated(ph.run_key(variant, dataset))
+    assert 0 < truncated.stats["n_windows"] < full.stats["n_windows"] and not truncated.trades.empty
 
-    def decided_before_cut(tr: pd.DataFrame, decision: str, cols=slice(None)) -> pd.DataFrame:
-        return tr.loc[tr[decision] < cut, cols].reset_index(drop=True)
+    def entries(tr: pd.DataFrame) -> pd.DataFrame:
+        sel = tr[tr["entry_signal"] < c].sort_values(["pair", "entry_signal"])
+        return sel[ENTRY_COLS].reset_index(drop=True)
 
-    exits = decided_before_cut(truncated.trades, "exit_signal")
-    assert not exits.empty
-    pd.testing.assert_frame_equal(exits, decided_before_cut(ref, "exit_signal"), check_exact=True)
-    entry_cols = ["pair", "window", "entry_signal", "entry", "side", "size"]
-    pd.testing.assert_frame_equal(decided_before_cut(truncated.trades, "entry_signal", entry_cols),
-                                  decided_before_cut(ref, "entry_signal", entry_cols),
-                                  check_exact=True)
+    def exits(tr: pd.DataFrame) -> pd.DataFrame:
+        sel = tr[(tr["exit_signal"] < c) & (tr["reason"] != "end_of_data")]
+        return sel.sort_values(["pair", "exit_signal"]).reset_index(drop=True)
+
+    assert not exits(truncated.trades).empty
+    pd.testing.assert_frame_equal(exits(truncated.trades), exits(full.trades), check_exact=True)
+    pd.testing.assert_frame_equal(entries(truncated.trades), entries(full.trades), check_exact=True)

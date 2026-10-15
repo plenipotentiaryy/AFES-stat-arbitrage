@@ -9,7 +9,9 @@ arguments and calls `run_wfo_daily`.  The defaults carry the audit fixes
 to the pre-refactor CLI (commit 46ffdfb).
 """
 from __future__ import annotations
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -106,6 +108,162 @@ def spread_series(df: pd.DataFrame, t1: str, t2: str, beta: float) -> pd.Series:
     return (np.log(df[t1]) - beta * np.log(df[t2])).dropna()
 
 
+def rolling_z(spread: pd.Series, z_win: int = Z_WIN) -> pd.Series:
+    """z of each bar against the rolling mean / std of the last z_win bars."""
+    mu  = spread.rolling(z_win).mean()
+    sig = spread.rolling(z_win).std()
+    return (spread - mu) / sig
+
+
+# ── Fills and leg PnL (audit T1/T2), shared by both engines ─────────────────
+
+def leg_fill_prices(leg_vals: np.ndarray, xleg_vals: np.ndarray | None, bar: int,
+                    vwap_row: int | None = None) -> tuple[float, float]:
+    """(P1, P2) of a fill on row `bar` of `leg_vals` (the legs' closes): with
+    vwap_row, each leg's VWAP from that row of `xleg_vals` (the VWAP of
+    `bar`), its close where it has none."""
+    p1, p2 = leg_vals[bar]
+    if vwap_row is not None and xleg_vals is not None:
+        v1, v2 = xleg_vals[vwap_row]
+        p1, p2 = (v1 if pd.notna(v1) else p1), (v2 if pd.notna(v2) else p2)
+    return p1, p2
+
+
+def exit_fill_bar(i: int, n: int) -> tuple[int, bool]:
+    """(fill bar, end of data) of an exit decided on bar i of n bars: bar i+1;
+    without one, bar i itself (reason "end_of_data")."""
+    return (i, True) if i + 1 >= n else (i + 1, False)
+
+
+def fill_is_causal(decision: int, fill: int, reason: str, n: int) -> bool:
+    """Hard rule 2: a fill comes after its decision; only an exit at the end
+    of the data fills on its decision bar, the last bar."""
+    return fill > decision or (reason == "end_of_data" and fill == decision == n - 1)
+
+
+def entry_quantities(p1e: float, p2e: float, beta_e: float) -> tuple[float, float]:
+    """(q1, q2) per $1 of leg-1 notional, fixed at the entry fill: 1/P1, β/P2."""
+    return 1.0 / p1e, beta_e / p2e
+
+
+def leg_gross(side: int, q1: float, q2: float, p1e: float, p2e: float,
+              p1x: float, p2x: float) -> float:
+    """Gross PnL per unit size: side·(q1·(P1_exit − P1_entry) − q2·(P2_exit − P2_entry))."""
+    return side * (q1 * (p1x - p1e) - q2 * (p2x - p2e))
+
+
+def net_pnl(size: float, gross: float, cost: float, held: int, borrow_per_day: float) -> float:
+    """size·(gross − round-trip cost − held days of borrow)."""
+    return size * gross - size * cost - size * (held * borrow_per_day)
+
+
+def entry_decision(i: int, zi: float, n: int, entry_z: float,
+                   vr: np.ndarray | None = None, vr_min: float = 0.5,
+                   panic: np.ndarray | None = None, panic_size_mult: float = 0.0,
+                   blackout: np.ndarray | None = None,
+                   size_gate: Callable[[int, int], float] | None = None,
+                   exec_ok: np.ndarray | None = None,
+                   same_close: bool = False) -> tuple[int, float, int] | None:
+    """(side, size, fill bar) of an entry decided on bar i with z = zi, or None.
+
+    The checks, in this order: liquidity gate (vr[i] < vr_min: no entry);
+    macro-HMM panic (panic[i]: no entry when panic_size_mult ≤ 0, else size
+    panic_size_mult); blackout[i] (Aussie gate, zero-return guard); the z
+    threshold (z > entry_z: short spread, z < −entry_z: long); size_gate(i,
+    side) (MetaGate size multiplier, ≤ 0: no entry); the fill bar — bar i+1
+    (legacy same_close: bar i), none past the data; exec_ok[i] False (VWAP
+    mode: no VWAP spread for the fill): not filled.
+    """
+    if vr is not None:
+        vri = vr[i]
+        if pd.notna(vri) and vri < vr_min:          # liquidity gate (legacy convention)
+            return None
+    this_size = 1.0
+    if panic is not None:
+        pi = panic[i]
+        if pd.notna(pi) and bool(pi):
+            if panic_size_mult <= 0.0:               # block mode
+                return None
+            this_size = panic_size_mult              # sizing mode
+    if blackout is not None:
+        bo = blackout[i]
+        if pd.notna(bo) and bool(bo):
+            return None
+    side = -1 if zi > entry_z else (+1 if zi < -entry_z else 0)
+    if side == 0:
+        return None
+    mg_size = 1.0
+    if size_gate is not None:
+        mg_size = size_gate(i, side)
+        if mg_size <= 0.0:
+            return None
+    if same_close:
+        fill = i
+    elif i + 1 < n:
+        fill = i + 1
+    else:                                            # no bar to fill on
+        return None
+    if exec_ok is not None and not exec_ok[i]:
+        return None
+    return side, this_size * mg_size, fill
+
+
+def exit_reason(side: int, zi: float, held: int, exit_z: float, stop_z: float,
+                max_hold: int) -> str | None:
+    """Exit rule of an open position on a bar with z = zi, `held` bars after
+    its entry fill: "target" (z back to exit_z), "stop" (|z| ≥ stop_z),
+    "time" (held ≥ max_hold), or None."""
+    hit_target = (side == -1 and zi <= exit_z) or (side == +1 and zi >= exit_z)
+    hit_stop   = abs(zi) >= stop_z
+    if hit_target or hit_stop or held >= max_hold:
+        return "target" if hit_target else ("stop" if hit_stop else "time")
+    return None
+
+
+def cusum_break_row(z: np.ndarray, lo: int, hi: int, h: float, k: float = 0.5) -> int | None:
+    """First bar in [lo, hi) where the two-sided CUSUM of z (slack k, NaN bars
+    skipped) exceeds h; None if it never does."""
+    Sp = Sn = 0.0
+    for i in range(lo, hi):
+        zi = z[i]
+        if pd.isna(zi):
+            continue
+        Sp = max(0.0, Sp + zi - k)
+        Sn = max(0.0, Sn - zi - k)
+        if max(Sp, Sn) > h:
+            return i
+    return None
+
+
+def tightened_stop(spread: pd.Series, i: int, stop_z: float,
+                   threshold: float, tight_stop_z: float) -> float:
+    """Vol-tight stop: tight_stop_z when the spread's 20-bar / 60-bar std
+    ratio at bar i exceeds threshold, else stop_z."""
+    if i >= 60:
+        v20 = spread.iloc[i - 19: i + 1].std()
+        v60 = spread.iloc[i - 59: i + 1].std()
+        if v60 > 0 and (v20 / v60) > threshold:
+            return tight_stop_z
+    return stop_z
+
+
+def trade_record(idx: pd.Index, entry_sig: int, entry_idx: int, exit_sig: int,
+                 exit_idx: int, side: int, size: float, pnl: float, reason: str,
+                 beta_e: float, p1e: float, p2e: float, p1x: float, p2x: float,
+                 q1: float, q2: float, gross: float) -> dict:
+    """One row of the trades table (bar numbers → dates; fills `entry` /
+    `exit`, decisions `entry_signal` / `exit_signal`)."""
+    return {
+        "entry":  idx[entry_idx], "exit": idx[exit_idx],
+        "held":   exit_idx - entry_idx, "side": side, "pnl": pnl,
+        "size":   size,
+        "reason": reason,
+        "entry_signal": idx[entry_sig], "exit_signal": idx[exit_sig],
+        "beta": beta_e, "p1_entry": p1e, "p2_entry": p2e, "p1_exit": p1x,
+        "p2_exit": p2x, "q1": q1, "q2": q2, "gross": gross,
+    }
+
+
 def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                   cost_per_trade: float,
                   entry_z=ENTRY_Z, exit_z=EXIT_Z, stop_z=STOP_Z,
@@ -134,6 +292,9 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
 
     Entries open only inside the OOS window; z is computed on the warmup-
     extended series so rolling statistics are stable from bar 0 of OOS.
+    This is the per-window engine (cfg.legacy_window_reset): a position still
+    open after the last decision bar is not returned.  The default engine is
+    `backtest_pair_continuous` (audit T3).
 
     cusum_h: if set, run two-sided CUSUM on the standardized spread and
              abort all further entries for this pair-window once
@@ -167,16 +328,11 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     cost_per_trade − held·borrow_per_day).
     """
     if z_series is None:
-        mu  = spread_full.rolling(z_win).mean()
-        sig = spread_full.rolling(z_win).std()
-        z   = (spread_full - mu) / sig
+        z = rolling_z(spread_full, z_win)
     else:
         z = z_series.reindex(spread_full.index)
 
-    # CUSUM state (only used if cusum_h is set)
-    Sp = Sn = 0.0
-    cusum_k = 0.5
-    broken = False
+    broken = False   # CUSUM break seen (only used if cusum_h is set)
 
     trades = []
     in_pos, side = False, 0
@@ -212,71 +368,65 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     beta_e = p1e = p2e = q1 = q2 = nan
 
     def legs_at(bar: int, vwap_row: int | None = None) -> tuple[float, float]:
-        """(P1, P2) of a fill on `bar`: with vwap_row, each leg's VWAP from that
-        row of exec_leg_prices (the VWAP of `bar`), its close where it has none."""
+        """(P1, P2) of a fill on `bar` (leg_fill_prices; NaN without leg_prices)."""
         if leg_vals is None:
             return nan, nan
-        p1, p2 = leg_vals[bar]
-        if vwap_row is not None and xleg_vals is not None:
-            v1, v2 = xleg_vals[vwap_row]
-            p1, p2 = (v1 if pd.notna(v1) else p1), (v2 if pd.notna(v2) else p2)
-        return p1, p2
+        return leg_fill_prices(leg_vals, xleg_vals, bar, vwap_row)
 
     def gross_of(exit_spread: float, p1x: float, p2x: float) -> float:
         """Gross PnL per unit size of the open position closed at these prices."""
         if leg_vals is None:                       # legacy: the spread change
             return side * (exit_spread - entry_spread)
-        return side * (q1 * (p1x - p1e) - q2 * (p2x - p2e))
+        return leg_gross(side, q1, q2, p1e, p2e, p1x, p2x)
 
-    def leg_cols(p1x: float, p2x: float, gross: float) -> dict:
-        return {"beta": beta_e, "p1_entry": p1e, "p2_entry": p2e, "p1_exit": p1x,
-                "p2_exit": p2x, "q1": q1, "q2": q2, "gross": gross}
+    def record(exit_sig: int, exit_idx: int, reason: str, p1x: float, p2x: float,
+               gross: float, pnl: float) -> dict:
+        return trade_record(idx, entry_sig, entry_idx, exit_sig, exit_idx, side, entry_size,
+                            pnl, reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross)
 
     def exit_fill(i: int, reason: str) -> tuple[int, float, float, float, str]:
         """(fill bar, fill spread, P1, P2, reason) of an exit decided on bar i."""
-        if i + 1 >= n:                     # no bar i+1: the data ends here
+        fill, end_of_data = exit_fill_bar(i, n)
+        if end_of_data:                    # no bar i+1: the data ends here
             return (i, sp_vals[i], *legs_at(i), "end_of_data")
         vwap_row = i if exec_vals is not None else None
         if exec_vals is not None and pd.notna(exec_vals[i]):
-            return (i + 1, exec_vals[i], *legs_at(i + 1, vwap_row), reason)   # VWAP of bar i+1
-        return (i + 1, sp_vals[i + 1], *legs_at(i + 1, vwap_row), reason)
+            return (fill, exec_vals[i], *legs_at(fill, vwap_row), reason)   # VWAP of bar i+1
+        return (fill, sp_vals[fill], *legs_at(fill, vwap_row), reason)
 
     def causal(decision: int, fill: int, reason: str) -> bool:
-        """Hard rule 2: a fill comes after its decision; only an exit at the
-        end of the data fills on its decision bar, the last bar."""
-        return fill > decision or (reason == "end_of_data" and fill == decision == n - 1)
+        return fill_is_causal(decision, fill, reason, n)
+
+    # CUSUM on every bar (train+oos) so the test is informed: the break bar.
+    cusum_at = cusum_break_row(z_vals, 0, n_decide, cusum_h) if cusum_h is not None else None
+    exec_ok_vals = pd.notna(exec_vals) if exec_vals is not None else None
+    mg_gate = None
+    if metagate is not None and metagate.usable and hurst_series is not None:
+        def mg_gate(i: int, side: int) -> float:
+            """MetaGate size multiplier of an entry on bar i (≤ 0: no entry)."""
+            feat = mg_entry_features(spread_full, z, i, side, hurst_series)
+            return metagate.size_multiplier(metagate.predict_proba(feat))
 
     for i in range(n_decide):
         if z_isna[i]:
             continue
         zi = z_vals[i]
-        # Update CUSUM on every bar (train+oos) so the test is informed.
-        if cusum_h is not None and not broken:
-            Sp = max(0.0, Sp + zi - cusum_k)
-            Sn = max(0.0, Sn - zi - cusum_k)
-            if max(Sp, Sn) > cusum_h:
-                broken = True
-                # Force-close any open position on break.
-                if in_pos:
-                    if legacy_same_close:
-                        exit_idx, exit_spread, reason = i, sp_vals[i], "cusum_break"
-                        p1x, p2x = legs_at(i)
-                    else:
-                        exit_idx, exit_spread, p1x, p2x, reason = exit_fill(i, "cusum_break")
-                    held_bars  = exit_idx - entry_idx
-                    gross = gross_of(exit_spread, p1x, p2x)
-                    pnl = entry_size * (gross - cost_per_trade - held_bars * borrow_per_day)
-                    assert legacy_same_close or (causal(entry_sig, entry_idx, "entry")
-                                                 and causal(i, exit_idx, reason))
-                    trades.append({
-                        "entry":  idx[entry_idx], "exit": idx[exit_idx],
-                        "held":   held_bars, "side": side, "pnl": pnl,
-                        "size":   entry_size,
-                        "reason": reason,
-                        "entry_signal": idx[entry_sig], "exit_signal": idx[i],
-                        **leg_cols(p1x, p2x, gross),
-                    })
-                    in_pos = False
+        if i == cusum_at:
+            broken = True
+            # Force-close any open position on break.
+            if in_pos:
+                if legacy_same_close:
+                    exit_idx, exit_spread, reason = i, sp_vals[i], "cusum_break"
+                    p1x, p2x = legs_at(i)
+                else:
+                    exit_idx, exit_spread, p1x, p2x, reason = exit_fill(i, "cusum_break")
+                gross = gross_of(exit_spread, p1x, p2x)
+                pnl = net_pnl(entry_size, gross, cost_per_trade, exit_idx - entry_idx,
+                              borrow_per_day)
+                assert legacy_same_close or (causal(entry_sig, entry_idx, "entry")
+                                             and causal(i, exit_idx, reason))
+                trades.append(record(i, exit_idx, reason, p1x, p2x, gross, pnl))
+                in_pos = False
 
         if broken:
             continue
@@ -284,83 +434,32 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
         if not in_pos:
             if not oos_mask[i]:
                 continue
-            # Liquidity gate: VR < 0.5 → skip entry (legacy convention).
-            if vr_series is not None:
-                vri = vr_vals[i]
-                if pd.notna(vri) and vri < vr_min:
-                    continue
-            # Macro-HMM panic gate. When panic active:
-            #   panic_size_mult == 0  → skip entry entirely (block-mode)
-            #   panic_size_mult > 0   → enter with reduced size (sizing-mode)
-            this_size = 1.0
-            if panic_series is not None:
-                pi = panic_vals[i]
-                if pd.notna(pi) and bool(pi):
-                    if panic_size_mult <= 0.0:
-                        continue
-                    this_size = panic_size_mult
-            # External blackout (e.g., Aussie filter: vol-spike / HL gate).
-            if entry_blackout is not None:
-                bo = blackout_vals[i]
-                if pd.notna(bo) and bool(bo):
-                    continue
-            # Pre-compute provisional side for MetaGate scoring; we still
-            # need a hard z-threshold cross to consider entering.
-            prov_side = -1 if zi > entry_z else (+1 if zi < -entry_z else 0)
-            if prov_side == 0:
+            # Gates, z threshold, MetaGate and fill bar (entry_decision).  With
+            # exec_spread the fill is the next-day VWAP: exec_spread[i] holds
+            # the spread realised by an order entered at the end of bar i (the
+            # VWAP of bar i+1); NaN → not filled.  Otherwise the close of bar
+            # i+1 (audit T1); legacy_same_close: the close of bar i.
+            entry = entry_decision(i, zi, n, entry_z, vr_vals, vr_min, panic_vals,
+                                   panic_size_mult, blackout_vals, mg_gate, exec_ok_vals,
+                                   legacy_same_close)
+            if entry is None:
                 continue
-            mg_size = 1.0
-            if metagate is not None and metagate.usable and hurst_series is not None:
-                feat = mg_entry_features(spread_full, z, i, prov_side, hurst_series)
-                p_win = metagate.predict_proba(feat)
-                mg_size = metagate.size_multiplier(p_win)
-                if mg_size <= 0.0:
-                    continue
-            # If exec_spread given, fill uses next-day VWAP price.
-            # exec_spread is assumed pre-shifted: exec_spread.iloc[i] holds
-            # the spread that would be realised by an order entered at the
-            # end of bar i (i.e. day i+1 VWAP). NaN → skip (no fill yet).
-            # Otherwise the fill is the close of bar i+1 (audit T1); no bar
-            # i+1 → not filled.  legacy_same_close: the close of bar i.
-            if legacy_same_close:
-                fill_idx = i
-                fill_spread_at_entry = (
-                    exec_vals[i] if exec_spread is not None
-                    else sp_vals[i]
-                )
-            elif i + 1 < n:
-                fill_idx = i + 1
-                fill_spread_at_entry = (
-                    exec_vals[i] if exec_spread is not None
-                    else sp_vals[i + 1]
-                )
-            else:
-                continue
-            if exec_spread is not None and pd.isna(fill_spread_at_entry):
-                continue
-            side = prov_side
+            side, entry_size, fill_idx = entry
             in_pos = True
-            entry_idx, entry_spread = fill_idx, fill_spread_at_entry
+            entry_idx = fill_idx
+            entry_spread = exec_vals[i] if exec_spread is not None else sp_vals[fill_idx]
             entry_sig = i
             # Audit T2: quantities fixed at the entry fill, with β of this decision bar.
             p1e, p2e = legs_at(fill_idx, i if exec_spread is not None else None)
             beta_e = (beta_vals[i] if beta_vals is not None
                       else (nan if beta is None else float(beta)))
-            q1, q2 = 1.0 / p1e, beta_e / p2e
-            entry_size = this_size * mg_size
-            cur_stop_z = stop_z
-            if vol_tight_stop and i >= 60:
-                v20 = spread_full.iloc[i - 19: i + 1].std()
-                v60 = spread_full.iloc[i - 59: i + 1].std()
-                if v60 > 0 and (v20 / v60) > vol_tight_threshold:
-                    cur_stop_z = vol_tight_stop_z
+            q1, q2 = entry_quantities(p1e, p2e, beta_e)
+            cur_stop_z = (tightened_stop(spread_full, i, stop_z, vol_tight_threshold,
+                                         vol_tight_stop_z)
+                          if vol_tight_stop else stop_z)
         else:
-            held = i - entry_idx
-            hit_target = (side == -1 and zi <= exit_z) or (side == +1 and zi >= exit_z)
-            hit_stop   = abs(zi) >= cur_stop_z
-            timeout    = held >= max_hold
-            if hit_target or hit_stop or timeout:
-                reason = "target" if hit_target else ("stop" if hit_stop else "time")
+            reason = exit_reason(side, zi, i - entry_idx, exit_z, cur_stop_z, max_hold)
+            if reason is not None:
                 if legacy_same_close:
                     exit_idx = i
                     fill_spread_at_exit = (
@@ -379,22 +478,164 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
                         p1x, p2x = legs_at(i, int(np.flatnonzero(pd.notna(exec_vals[:i + 1]))[-1]))
                 else:
                     exit_idx, fill_spread_at_exit, p1x, p2x, reason = exit_fill(i, reason)
-                exit_spread = fill_spread_at_exit
-                held_bars  = exit_idx - entry_idx
-                borrow_cost = held_bars * borrow_per_day
-                gross = gross_of(exit_spread, p1x, p2x)
-                pnl = entry_size * gross - entry_size * cost_per_trade - entry_size * borrow_cost
+                gross = gross_of(fill_spread_at_exit, p1x, p2x)
+                pnl = net_pnl(entry_size, gross, cost_per_trade, exit_idx - entry_idx,
+                              borrow_per_day)
                 assert legacy_same_close or (causal(entry_sig, entry_idx, "entry")
                                              and causal(i, exit_idx, reason))
-                trades.append({
-                    "entry":  idx[entry_idx], "exit": idx[exit_idx],
-                    "held":   held_bars, "side": side, "pnl": pnl,
-                    "size":   entry_size,
-                    "reason": reason,
-                    "entry_signal": idx[entry_sig], "exit_signal": idx[i],
-                    **leg_cols(p1x, p2x, gross),
-                })
+                trades.append(record(i, exit_idx, reason, p1x, p2x, gross, pnl))
                 in_pos = False
+    return pd.DataFrame(trades)
+
+
+# ── Continuous engine (audit T3) ────────────────────────────────────────────
+
+@dataclass
+class PairWindow:
+    """One walk-forward window's inputs for a pair's NEW entries (audit T3).
+
+    Arrays run over the pair's rows (see `backtest_pair_continuous`).  On the
+    static and --vwz paths `z` is also the exit z of the trades entered in
+    the window: the z of their own spread log p1 − β_w·log p2.
+    """
+    beta: float                          # β_w (OLS on the rows in [tr_s, oos_s)); NaN on the Kalman path
+    z: np.ndarray                        # entry signal z
+    entry_z: float = ENTRY_Z
+    cost: float = 0.0                    # round-trip cost of a trade entered in the window
+    borrow: float = 0.0                  # borrow per day of a trade entered in the window
+    blackout: np.ndarray | None = None   # True = no entry decision (Aussie gate, zero-return guard)
+    vr: np.ndarray | None = None         # --vwz liquidity ratio: no entry below vr_min
+    panic: np.ndarray | None = None      # macro-HMM panic flags
+    panic_size_mult: float = 0.0         # 0: no entry in panic; > 0: entry size in panic
+    exec_ok: np.ndarray | None = None    # VWAP mode: False = an entry decided on the row is not filled
+    spread: pd.Series | None = None      # s_w, for the vol-tight stop (static path)
+    cusum_break: int | None = None       # row where the window's CUSUM breaks
+
+
+def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_decide: int,
+                             windows: list[tuple], pair_windows: dict[int, PairWindow],
+                             exec_leg_vals: np.ndarray | None = None,
+                             kalman_beta: np.ndarray | None = None,
+                             exit_z_of: Callable[[float], np.ndarray] | None = None,
+                             exit_z=EXIT_Z, stop_z=STOP_Z, max_hold=MAX_HOLD,
+                             vr_min: float = 0.5,
+                             vol_tight_stop: bool = False,
+                             vol_tight_threshold: float = 1.5,
+                             vol_tight_stop_z: float = 2.5,
+                             ) -> pd.DataFrame:
+    """One continuous position state for a pair over the whole walk-forward
+    timeline (audit T3): no reset at a window end, never a second position.
+
+    idx, leg_vals: the pair's rows with prints of both legs from the first
+    window's training start to the last window's OOS end (the decision rows,
+    the first `n_decide`), plus at most one fill-only row after them; leg_vals
+    holds the legs' closes [P1, P2].  windows: every (tr_s, tr_e, oos_s, oos_e)
+    of the run.  pair_windows: {window number (1-based): PairWindow} for the
+    windows in which the pair is eligible.
+
+    Flat on row i: a new entry only in the active window w — the latest-
+    starting window whose OOS [oos_s, oos_e) contains the row; none in a gap
+    or in a window where the pair is not eligible — decided on w's z and
+    gates exactly as in `backtest_pair`, filled on row i+1 (exec_leg_vals: each
+    leg's VWAP of the next row on row i, with pair_windows[w].exec_ok), with
+    q1 = 1/P1, q2 = β_e/P2 and β_e = β_w (kalman_beta: β of the decision row).
+    Open: every later decision row, whatever window it is in, is an exit-
+    decision row on the trade's own exit z — the z of the entry window
+    (static / vwz: the z of log p1 − β_w·log p2), or exit_z_of(β_e) (Kalman:
+    the rolling z of log p1 − β_e·log p2) — by target, stop or time; the exit
+    fills on the next row.  The trade keeps the cost and borrow of its entry
+    window.  CUSUM: from a window's break row no new entries in that window;
+    a break inside the window's OOS force-closes an open trade (next row).
+    After the last decision row an open trade is closed at the next available
+    close — the fill-only row, else the last row's close — with reason
+    "end_of_data" and exit_signal = the last decision row.
+
+    Columns: those of `backtest_pair`, plus window_entered (window of the
+    entry decision) and window_exited (window of the exit decision: the
+    latest-starting window whose OOS has begun on that row; for the
+    end-of-run close the window of the pair's last decision row, the last
+    window unless the pair's data end earlier).
+    """
+    n = len(idx)
+    oos_starts = pd.DatetimeIndex([w[2] for w in windows])
+    oos_ends = pd.DatetimeIndex([w[3] for w in windows])
+    # Window number of each row: the latest-starting one whose OOS has begun
+    # (0: before the first OOS); active for entries until its OOS end.
+    win_of = oos_starts.searchsorted(idx, side="right")
+    active = np.where((win_of > 0) & np.asarray(idx < oos_ends[np.maximum(win_of, 1) - 1]),
+                      win_of, 0)
+    cusum_close = np.zeros(n, dtype=bool)
+    for w, pw in pair_windows.items():
+        if pw.cusum_break is not None and idx[pw.cusum_break] >= oos_starts[w - 1]:
+            cusum_close[pw.cusum_break] = True
+    vwap_rows = exec_leg_vals is not None
+
+    trades = []
+    in_pos = False
+    side = entry_sig = entry_idx = w_e = 0
+    size = beta_e = p1e = p2e = q1 = q2 = cost_e = borrow_e = cur_stop_z = 0.0
+    ez = None
+
+    def close(decision: int, fill: int, reason: str) -> None:
+        """Book the open trade, exit decided on row `decision`, filled on `fill`."""
+        if reason == "end_of_data":
+            p1x, p2x = leg_fill_prices(leg_vals, None, fill)
+        else:
+            p1x, p2x = leg_fill_prices(leg_vals, exec_leg_vals, fill,
+                                       decision if vwap_rows else None)
+        gross = leg_gross(side, q1, q2, p1e, p2e, p1x, p2x)
+        pnl = net_pnl(size, gross, cost_e, fill - entry_idx, borrow_e)
+        assert (fill_is_causal(entry_sig, entry_idx, "entry", n)
+                and fill_is_causal(decision, fill, reason, n))
+        trades.append({**trade_record(idx, entry_sig, entry_idx, decision, fill, side, size, pnl,
+                                      reason, beta_e, p1e, p2e, p1x, p2x, q1, q2, gross),
+                       "window_entered": w_e, "window_exited": int(win_of[decision])})
+
+    def exit_now(i: int, reason: str) -> None:
+        fill, end_of_data = exit_fill_bar(i, n)
+        close(i, fill, "end_of_data" if end_of_data else reason)
+
+    for i in range(n_decide):
+        if in_pos:
+            if cusum_close[i]:
+                exit_now(i, "cusum_break")
+                in_pos = False
+                continue
+            zi = ez[i]
+            if pd.isna(zi):
+                continue
+            reason = exit_reason(side, zi, i - entry_idx, exit_z, cur_stop_z, max_hold)
+            if reason is not None:
+                exit_now(i, reason)
+                in_pos = False
+            continue
+
+        pw = pair_windows.get(int(active[i]))
+        if pw is None:
+            continue
+        if pw.cusum_break is not None and i >= pw.cusum_break:
+            continue
+        zi = pw.z[i]
+        if pd.isna(zi):
+            continue
+        entry = entry_decision(i, zi, n, pw.entry_z, pw.vr, vr_min, pw.panic,
+                               pw.panic_size_mult, pw.blackout, exec_ok=pw.exec_ok)
+        if entry is None:
+            continue
+        side, size, entry_idx = entry
+        entry_sig, w_e = i, int(active[i])
+        p1e, p2e = leg_fill_prices(leg_vals, exec_leg_vals, entry_idx, i if vwap_rows else None)
+        beta_e = kalman_beta[i] if kalman_beta is not None else pw.beta
+        q1, q2 = entry_quantities(p1e, p2e, beta_e)
+        cost_e, borrow_e = pw.cost, pw.borrow
+        cur_stop_z = (tightened_stop(pw.spread, i, stop_z, vol_tight_threshold, vol_tight_stop_z)
+                      if vol_tight_stop and pw.spread is not None else stop_z)
+        ez = exit_z_of(beta_e) if exit_z_of is not None else pw.z
+        in_pos = True
+
+    if in_pos:                             # end of the last window: next available close
+        last = n_decide - 1
+        close(last, n_decide if n_decide < n else last, "end_of_data")
     return pd.DataFrame(trades)
 
 
@@ -529,6 +770,7 @@ class WfoConfig:
     legacy_same_close: bool = False
     legacy_spread_pnl: bool = False
     legacy_stale_prints: bool = False
+    legacy_window_reset: bool = False
     rotation: bool = False
     voltarget: float = 0.0
     hmm: str = "off"
@@ -751,6 +993,146 @@ def apply_vol_target(trades: pd.DataFrame, target_vol: float,
 
 # ── Main loop ───────────────────────────────────────────────────────────────
 
+class WindowContext(NamedTuple):
+    """Window-level inputs the run's window loop builds for the continuous
+    engine (audit T3)."""
+    weights: dict               # ivol / HRP size weight by pair (absent: 1)
+    panic: pd.Series | None     # macro-HMM panic flags (None: HMM off or no fit)
+    panic_size_mult: float      # 0: no entry in panic; > 0: entry size in panic
+
+
+def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
+                      windows: list[tuple], window_ctx: list[WindowContext],
+                      pair_cost: Callable[[str, str, pd.DataFrame], tuple[float, float]],
+                      has_px: pd.DataFrame, zero_ret: pd.DataFrame | None, data_end,
+                      volumes: pd.DataFrame | None = None,
+                      vwap_daily: pd.DataFrame | None = None) -> list[pd.DataFrame]:
+    """Audit T3: one `backtest_pair_continuous` pass per pair over all windows.
+
+    A pair's rows: its dates with prints of both legs from the first window's
+    training start to the last window's OOS end, plus the fill-only row (the
+    first later row with both legs, never after data_end, R15).  Per window
+    w the pair is eligible as in the per-window engine (≥ 60 training rows,
+    ≥ Z_WIN + 10 rows in [tr_s, oos_e], 0.1 ≤ |β_w| ≤ 15 except on the Kalman
+    path), with the training rows strictly before oos_s (T9.1): β_w, and the
+    cost / borrow of trades entered in w (pair_cost).  window_ctx[w − 1]: the
+    WindowContext of window w, built by the run's window loop; a trade is
+    sized with its entry window's weight.
+    Returns one trades frame per pair (columns as the per-window engine, then
+    window_entered / window_exited), and prints a line per window.
+    """
+    first_tr_s, last_oos_e = windows[0][0], windows[-1][3]
+    after_lo = closes.index.searchsorted(last_oos_e, side="right")
+    after_hi = closes.index.searchsorted(data_end, side="right")
+    nan = float("nan")
+    out = []
+    for rank, pair in enumerate(pairs):
+        t1, t2 = pair.split("-")
+        if t1 not in closes.columns or t2 not in closes.columns:
+            continue
+        px = closes.loc[first_tr_s:last_oos_e, [t1, t2]].dropna()
+        both = (has_px[t1].to_numpy()[after_lo:after_hi]
+                & has_px[t2].to_numpy()[after_lo:after_hi])
+        if both.any():
+            px = pd.concat([px, closes[[t1, t2]].iloc[[after_lo + int(both.argmax())]]])
+        rows = px.index
+        n_decide = int(rows.searchsorted(last_oos_e, side="right"))
+        if n_decide == 0:
+            continue
+        no_entry = (None if zero_ret is None
+                    else (zero_ret[t1] | zero_ret[t2]).reindex(rows).to_numpy())
+
+        kalman_beta = exit_z_of = None
+        if cfg.kalman:
+            # One causal Kalman pass over the pair's rows; a trade exits on the
+            # rolling z of log p1 − β_e·log p2 with β_e of its entry decision.
+            _, z_kal, beta_kal = kalman_spread_z(px, t1, t2)
+            z_kal, kalman_beta = z_kal.to_numpy(), beta_kal.to_numpy()
+            log1, log2 = np.log(px[t1]), np.log(px[t2])
+
+            def exit_z_of(b: float) -> np.ndarray:
+                return rolling_z(log1 - b * log2).to_numpy()
+
+        vw = exec_legs = None
+        if (vwap_daily is not None and not cfg.kalman and not cfg.vwz
+                and t1 in vwap_daily.columns and t2 in vwap_daily.columns):
+            vw = vwap_daily.loc[rows.min():rows.max(), [t1, t2]].reindex(rows)
+            exec_legs = vw.shift(-1).to_numpy(dtype=float)   # each leg's VWAP of the next row
+        aussie = cfg.aussie_filter and is_aussie_jp_pair(pair) and not (cfg.kalman or cfg.vwz)
+
+        pw: dict[int, PairWindow] = {}
+        for w, (tr_s, tr_e, oos_s, oos_e) in enumerate(windows, start=1):
+            lo = rows.searchsorted(tr_s)
+            n_w = rows.searchsorted(oos_e, side="right")     # rows up to the OOS end
+            train = px.iloc[lo:rows.searchsorted(oos_s)]       # [tr_s, oos_s): T9.1
+            if len(train) < 60 or n_w - lo < Z_WIN + 10:
+                continue
+            cost, borrow = pair_cost(t1, t2, train)
+            ctx = window_ctx[w - 1]
+            if cfg.kalman:
+                p = PairWindow(beta=nan, z=z_kal, cost=cost, borrow=borrow, blackout=no_entry)
+            else:
+                beta = estimate_beta(train[t1], train[t2])
+                if not (0.1 <= abs(beta) <= 15.0):
+                    continue
+                panic = None if ctx.panic is None else ctx.panic.reindex(rows).to_numpy()
+                if cfg.vwz:
+                    _, z_vw, vr = vwz_spread_z(px, volumes, t1, t2, beta)
+                    p = PairWindow(beta=beta, z=z_vw.to_numpy(), cost=cost, borrow=borrow,
+                                   blackout=no_entry, vr=vr.to_numpy(), panic=panic,
+                                   panic_size_mult=ctx.panic_size_mult)
+                else:
+                    sp = spread_series(px, t1, t2, beta).reindex(rows)
+                    entry_z, blackout = ENTRY_Z, no_entry
+                    if aussie:
+                        entry_z = max(ENTRY_Z, 2.5)
+                        # The gate on the rows up to the OOS end (its entry rows).
+                        bo = np.zeros(len(rows), dtype=bool)
+                        bo[:n_w] = aussie_blackout_series(sp.iloc[:n_w]).to_numpy()
+                        blackout = bo if no_entry is None else (bo | no_entry)
+                    exec_ok = (None if vw is None else
+                               (np.log(vw[t1]) - beta * np.log(vw[t2])).shift(-1).notna().to_numpy())
+                    p = PairWindow(beta=beta, z=rolling_z(sp).to_numpy(), entry_z=entry_z,
+                                   cost=cost, borrow=borrow, blackout=blackout, panic=panic,
+                                   panic_size_mult=ctx.panic_size_mult, exec_ok=exec_ok,
+                                   spread=sp)
+            if cfg.cusum is not None:
+                # The window's CUSUM on its z over its decision rows [tr_s, oos_e].
+                p.cusum_break = cusum_break_row(p.z, lo, n_w, cfg.cusum)
+            pw[w] = p
+
+        tr = backtest_pair_continuous(rows, px.to_numpy(dtype=float), n_decide, windows, pw,
+                                      exec_leg_vals=exec_legs, kalman_beta=kalman_beta,
+                                      exit_z_of=exit_z_of, vol_tight_stop=cfg.vol_tight_stop)
+        if tr.empty:
+            continue
+        if cfg.hrp or cfg.ivol:
+            # HRP / inverse-vol weight of the entry window (pnl is linear in size).
+            wt = tr["window_entered"].map(lambda k: window_ctx[k - 1].weights.get(pair, 1.0))
+            tr["pnl"] = tr["pnl"] * wt
+            tr["size"] = tr["size"] * wt
+        base = [c for c in tr.columns if c not in ("window_entered", "window_exited")]
+        tr = tr[base].assign(pair=pair, window=tr["window_entered"],
+                             oos_start=tr["window_entered"].map(lambda k: windows[k - 1][2]),
+                             window_entered=tr["window_entered"],
+                             window_exited=tr["window_exited"], _rank=rank)
+        out.append(tr)
+
+    # Window-major order, as the per-window engine (pairs in input order).
+    if out:
+        out = [pd.concat(out, ignore_index=True)
+               .sort_values(["window", "_rank"], kind="stable").drop(columns="_rank")]
+    allt = out[0] if out else pd.DataFrame(columns=["window_entered", "window_exited", "pnl"])
+    for w, (tr_s, tr_e, oos_s, oos_e) in enumerate(windows, start=1):
+        mine = allt[allt["window_entered"] == w]
+        print(f"  Window {w:02d}/{len(windows)}  "
+              f"TRAIN {tr_s.date()} → {tr_e.date()} (excl.)  |  "
+              f"OOS {oos_s.date()} → {oos_e.date()}  "
+              f"→  {len(mine)} trades entered ({int((mine['window_exited'] > w).sum())} exit "
+              f"in a later window)   P&L = {mine['pnl'].sum():+.4f}")
+    return out
+
+
 def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                   volumes: pd.DataFrame | None = None,
                   vwap: pd.DataFrame | None = None) -> WfoResult:
@@ -762,6 +1144,11 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     volumes: daily share volumes (volumes_daily.csv); required by cfg.vwz,
              used for the stale-print mask and the Almgren-Chriss ADV if present.
     vwap:    daily VWAPs (vwap_daily.csv); required by cfg.exec_mode "vwap".
+
+    Engine (audit T3): by default one continuous position per pair over all
+    windows (`continuous_trades`); cfg.legacy_window_reset runs the pre-T3
+    per-window loop (`backtest_pair` per pair and window), which the other
+    pre-T3 legacy flags (legacy_same_close, legacy_spread_pnl) require.
     """
     if cfg.exec_mode not in ("next_close", "vwap"):
         raise ValueError(f"cfg.exec_mode must be 'next_close' or 'vwap', not {cfg.exec_mode!r}")
@@ -769,6 +1156,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         raise ValueError("cfg.vwz needs the volumes frame (volumes_daily.csv)")
     if cfg.exec_mode == "vwap" and vwap is None:
         raise ValueError("cfg.exec_mode 'vwap' needs the vwap frame (vwap_daily.csv)")
+    if not cfg.legacy_window_reset and (cfg.legacy_same_close or cfg.legacy_spread_pnl):
+        raise ValueError("cfg.legacy_same_close / cfg.legacy_spread_pnl describe the pre-T3 "
+                         "per-window engine: use them with cfg.legacy_window_reset "
+                         "(--legacy-window-reset)")
 
     if not cfg.legacy_stale_prints:
         # Audit T2: an exactly unchanged close with zero or missing volume is
@@ -872,6 +1263,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                                "no entry on a zero-return signal day"))
     print("  pnl:        " + ("LEGACY — spread change between the fills" if cfg.legacy_spread_pnl
                                else "leg fills, q1 = 1/P1 and q2 = β/P2 fixed at the entry fill"))
+    print("  positions:  " + ("LEGACY — reset per window; open at a window end = dropped; "
+                               "train includes the OOS start" if cfg.legacy_window_reset else
+                               "one per pair across windows; β per window (train < OOS start) "
+                               "for new entries; end of run → next close"))
     print()
 
     # Last date of the run's data: fills never use a row after cfg.end.
@@ -882,6 +1277,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     zero_ret = None if cfg.legacy_stale_prints else repeats_previous_print(closes)
 
     all_trades = []
+    window_ctx: list[WindowContext] = []   # continuous engine: one per window
     for w_idx, (tr_s, tr_e, oos_s, oos_e) in enumerate(windows, start=1):
         win_trades_n = 0
         win_pnl      = 0.0
@@ -964,6 +1360,12 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 panic_full = pd.Series(panic_mask, index=spy_full.index)
                 if cfg.hmm == "size-panic":
                     panic_size_mult = 0.5
+
+        if not cfg.legacy_window_reset:
+            # Audit T3: no per-window reset.  The window's sizing weights and
+            # HMM flags go to the continuous engine after this loop.
+            window_ctx.append(WindowContext(hrp_w_pair, panic_full, panic_size_mult))
+            continue
 
         # Row range after the OOS end, up to data_end: the fill-only bar's candidates.
         after_lo = closes.index.searchsorted(oos_e, side="right")
@@ -1094,6 +1496,15 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
               f"OOS {oos_s.date()} → {oos_e.date()}  "
               f"→  {win_trades_n} trades   P&L = {win_pnl:+.4f}")
 
+    if not cfg.legacy_window_reset and windows:
+        def pair_cost(t1: str, t2: str, train: pd.DataFrame) -> tuple[float, float]:
+            if cfg.execution_model == "almgren":
+                return ac_pair_cost(t1, t2, train)
+            return cost_log_flat, borrow_per_day_flat
+
+        all_trades = continuous_trades(closes, pairs, cfg, windows, window_ctx, pair_cost,
+                                       has_px, zero_ret, data_end, volumes, vwap_daily)
+
     if not all_trades:
         no_trades = pd.DataFrame()
         oos_idx = (closes.loc[windows[0][2]:windows[-1][3]].index if windows
@@ -1103,6 +1514,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                          stats=trade_stats(no_trades, len(windows), len(pairs)))
 
     trades = pd.concat(all_trades, ignore_index=True)
+    if cfg.legacy_window_reset:
+        # One schema (audit T3): a reset window's trades enter and exit in it.
+        trades["window_entered"] = trades["window"]
+        trades["window_exited"] = trades["window"]
     trades["entry"] = pd.to_datetime(trades["entry"])
     trades["exit"]  = pd.to_datetime(trades["exit"])
     trades["entry_signal"] = pd.to_datetime(trades["entry_signal"])
@@ -1229,7 +1644,15 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         eod = trades["reason"] == "end_of_data"
         assert (trades["entry"] > trades["entry_signal"]).all()
         assert (trades["exit"] > trades["exit_signal"])[~eod].all()
-        assert (trades["exit"] == trades["exit_signal"])[eod].all()
+        if cfg.legacy_window_reset:
+            assert (trades["exit"] == trades["exit_signal"])[eod].all()
+        else:
+            # Audit T3: the end-of-run close fills on the next available close
+            # after the last decision row (on it when there is none), and a
+            # pair never holds two positions.
+            assert (trades["exit"] >= trades["exit_signal"])[eod].all()
+            for _, g in trades.sort_values("entry_signal").groupby("pair"):
+                assert (g["entry"].to_numpy()[1:] > g["exit"].to_numpy()[:-1]).all()
     if not cfg.legacy_stale_prints:
         # Audit T2: both legs have a genuine print on every entry's signal date
         # and fill date.
