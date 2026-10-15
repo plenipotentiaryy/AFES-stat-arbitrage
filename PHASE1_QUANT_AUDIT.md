@@ -1,3 +1,5 @@
+> **SUPERSEDED — see RESULTS_v2.md.** The numbers below come from a backtest with look-ahead, impossible fills and accounting errors (see AUDIT_FIX_LOG.md); do not use them.
+
 # AFES — Phase 1 Quant Audit
 
 **Date:** 2026-05-27

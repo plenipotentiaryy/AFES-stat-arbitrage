@@ -267,7 +267,8 @@ def main():
     print(f"  Total PnL:       {df_oos.pnl.sum():+.3f}")
     print(f"  Profit factor:   {pf:.2f}")
     print(f"  Max DD:          {dd:+.3f}")
-    print(f"  Sharpe (daily):  {sh:+.3f}")
+    print(f"  Exit-date ratio: {sh:+.3f}   (this engine's own exit-date booking — "
+          "not the audited daily MTM Sharpe; not a Sharpe)")
 
     # Save
     out = Path(f"data/wfo_daily_results_{args.tag}.csv")

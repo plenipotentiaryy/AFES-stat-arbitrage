@@ -2,7 +2,7 @@
 set -e
 cd /Users/leonidpofa/VSCodeHruchevoPY/quant/AFES_1
 mkdir -p output/split
-for RANGE in "2006-04-03:2014-12-31:H1" "2015-01-01:2026-04-03:H2"; do
+for RANGE in "2006-04-03:2014-12-31:H1" "2015-01-01:2023-12-31:H2"; do   # never past 2023-12-31 (holdout)
   IFS=":" read S E TAG <<< "$RANGE"
   echo "=== $TAG : $S → $E ==="
   python step3j_wfo.py --pairs pairs_baseline14.csv --start "$S" --end "$E" \

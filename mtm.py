@@ -37,9 +37,21 @@ downstream scripts read the portfolio pnl column with `add_series_args` /
 for; ret = pnl / capital, so Sharpe ratios, t-stats and R² are the same on
 either column), checked against the trades file; dashboard_daily.py also
 reads the per-pair file (`load_mtm_pairs`).
+
+Audit T10: every script reads a run through `load_mtm` (or, LEGACY,
+`legacy_exit_date_pnl`), which asserts that the files and the date range
+match the run's meta sidecar wfo_daily_meta<tag>.json (`check_run`: the
+trades, MTM and closes file names; the series' dates are exactly the run's
+span, rebuilt from the sidecar's config and the trades (`run_span`), and lie
+before the final holdout unless it is a --final-holdout run) and prints the
+run's span and HEADLINE / NON-HEADLINE status.  A legacy exit-date series
+covers the closes days of the run's span only (no zero-padding past it) and
+its ratio is labelled "not a Sharpe".
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,9 +61,11 @@ import pandas as pd
 
 CAPITAL_PER_PAIR = 2.0     # USD of capital per pair, per $1 of leg-1 notional
 
-LEGACY_LABEL = ("LEGACY exit-date booking: each trade's PnL on its exit date "
+LEGACY_LABEL = ("LEGACY exit-date booking — not a Sharpe: each trade's PnL on its exit date "
                 "(not a mark-to-market series; comparison only)")
+LEGACY_RATIO = "LEGACY exit-date ratio (not a Sharpe)"   # mean / std · √252 of that series
 MTM_LABEL = "daily mark-to-market PnL, USD per $1 of leg-1 notional"
+SAMPLING_LABEL = "sampling uncertainty only — does not detect bias"     # every bootstrap (T10)
 
 
 # ── Costs that scale with the position (audit T8) ───────────────────────────
@@ -248,25 +262,206 @@ def _same_total(what: str, path: str, total: float, expected: float, against: st
                          "step3j_wfo_daily.py with the same --tag)")
 
 
+def file_sha256(path) -> str:
+    """SHA-256 of a file's bytes (the run's files in its meta sidecar, T10)."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def check_from(index: pd.DatetimeIndex, date, option: str) -> None:
+    """Audit T10 (R46): a --split / --start after the first date of the run's
+    span would make a script report a sub-span as if it were the run —
+    refused (fail closed); a date on or before it changes nothing."""
+    if date is not None and len(index) and pd.Timestamp(date) > index.min():
+        raise SystemExit(f"{option} {date} falls inside the run's span ({index.min().date()} → "
+                         f"{index.max().date()}): the scripts report the whole run, not a sub-span; "
+                         f"omit it or pass a date on or before {index.min().date()}")
+
+
+def trades_span_days(days: pd.DatetimeIndex, trades: pd.DataFrame, split=None) -> pd.DatetimeIndex:
+    """The calendar of a LEGACY exit-date series in the research scripts
+    (almgren_chriss_repricing, audit_baseline, hmm_modes_proper; audit T10,
+    R45 / R47): the `days` from max(`split`, the trades' first OOS start — or
+    first entry without an `oos_start` column) to their last exit, not to the
+    end of the closes file.  Trades that exit in the final holdout are refused."""
+    from wfo_daily_core import HOLDOUT_START     # not at the top: wfo_daily_core imports this module
+    exits = pd.to_datetime(trades["exit"])
+    if exits.max() >= HOLDOUT_START:
+        raise SystemExit(f"exits up to {exits.max().date()} reach the final holdout (from "
+                         f"{HOLDOUT_START.date()}); use a development-period run (--end 2023-12-31)")
+    first = pd.to_datetime(trades["oos_start"] if "oos_start" in trades.columns else trades["entry"]).min()
+    if split is not None:
+        first = max(first, pd.Timestamp(split))
+    days = pd.DatetimeIndex(days)
+    return days[(days >= first) & (days <= exits.max())]
+
+
+def meta_path(trades_path: str) -> str:
+    """The run's meta sidecar the CLI writes next to its trades file (audit
+    T8): wfo_daily_results<tag>.csv → wfo_daily_meta<tag>.json."""
+    return str(Path(mtm_path(trades_path, "wfo_daily_meta")).with_suffix(".json"))
+
+
+def run_meta(args) -> dict:
+    """The run's meta sidecar (--meta, else derived from --trades), as JSON."""
+    return json.loads(Path(args.meta or meta_path(args.trades)).read_text())
+
+
+def run_end(meta: dict) -> pd.Timestamp | None:
+    """The last date a run's series may carry: the run's --end and, unless it
+    is a --final-holdout run, the day before the final holdout."""
+    from wfo_daily_core import HOLDOUT_START     # not at the top: wfo_daily_core imports this module
+    cfg = meta["config"]
+    ends = [pd.Timestamp(cfg["end"])] if cfg.get("end") else []
+    if not cfg.get("final_holdout"):
+        ends.append(HOLDOUT_START - pd.Timedelta(days=1))
+    return min(ends) if ends else None
+
+
+def span_line(index: pd.DatetimeIndex, unit: str) -> str:
+    return f"span: {index.min().date()} → {index.max().date()} ({len(index)} {unit})"
+
+
+def run_span(meta: dict, trades_path: str) -> pd.DatetimeIndex:
+    """The run's MTM dates (`wfo_daily_core.mtm_span`), rebuilt from its meta
+    sidecar: the windows of its config (start, end, train, oos, step; without
+    --start or --end, also the dates of its closes file, which the CLI reads
+    from the directory it writes the trades file to) and its trades' last
+    exit fill."""
+    from wfo_daily_core import make_windows, mtm_span   # not at the top: it imports this module
+    cfg = meta["config"]
+    dates = pd.DatetimeIndex([])
+    if not (cfg.get("start") and cfg.get("end")):
+        closes = Path(trades_path).parent / str(meta.get("closes_file"))
+        if not closes.exists():
+            raise SystemExit(f"date range: cannot rebuild the run's windows without its closes file "
+                             f"{closes} (next to the trades file)")
+        dates = pd.DatetimeIndex(pd.read_csv(closes, usecols=["Date"], parse_dates=["Date"])["Date"])
+    windows = make_windows(pd.DataFrame(index=dates.sort_values()), cfg["train"], cfg["oos"],
+                           cfg["step"], start=cfg.get("start"), end=cfg.get("end"))
+    if not windows:
+        raise SystemExit(f"date range: the run's config gives no OOS window ({trades_path})")
+    return mtm_span(windows, pd.read_csv(trades_path, usecols=["exit"], parse_dates=["exit"]))
+
+
+def check_dates(index: pd.DatetimeIndex, meta: dict, meta_file: str,
+                expected: pd.DatetimeIndex | None = None) -> None:
+    """SystemExit unless the series dates `index` end on or before the run's
+    --end and before the final holdout (`run_end`) and, if given, are exactly
+    `expected` (the run's span, `run_span`)."""
+    if len(index) == 0:
+        raise SystemExit(f"date range: the series of the run {meta_file} is empty")
+    cfg = meta["config"]
+    first, last, end = index.min(), index.max(), run_end(meta)
+    wrong = []
+    if end is not None and last > end:
+        why = (f"the run's --end {cfg['end']}" if cfg.get("end") and pd.Timestamp(cfg["end"]) == end
+               else "the final holdout starts the next day")
+        wrong.append(f"ends {last.date()}, after {end.date()} ({why})")
+    if expected is not None and not index.equals(expected):
+        wrong.append(f"covers {first.date()} → {last.date()} ({len(index)} days), the run's span is "
+                     f"{expected.min().date()} → {expected.max().date()} ({len(expected)} business days)")
+    if wrong:
+        raise SystemExit(f"date range does not match the run's meta sidecar {meta_file}: the series "
+                         + "; ".join(wrong))
+
+
+def check_run(trades_path: str, meta_file: str | None = None, *, mtm_file: str | None = None,
+              closes: str | None = None, index: pd.DatetimeIndex | None = None) -> dict:
+    """The run's meta sidecar (audit T8; default: derived from the trades
+    path), asserted to match what a script reads (audit T10): the trades file,
+    the MTM file and the closes file by name, the series dates `index`
+    (exactly the run's span, `run_span`; `check_dates`), and the files'
+    SHA-256 recorded by the CLI (R44; a sidecar written before they were
+    recorded: a warning, contents not verified).  SystemExit on a mismatch or
+    a missing sidecar.  Prints the run's HEADLINE / NON-HEADLINE status;
+    returns the sidecar."""
+    meta_file = meta_file or meta_path(trades_path)
+    if not Path(meta_file).exists():
+        raise SystemExit(f"{meta_file} missing: step3j_wfo_daily.py writes the run's meta sidecar next "
+                         "to its trades file; a series that cannot be checked against it is refused "
+                         "(audit T10)")
+    meta = json.loads(Path(meta_file).read_text())
+    files = meta.get("files") or {}
+    for what, given, recorded in [("trades file", trades_path, files.get("trades")),
+                                  ("MTM file", mtm_file, files.get("mtm")),
+                                  ("closes file", closes, meta.get("closes_file"))]:
+        if given is not None and Path(given).name != recorded:
+            raise SystemExit(f"{given} does not match the run's meta sidecar {meta_file}: its {what} "
+                             f"is {recorded}")
+    if index is not None:
+        check_dates(index, meta, meta_file, run_span(meta, trades_path))
+    check_hashes(meta, meta_file, trades=trades_path, mtm=mtm_file, closes=closes)
+    print(f"run: {meta_file} (config {str(meta.get('config_hash'))[:12]}…): "
+          + ("HEADLINE RUN" if meta.get("headline") is True else
+             "NON-HEADLINE RUN (not a frozen point-in-time universe, or legacy options: "
+             "see the run's banner)"))
+    return meta
+
+
+def check_hashes(meta: dict, meta_file: str, **files) -> None:
+    """SystemExit unless each given file (keyword = its key in the sidecar's
+    `sha256`: trades, mtm, mtm_pairs, closes; None = not read) has the SHA-256
+    the CLI recorded.  A sidecar without hashes (written before audit T10):
+    a loud warning — the contents are not verified."""
+    hashes = meta.get("sha256")
+    if hashes is None:
+        print(f"WARNING: no file hashes recorded in {meta_file} (a sidecar written before audit "
+              "T10) — contents not verified")
+        return
+    for key, path in files.items():
+        if path is not None and file_sha256(path) != hashes.get(key):
+            raise SystemExit(f"{path} does not match the run's meta sidecar {meta_file}: its SHA-256 "
+                             f"is not the {key} file's the run wrote (edited, or from another run)")
+
+
 def add_series_args(parser) -> None:
-    """--mtm and --legacy-exit-date-pnl of the downstream scripts."""
+    """--mtm, --meta and --legacy-exit-date-pnl of the downstream scripts."""
     parser.add_argument("--mtm", default=None,
                         help="Daily MTM file of the run (Date,pnl,ret); default: the --trades "
                              "path with wfo_daily_results → wfo_daily_mtm.")
+    parser.add_argument("--meta", default=None,
+                        help="The run's meta sidecar; default: the --trades path with "
+                             "wfo_daily_results<tag>.csv → wfo_daily_meta<tag>.json.  The files and "
+                             "the date range must match it (audit T10).")
     parser.add_argument("--legacy-exit-date-pnl", action="store_true", dest="legacy_exit_date_pnl",
                         help="LEGACY: book each trade's PnL on its exit date (the pre-audit "
                              "series) instead of reading the MTM file. Comparison only.")
 
 
-def load_mtm(args) -> pd.DataFrame:
+def load_mtm(args, closes: str | None = None) -> pd.DataFrame:
     """The run's daily MTM file (--mtm, else derived from --trades), checked
-    against the trades file: its PnL must sum to the trades' PnL."""
+    against the trades file (its PnL must sum to the trades' PnL) and the
+    run's meta sidecar (`check_run`: file names — `closes` too, if the script
+    reads it — and the date range)."""
     path = args.mtm or mtm_path(args.trades)
     m = read_mtm(path)
     trades = pd.read_csv(args.trades, usecols=["pnl"])
     _same_total("Σ pnl", path, m["pnl"].sum(), trades["pnl"].sum(), args.trades)
+    check_run(args.trades, args.meta, mtm_file=path, closes=closes, index=m.index)
     print(f"series: {MTM_LABEL} ({path})")
+    print(span_line(m.index, "business days"))
     return m
+
+
+def legacy_exit_date_pnl(args, closes: str, start=None, option: str = "--split") -> pd.Series:
+    """LEGACY: each trade's PnL on its exit date, zeros on the other closes
+    days of the run's span (`run_span`; the pre-T10 series ran from `start`
+    to the closes file's last date, zero-padded past the run), checked against
+    the run's meta sidecar (trades and closes files; never past the run's end
+    or into the final holdout).  A `start` inside the span is refused
+    (`check_from`)."""
+    meta_file = args.meta or meta_path(args.trades)
+    meta = check_run(args.trades, meta_file, closes=closes)
+    span = run_span(meta, args.trades)
+    days = pd.DatetimeIndex(pd.read_csv(closes, parse_dates=["Date"], usecols=["Date"])["Date"]).normalize()
+    days = days[(days >= span.min()) & (days <= span.max())]
+    check_from(days, start, option)
+    check_dates(days, meta, meta_file)
+    tr = pd.read_csv(args.trades, parse_dates=["exit"])
+    exits = tr["exit"].dt.normalize()
+    print(f"series: {LEGACY_LABEL}")
+    print(span_line(days, "closes days"))
+    return tr.groupby(exits)["pnl"].sum().reindex(days, fill_value=0.0).rename_axis("Date")
 
 
 def mtm_pnl(args) -> pd.Series:
@@ -274,12 +469,19 @@ def mtm_pnl(args) -> pd.Series:
     return load_mtm(args)["pnl"]
 
 
-def load_mtm_pairs(path: str, trades: pd.DataFrame, portfolio: pd.Series) -> pd.DataFrame | None:
+def load_mtm_pairs(path: str, trades: pd.DataFrame, portfolio: pd.Series,
+                   meta: dict | None = None) -> pd.DataFrame | None:
     """The run's per-pair daily MTM file, or None if it does not exist.
-    Checked: the portfolio file's dates, the columns sum to the portfolio
-    pnl, and each traded pair's column sums to its trades' PnL."""
+    Checked: the name the run's meta sidecar records (if given), the
+    portfolio file's dates, the columns sum to the portfolio pnl, and each
+    traded pair's column sums to its trades' PnL."""
     if not Path(path).exists():
         return None
+    if meta is not None and Path(path).name != (meta.get("files") or {}).get("mtm_pairs"):
+        raise SystemExit(f"{path} does not match the run's meta sidecar: its per-pair MTM file is "
+                         f"{(meta.get('files') or {}).get('mtm_pairs')}")
+    if meta is not None and meta.get("sha256") is not None:
+        check_hashes(meta, "(the run's meta sidecar)", mtm_pairs=path)
     by_pair = read_mtm(path)
     if not by_pair.index.equals(portfolio.index):
         raise SystemExit(f"{path} does not match the portfolio MTM file: different dates")

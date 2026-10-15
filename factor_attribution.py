@@ -6,10 +6,15 @@ returns to answer a basic but critical question:
     Is the backtest producing idiosyncratic spread alpha, or is it just a
     disguised exposure to market, sector, size, momentum, or rates factors?
 
-The dependent variable is the run's daily mark-to-market PnL
-(wfo_daily_mtm<tag>.csv, written by step3j_wfo_daily.py next to the trades
-file; audit T4).  The independent variables are daily log returns of
-available ETF proxies.
+The dependent variable is the run's daily mark-to-market return on its
+capital (column ret of wfo_daily_mtm<tag>.csv, written by step3j_wfo_daily.py
+next to the trades file; audit T4, T10), regressed on the same day's log
+returns of the available ETF proxies.  The MTM file, the trades file, the
+closes file and the series' date range must match the run's meta sidecar
+(audit T10); the report states the MTM span, the number and range of the
+days aligned with the factor calendar (MTM business days on which every
+factor has a return), the one Sharpe (all MTM business days) and the
+factor-neutral information ratio (aligned days; not a Sharpe).
 """
 from __future__ import annotations
 
@@ -21,7 +26,9 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-from mtm import LEGACY_LABEL, add_series_args, mtm_pnl
+from mtm import (LEGACY_LABEL, LEGACY_RATIO, add_series_args, check_dates, check_run, load_mtm,
+                 meta_path, run_meta, span_line)
+from perf_stats import portfolio_sharpe
 
 
 DEFAULT_FACTORS = [
@@ -96,11 +103,18 @@ def main() -> None:
     args = parser.parse_args()
 
     factor_ret = load_factor_returns(args.closes, args.factors)
-    if args.legacy_exit_date_pnl:
+    legacy = args.legacy_exit_date_pnl
+    if legacy:
+        meta = check_run(args.trades, args.meta, closes=args.closes)
         print(f"series: {LEGACY_LABEL}")
-        y = load_daily_pnl(args.trades, factor_ret.index)
+        y = load_daily_pnl(args.trades, factor_ret.index)     # exit dates: first → last exit
+        check_dates(y.index, meta, args.meta or meta_path(args.trades))
+        print(span_line(y.index, "factor days"))
+        y_name, y_text = "strategy_pnl", "LEGACY exit-date PnL"
     else:
-        y = mtm_pnl(args).rename("strategy_pnl")
+        m = load_mtm(args, closes=args.closes)        # the factors: from the run's closes file
+        y = m["ret"].rename("strategy_ret")
+        y_name, y_text = "strategy_ret", "ret (daily MTM return on capital)"
     model, aligned = fit_ols(y, factor_ret)
 
     coefs = []
@@ -115,17 +129,16 @@ def main() -> None:
     pred = model.predict(sm.add_constant(aligned.iloc[:, 1:]))
     residual = aligned.iloc[:, 0] - pred
     alpha_series = model.params.get("const", 0.0) + residual
-    factor_neutral_sharpe = (
+    # Not a Sharpe (rule 4): alpha + residual on the aligned days only.
+    factor_neutral_ir = (
         float(alpha_series.mean() / alpha_series.std() * np.sqrt(252))
         if alpha_series.std() > 0 else float("nan")
     )
     raw = aligned.iloc[:, 0]
-    raw_sharpe = (
-        float(raw.mean() / raw.std() * np.sqrt(252))
-        if raw.std() > 0 else float("nan")
-    )
-    factor_explained_pnl = float((pred - model.params.get("const", 0.0)).sum())
-    alpha_pnl = float(alpha_series.sum())
+    # The one Sharpe: every business day of the MTM span (not the aligned days).
+    whole = portfolio_sharpe(y)
+    factor_explained = float((pred - model.params.get("const", 0.0)).sum())
+    alpha_total = float(alpha_series.sum())
 
     rolling = {}
     for f in ["SPY", "QQQ", "IWM", "XLF", "XLK"]:
@@ -140,20 +153,30 @@ def main() -> None:
                 }
 
     out_daily = pd.DataFrame({
-        "strategy_pnl": aligned.iloc[:, 0],
+        y_name: aligned.iloc[:, 0],
         "factor_pred": pred,
         "residual": residual,
         "factor_neutral_alpha": alpha_series,
     }, index=aligned.index)
     out_daily.to_csv(args.csv_out)
 
+    span = [str(y.index.min().date()), str(y.index.max().date())]
+    aligned_span = [str(aligned.index.min().date()), str(aligned.index.max().date())]
+    meta = run_meta(args)
     payload = {
+        "series": "LEGACY exit-date booking — not a Sharpe" if legacy else "daily mark-to-market",
+        "y": "pnl (LEGACY exit-date)" if legacy else "ret",
+        "headline": meta.get("headline") is True,
+        "config_hash": meta.get("config_hash"),
+        "mtm_days": int(len(y)),
+        "mtm_span": span,
         "n_days": int(len(aligned)),
-        "raw_sharpe": raw_sharpe,
-        "factor_neutral_sharpe": factor_neutral_sharpe,
-        "total_pnl": float(raw.sum()),
-        "factor_explained_pnl": factor_explained_pnl,
-        "alpha_plus_residual_pnl": alpha_pnl,
+        "aligned_span": aligned_span,
+        ("legacy_exit_date_ratio" if legacy else "sharpe"): whole,
+        "factor_neutral_ir": factor_neutral_ir,
+        "total_y_aligned": float(raw.sum()),
+        "factor_explained_y": factor_explained,
+        "alpha_plus_residual_y": alpha_total,
         "r_squared": float(model.rsquared),
         "adj_r_squared": float(model.rsquared_adj),
         "alpha_daily": float(model.params.get("const", np.nan)),
@@ -165,11 +188,17 @@ def main() -> None:
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(payload, indent=2))
 
-    print("FACTOR ATTRIBUTION")
-    print(f"  aligned days:       {payload['n_days']}")
-    print(f"  total PnL:          {payload['total_pnl']:+.4f}")
-    print(f"  raw Sharpe:         {raw_sharpe:+.3f}")
-    print(f"  factor-neutral Sh:  {factor_neutral_sharpe:+.3f}")
+    print(f"FACTOR ATTRIBUTION  (y = {y_text}, on the same day's factor log returns)")
+    print(f"  series days:        {len(y)}  ({span[0]} → {span[1]})")
+    print(f"  aligned days:       {payload['n_days']}  ({aligned_span[0]} → {aligned_span[1]})"
+          "  (series days on which every factor has a return)")
+    print(f"  total y, aligned:   {payload['total_y_aligned']:+.4f}")
+    if legacy:
+        print(f"  {LEGACY_RATIO}, all {len(y)} days: {whole:+.3f}")
+    else:
+        print(f"  Sharpe (daily MTM, annualised, all {len(y)} business days): {whole:+.3f}")
+    print(f"  factor-neutral IR (alpha + residual, aligned days, ×√252; not a Sharpe): "
+          f"{factor_neutral_ir:+.3f}")
     print(f"  R^2:                {payload['r_squared']:.3f}")
     print(f"  alpha daily:        {payload['alpha_daily']:+.5f}  "
           f"t={payload['alpha_tstat_hac']:+.2f}")

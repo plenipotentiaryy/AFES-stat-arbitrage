@@ -14,7 +14,8 @@ every business day of the OOS span, `daily_returns` = daily_pnl / capital,
 restores the exit-date booking.
 
 Downstream scripts (smoke test on a small synthetic CLI run, no data/): they
-read the MTM file the CLI writes, checked against the trades file; without
+read the MTM file the CLI writes, checked against the trades file (and,
+since T10, the run's meta sidecar — tests/test_validation_outputs.py); without
 it they stop unless --legacy-exit-date-pnl is given.  The dashboard's
 per-pair and sub-block Sharpe ratios come from the per-pair MTM file (none
 without it), never from exit-date booking.
@@ -310,6 +311,19 @@ def cli_run(tmp_path_factory):
     return root, out.getvalue()
 
 
+def copy_run(data, dst, tag: str, kinds=("wfo_daily_results", "wfo_daily_mtm")) -> str:
+    """The fixture run's files under another tag in `dst`, with its meta
+    sidecar and closes file (audit T10: the scripts check a run against its
+    meta); returns the trades path."""
+    for kind in kinds:
+        shutil.copy(data / f"{kind}_t.csv", dst / f"{kind}_{tag}.csv")
+    meta = json.loads((data / "wfo_daily_meta_t.json").read_text())
+    meta["files"] = {k: v and v.replace("_t.csv", f"_{tag}.csv") for k, v in meta["files"].items()}
+    (dst / f"wfo_daily_meta_{tag}.json").write_text(json.dumps(meta))
+    shutil.copy(data / "closes.csv", dst / "closes.csv")
+    return str(dst / f"wfo_daily_results_{tag}.csv")
+
+
 def run_script(module, args: list[str]) -> str:
     argv = sys.argv
     out = io.StringIO()
@@ -354,8 +368,8 @@ def test_downstream_scripts_read_the_mtm_file(cli_run, tmp_path):
     sharpe = pnl.mean() / pnl.std() * math.sqrt(252)
 
     out = run_script(bootstrap_sharpe, ["--trades", trades, "--closes", closes, *split, "--reps", "20"])
-    # (the script's own point estimate uses numpy's std, ddof = 0)
-    assert f"point Sharpe    : {pnl.mean() / pnl.std(ddof=0) * math.sqrt(252):+.3f}" in out
+    # (T10: the one Sharpe, sample std — was numpy's ddof = 0)
+    assert f"point Sharpe    : {sharpe:+.3f}" in out
     assert "daily mark-to-market" in out and "LEGACY" not in out
 
     out = run_script(stress_crisis_analysis, ["--trades", trades, "--closes", closes, *split,
@@ -364,7 +378,8 @@ def test_downstream_scripts_read_the_mtm_file(cli_run, tmp_path):
     assert rep["full_sharpe"] == pytest.approx(sharpe, rel=1e-12)
     assert rep["var_99"] == pytest.approx(pnl.quantile(0.01), rel=1e-12)
     eq = pnl.cumsum()
-    assert min(c["dd"] for c in rep["crisis_periods"] + rep["calm_periods"]) >= (eq - eq.cummax()).min()
+    # (T10: only the named windows inside the run's span; none for 2005-2007)
+    assert min([c["dd"] for c in rep["crisis_periods"] + rep["calm_periods"]] + [0.0]) >= (eq - eq.cummax()).min()
     assert rep["oos_span"] == [str(pnl.index.min().date()), str(pnl.index.max().date())]
     assert "daily mark-to-market" in out
 
@@ -374,7 +389,9 @@ def test_downstream_scripts_read_the_mtm_file(cli_run, tmp_path):
                                           "--csv-out", str(tmp_path / "factor.csv")])
     rep = json.loads((tmp_path / "factor.json").read_text())
     daily = pd.read_csv(tmp_path / "factor.csv", index_col=0, parse_dates=True)
-    np.testing.assert_allclose(daily["strategy_pnl"], pnl.reindex(daily.index), rtol=1e-12)
+    # (T10: the regression's y is the daily MTM return, ret = pnl / capital)
+    ret = mtm.read_mtm(data / "wfo_daily_mtm_t.csv")["ret"]
+    np.testing.assert_allclose(daily["strategy_ret"], ret.reindex(daily.index), rtol=1e-12)
     assert rep["n_days"] == len(daily) > 100
     assert "daily mark-to-market" in out
 
@@ -387,15 +404,14 @@ def test_downstream_scripts_read_the_mtm_file(cli_run, tmp_path):
     assert f"Sharpe={st['sharpe']:+.3f}   maxDD={st['max_dd'] * 100:+.2f}%   (daily mark-to-market)" in out
 
     # No MTM file: each script stops, unless the legacy exit-date booking is asked for.
-    (tmp_path / "wfo_daily_results_x.csv").write_text((data / "wfo_daily_results_t.csv").read_text())
-    orphan = str(tmp_path / "wfo_daily_results_x.csv")
+    orphan = copy_run(data, tmp_path, "x", kinds=("wfo_daily_results",))
     for module, extra in [(bootstrap_sharpe, [*split, "--reps", "20"]),
                           (stress_crisis_analysis, [*split, "--out", str(tmp_path / "s2.json")]),
                           (factor_attribution, ["--factors", "OUA0", "OUB1",
                                                 "--out", str(tmp_path / "f2.json"),
                                                 "--csv-out", str(tmp_path / "f2.csv")]),
                           (dashboard_daily, [*split, "--out", str(tmp_path / "d2.png")])]:
-        args = ["--trades", orphan, "--closes", closes, *extra]
+        args = ["--trades", orphan, "--closes", str(tmp_path / "closes.csv"), *extra]
         with pytest.raises(SystemExit, match="wfo_daily_mtm_x.csv"):
             run_script(module, args)
         assert "LEGACY exit-date booking" in run_script(module, [*args, "--legacy-exit-date-pnl"])
@@ -420,8 +436,8 @@ def test_dashboard_shows_no_sharpe_from_exit_date_booking(cli_run, tmp_path):
     block = mtm.mtm_stats(mtm.portfolio_pnl(by_pair) / (len(by_pair.columns) * mtm.CAPITAL_PER_PAIR), 1.0)
     port = mtm.mtm_stats(ret, 1.0)
     assert f"legend: Non-cross (S={block['sharpe']:+.2f})" in out
-    assert (f"table: Non-cross (26) | {len(trades)} | {trades['pnl'].sum():+.2f} | "
-            f"{block['sharpe']:+.2f} | {block['max_dd'] * 100:+.2f}%") in out
+    assert (f"table: Non-cross (2) | {len(trades)} | {trades['pnl'].sum():+.2f} | "
+            f"{block['sharpe']:+.2f} | {block['max_dd'] * 100:+.2f}%") in out      # T10: the count
     assert (f"table: Combined | {len(trades)} | {trades['pnl'].sum():+.2f} | "
             f"{port['sharpe']:+.2f} | {port['max_dd'] * 100:+.2f}%") in out
     oos = ret.index
@@ -431,13 +447,12 @@ def test_dashboard_shows_no_sharpe_from_exit_date_booking(cli_run, tmp_path):
         exit_date = dashboard_daily.sharpe(dashboard_daily.daily_series(trades[trades["pair"] == pair], oos))
         assert f"{pair} {exit_date:+.3f}" not in out
     # Without the per-pair file: trades and PnL only.
-    for name in ("wfo_daily_results", "wfo_daily_mtm"):
-        shutil.copy(data / f"{name}_t.csv", tmp_path / f"{name}_y.csv")
+    copy_run(data, tmp_path, "y")
     out = run_script(dashboard_daily, ["--trades", str(tmp_path / "wfo_daily_results_y.csv"),
                                        "--closes", str(data / "closes.csv"), *split,
                                        "--out", str(tmp_path / "d2.png")])
     assert "legend: Non-cross" not in out and "no per-pair MTM file, no Sharpe" in out
-    assert f"table: Non-cross (26) | {len(trades)} | {trades['pnl'].sum():+.2f} | — | —" in out
+    assert f"table: Non-cross (2) | {len(trades)} | {trades['pnl'].sum():+.2f} | — | —" in out
     assert f"legend: Combined (S={port['sharpe']:+.2f})" in out
     # Legacy: the old exit-date figures, labelled.
     out = run_script(dashboard_daily, [*args, "--legacy-exit-date-pnl"])
@@ -454,7 +469,7 @@ def test_a_stale_mtm_file_is_refused(cli_run, tmp_path):
     root, _ = cli_run
     data = root / "data"
     split = ["--split", str(synthetic.START.date())]
-    shutil.copy(data / "wfo_daily_results_t.csv", tmp_path / "wfo_daily_results_z.csv")
+    copy_run(data, tmp_path, "z", kinds=("wfo_daily_results",))
     m = pd.read_csv(data / "wfo_daily_mtm_t.csv")
     m["pnl"] *= 1.1
     m.to_csv(tmp_path / "wfo_daily_mtm_z.csv", index=False)

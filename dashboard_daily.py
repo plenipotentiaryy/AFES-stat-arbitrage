@@ -13,8 +13,10 @@ daily MTM returns on constant capital (pairs × 2.0 USD per $1 of leg-1
 notional, a block: its pairs × 2.0), mean / std · √252; every drawdown is
 the date-ordered equity starting at 0, in % of capital (`mtm.mtm_stats`).
 Without the per-pair file the per-pair and sub-block items show trades and
-PnL only.  --legacy-exit-date-pnl: the pre-audit exit-date booking, labelled
-LEGACY.
+PnL only.  --legacy-exit-date-pnl: the pre-audit exit-date booking up to the
+run's end, every title and legend labelled LEGACY and its ratios "not a
+Sharpe".  The files and the date range must match the run's meta sidecar
+(audit T10).
 
 CLI:
     python dashboard_daily.py --trades data/wfo_daily_results_fullrun.csv \\
@@ -32,8 +34,8 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import pandas as pd
 
-from mtm import (CAPITAL_PER_PAIR, LEGACY_LABEL, add_series_args, load_mtm, load_mtm_pairs,
-                 mtm_path, mtm_stats, portfolio_pnl)
+from mtm import (CAPITAL_PER_PAIR, LEGACY_RATIO, add_series_args, check_from, legacy_exit_date_pnl,
+                 load_mtm, load_mtm_pairs, mtm_path, mtm_stats, portfolio_pnl, run_meta)
 
 
 def daily_series(trades: pd.DataFrame, oos_days: pd.DatetimeIndex) -> pd.Series:
@@ -88,10 +90,8 @@ def main():
 
     # ── Aggregate metrics ─────────────────────────────────────────────────
     if legacy:
-        print(f"series: {LEGACY_LABEL}")
-        closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
-        oos = closes.loc[args.split:].index
-        d_all = daily_series(t, oos)
+        d_all = legacy_exit_date_pnl(args, args.closes, start=args.split)   # to the run's end
+        oos = d_all.index
         eq = d_all.cumsum()
         dd = eq - eq.cummax()
         sh, mdd = sharpe(d_all), float(dd.min())
@@ -100,13 +100,13 @@ def main():
                   ("Non-cross", d_nc.cumsum(), sharpe(d_nc))]
         units, scale, mdd_text = "log-spread units", 1.0, f"{mdd:+.3f}"
         booking = "LEGACY exit-date booking"
+        n_nc = t_nc["pair"].nunique()
     else:
         m = load_mtm(args)
+        check_from(m.index, args.split, "--split")   # the whole run, never a sub-span (R46)
         by_pair = load_mtm_pairs(args.mtm_pairs or mtm_path(args.trades, "wfo_daily_mtm_pairs"),
-                                 t, m["pnl"])
-        if by_pair is not None:
-            by_pair = by_pair.loc[args.split:]
-        d_all = m["ret"].loc[args.split:]            # daily return on the run's capital
+                                 t, m["pnl"], run_meta(args))
+        d_all = m["ret"]                             # daily return on the run's capital
         oos = d_all.index
         st = mtm_stats(d_all, 1.0)
         sh, mdd = st["sharpe"], st["max_dd"]
@@ -120,6 +120,10 @@ def main():
                 curves.append((name, r.cumsum(), mtm_stats(r, 1.0)["sharpe"]))
         units, scale, mdd_text = "% of capital", 100.0, f"{mdd * 100:+.2f}%"
         booking = "daily mark-to-market"
+        n_nc = (sum("_USD" not in p for p in by_pair.columns) if by_pair is not None
+                else t_nc["pair"].nunique())
+    # Legacy: every title and legend says LEGACY; its ratios are not a Sharpe (rule 4).
+    tag, s_name = ("LEGACY ", "ratio") if legacy else ("", "S")
 
     pnl  = float(t.pnl.sum())
     n_tr = len(t)
@@ -130,22 +134,26 @@ def main():
     fig = plt.figure(figsize=(20, 13))
     gs  = gridspec.GridSpec(3, 3, hspace=0.40, wspace=0.30,
                               left=0.05, right=0.98, top=0.94, bottom=0.06)
-    title = (f"AFES v2 — Daily WFO Dashboard   |   OOS {oos.min().date()} → {oos.max().date()}   |   "
-             f"Sharpe={sh:+.3f}   PnL={pnl:+.2f}   trades={n_tr}   win={win:.1f}%   PF={pf:.2f}   "
+    sh_text = f"{LEGACY_RATIO}={sh:+.3f}" if legacy else f"Sharpe={sh:+.3f}"
+    title = (f"{tag}AFES v2 — Daily WFO Dashboard   |   OOS {oos.min().date()} → {oos.max().date()}   |   "
+             f"{sh_text}   PnL={pnl:+.2f}   trades={n_tr}   win={win:.1f}%   PF={pf:.2f}   "
              f"maxDD={mdd_text}   |   {booking}")
     fig.suptitle(title, fontsize=13, y=0.985)
-    print(f"Sharpe={sh:+.3f}   maxDD={mdd_text}   ({booking})")
+    print(f"{sh_text}   maxDD={mdd_text}   ({booking})")
 
     # ─── Panel 1: Equity curve (combined + sub-blocks)
     ax = fig.add_subplot(gs[0, :2])
-    ax.plot(eq.index, eq.values * scale, lw=1.6, color="#1f77b4", label=f"Combined (S={sh:+.2f})")
-    texts.append(f"legend: Combined (S={sh:+.2f})")
+    ax.plot(eq.index, eq.values * scale, lw=1.6, color="#1f77b4",
+            label=f"{tag}Combined ({s_name}={sh:+.2f})")
+    texts.append(f"legend: {tag}Combined ({s_name}={sh:+.2f})")
     for name, curve, s in curves:
         color = "#2ca02c" if name == "Cross-listing" else "#ff7f0e"
         ax.plot(curve.index, curve.values * scale, lw=1.2, color=color,
-                label=f"{name} (S={s:+.2f})", alpha=0.8)
-        texts.append(f"legend: {name} (S={s:+.2f})")
-    ax.set_title("Equity curve — combined vs sub-blocks", fontsize=11)
+                label=f"{tag}{name} ({s_name}={s:+.2f})", alpha=0.8)
+        texts.append(f"legend: {tag}{name} ({s_name}={s:+.2f})")
+    title1 = f"{tag}Equity curve — combined vs sub-blocks"
+    ax.set_title(title1, fontsize=11)
+    texts.append(f"panel 1: {title1}")
     ax.set_ylabel(f"Cumulative PnL ({units})" if legacy else
                   "Cumulative return (% of capital; a block: % of its own capital)")
     ax.legend(loc="upper left", fontsize=9)
@@ -154,7 +162,9 @@ def main():
     # ─── Panel 2: Drawdown
     ax = fig.add_subplot(gs[0, 2])
     ax.fill_between(dd.index, dd.values * scale, 0, color="#d62728", alpha=0.6)
-    ax.set_title(f"Drawdown (max = {mdd_text})", fontsize=11)
+    title2 = f"{tag}Drawdown (max = {mdd_text})"
+    ax.set_title(title2, fontsize=11)
+    texts.append(f"panel 2: {title2}")
     ax.set_ylabel("Underwater (log-units)" if legacy else "Underwater (% of capital)")
     ax.grid(alpha=0.3)
 
@@ -177,8 +187,9 @@ def main():
             if pd.notna(v):
                 ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=7,
                          color="black" if abs(v) < pivot.abs().max().max() * 0.6 else "white")
-    ax.set_title("Monthly PnL heatmap" if legacy else "Monthly return heatmap (% of capital)",
-                 fontsize=11)
+    title3 = "LEGACY Monthly PnL heatmap" if legacy else "Monthly return heatmap (% of capital)"
+    ax.set_title(title3, fontsize=11)
+    texts.append(f"panel 3: {title3}")
     fig.colorbar(im, ax=ax, fraction=0.025)
 
     # ─── Panel 4: Trades by year
@@ -188,7 +199,9 @@ def main():
     ax2 = ax.twinx()
     ax2.plot(yr_count.index, yr_count["sum"], color="#d62728", lw=2, marker="o",
               label="PnL per year")
-    ax.set_title("Trades & PnL by year", fontsize=11)
+    title4 = f"{tag}Trades & PnL by year (exit year)"
+    ax.set_title(title4, fontsize=11)
+    texts.append(f"panel 4: {title4}")
     ax.set_ylabel("Trade count", color="#1f77b4")
     ax2.set_ylabel("PnL", color="#d62728")
     ax.grid(alpha=0.3)
@@ -197,7 +210,8 @@ def main():
     ax = fig.add_subplot(gs[2, :2])
     if legacy:
         ps = pd.Series({p: sharpe(daily_series(t[t.pair == p], oos)) for p in t.pair.unique()})
-        title5, xlabel5 = "Per-pair Sharpe (green = cross-listing, blue = non-cross)", "Sharpe"
+        title5 = f"Per-pair {LEGACY_RATIO} (green = cross-listing, blue = non-cross)"
+        xlabel5 = LEGACY_RATIO
     elif by_pair is not None:
         ps = pd.Series({p: mtm_stats(by_pair[p], CAPITAL_PER_PAIR)["sharpe"] for p in t.pair.unique()})
         title5 = "Per-pair Sharpe, daily MTM (green = cross-listing, blue = non-cross)"
@@ -245,18 +259,18 @@ def main():
         return [label, f"{len(grp)}", f"{grp.pnl.sum():+.2f}", f"{bs['sharpe']:+.2f}",
                 f"{bs['max_dd'] * 100:+.2f}%"]
 
-    rows = [["Block", "Trades", "PnL", "Sharpe", "MaxDD"]]
+    rows = [["Block", "Trades", "PnL", "LEGACY ratio" if legacy else "Sharpe", "MaxDD"]]
     if legacy:
         for name, ps_set in SUB.items():
             rows.append(block_stats(t[t.pair.isin(ps_set)], name))
-        rows.append(block_stats(t_nc, "Non-cross (26)"))
+        rows.append(block_stats(t_nc, f"Non-cross ({n_nc})"))
         rows.append(block_stats(t,    "Combined", d_all))
-        title6 = f"Sub-block decomposition; {booking}"
+        title6 = f"LEGACY sub-block decomposition; {booking} (ratio: not a Sharpe)"
     else:
         for name, ps_set in SUB.items():
             rows.append(mtm_block_stats(t[t.pair.isin(ps_set)], name,
                                         block_returns(by_pair, ps_set.__contains__)))
-        rows.append(mtm_block_stats(t_nc, "Non-cross (26)",
+        rows.append(mtm_block_stats(t_nc, f"Non-cross ({n_nc})",
                                     block_returns(by_pair, lambda p: "_USD" not in p)))
         rows.append(mtm_block_stats(t, "Combined", d_all))
         title6 = "Sub-block decomposition (daily MTM; MaxDD % of the block's capital)"

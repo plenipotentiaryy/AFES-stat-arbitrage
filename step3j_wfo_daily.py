@@ -59,6 +59,7 @@ import pandas as pd
 from config import DATA_DIR, OUTPUT_DIR, BAR_TIMEFRAME
 from build_universe_pit import COLUMNS as PIT_COLUMNS
 from cross_listing import close_time
+from mtm import file_sha256
 from perf_stats import deflated_sharpe, psr, sharpe_per_period, sr0_threshold
 from wfo_daily_core import (
     TRAIN_INIT_MO, OOS_MO, STEP_MO, HOLDOUT_START,
@@ -160,29 +161,44 @@ HEADLINE_FORBIDDEN = {
 }
 
 
-def non_headline_reasons(pairs_file: str, pairs_df: pd.DataFrame, first_oos,
-                         legacy: list[str]) -> list[str]:
-    """Why a run is not a headline run; empty = HEADLINE.  A headline run
-    reads a frozen point-in-time universe written by build_universe_pit.py — a
-    file named universe_pit_<asof>.csv with the builder's columns, a value in
-    each of them on every row, and that one as-of date in the `asof` column
-    of every row (a hand-appended pair is not frozen) — whose as-of date is
-    strictly before the run's first OOS date (`first_oos`, None if the run has
-    no window), and uses no legacy option (`legacy`, the --legacy-* options
-    given; hard rule 5).  Manual pair lists, step7's OOS-PnL curation and every
-    other pairs file are not headline."""
-    reasons = []
+def frozen_pit_asof(pairs_file: str, pairs_df: pd.DataFrame) -> str | None:
+    """The as-of date of a frozen point-in-time universe written by
+    build_universe_pit.py — a file named universe_pit_<asof>.csv with the
+    builder's columns, a value in each of them on every row, and that one
+    as-of date in the `asof` column of every row (a hand-appended pair is not
+    frozen); None for any other pairs file.  (Also used by fdr_screening.py.)"""
     name = PIT_UNIVERSE_FILE.fullmatch(Path(pairs_file).name)
     frozen = (name is not None and len(pairs_df) > 0
               and all(c in pairs_df.columns for c in PIT_COLUMNS)
               and bool(pairs_df[PIT_COLUMNS].notna().all().all())
               and bool((pairs_df["asof"].astype(str) == name.group(1)).all()))
-    if not frozen:
+    return name.group(1) if frozen else None
+
+
+SCREEN_ONLY_REASON = ("NON-HEADLINE RUN: pairs file carries a role column (role=screen_only: the "
+                      "output of a screen such as fdr_screening.py), never the headline pairs")
+
+
+def non_headline_reasons(pairs_file: str, pairs_df: pd.DataFrame, first_oos,
+                         legacy: list[str]) -> list[str]:
+    """Why a run is not a headline run; empty = HEADLINE.  A headline run
+    reads a frozen point-in-time universe (`frozen_pit_asof`) whose as-of date
+    is strictly before the run's first OOS date (`first_oos`, None if the run
+    has no window), with no `role` column (audit T10: a screen's output, e.g.
+    fdr_screening.py's role=screen_only file, is never the headline pairs),
+    and uses no legacy option (`legacy`, the --legacy-* options given; hard
+    rule 5).  Manual pair lists, step7's OOS-PnL curation and every other
+    pairs file are not headline."""
+    reasons = []
+    asof = frozen_pit_asof(pairs_file, pairs_df)
+    if asof is None:
         reasons.append(NON_HEADLINE_BANNER)
-    elif first_oos is None or not pd.Timestamp(name.group(1)) < first_oos:
+    elif first_oos is None or not pd.Timestamp(asof) < first_oos:
         first = "none (no window)" if first_oos is None else first_oos.date()
-        reasons.append(f"{NON_HEADLINE_BANNER}: as of {name.group(1)}, not before the first "
+        reasons.append(f"{NON_HEADLINE_BANNER}: as of {asof}, not before the first "
                        f"OOS date {first}")
+    if "role" in pairs_df.columns:
+        reasons.append(SCREEN_ONLY_REASON)
     if legacy:
         reasons.append("NON-HEADLINE RUN: legacy options " + ", ".join(legacy))
     return reasons
@@ -436,8 +452,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "slice includes the first OOS day). Needed by --legacy-same-close "
                         "and --legacy-spread-pnl. Comparison only; never for headline results.")
     p.add_argument("--legacy-exit-date-pnl", action="store_true", dest="legacy_exit_date_pnl",
-                   help="LEGACY: book each trade's PnL on its exit date (daily PnL, Sharpe(full), "
-                        "Sharpe(exit)) and MaxDD over trades in table order, instead of the daily "
+                   help="LEGACY: book each trade's PnL on its exit date (daily PnL; the exit-date "
+                        "ratios over full days / exit days, not a Sharpe) and MaxDD over trades "
+                        "in table order, instead of the daily "
                         "mark-to-market on constant capital; no MTM file is written. Needed by "
                         "--legacy-spread-pnl. Comparison only; never for headline results.")
     p.add_argument("--legacy-no-entry-guards", action="store_true", dest="legacy_no_entry_guards",
@@ -617,10 +634,11 @@ def main():
         cross = trades[trades["pair"].isin(excluded.index)]
         if not cross.empty:
             st = trade_stats(cross, result.stats["n_windows"], len(excluded), result.daily_pnl.index)
-            # The exit-date Sharpe(full) only with the legacy booking (rule 4: one Sharpe).
+            # The exit-date ratio only with the legacy booking, never called a Sharpe (rule 4).
             print(f"  cross-listed block (LEGACY — NOT VALID): {st['n_trades']} trades, "
                   f"win {st['win_rate']:.1%}, total PnL {st['total_pnl']:+.4f}"
-                  + (f", Sharpe(full) {st['sharpe_full']:+.3f}" if legacy_pnl else ""))
+                  + (f", LEGACY exit-date ratio (full days) — not a Sharpe {st['sharpe_full']:+.3f}"
+                     if legacy_pnl else ""))
     else:
         print("\n" + cross_listed_table(excluded))
     print("\n" + verdict)
@@ -654,6 +672,12 @@ def main():
         "files": {"trades": out_csv.name,
                   "mtm": None if legacy_pnl else f"wfo_daily_mtm{suffix}.csv",
                   "mtm_pairs": None if legacy_pnl else f"wfo_daily_mtm_pairs{suffix}.csv"},
+        # Audit T10 (R44): the contents of the files above (as written) and of
+        # the closes file, verified by the downstream scripts (mtm.check_run).
+        "sha256": {"trades": file_sha256(out_csv),
+                   "mtm": None if legacy_pnl else file_sha256(out_mtm),
+                   "mtm_pairs": None if legacy_pnl else file_sha256(out_pairs),
+                   "closes": file_sha256(closes_path)},
     }
     out_meta.write_text(json.dumps(meta, indent=2) + "\n")
     print(f"Meta   → {out_meta}")

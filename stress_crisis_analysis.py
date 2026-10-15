@@ -3,7 +3,9 @@
 Slices the daily-WFO output by named crisis episodes, computes VaR/CVaR
 on the daily series, and reports tail behaviour.  The series is the run's
 daily mark-to-market PnL (wfo_daily_mtm<tag>.csv, written by
-step3j_wfo_daily.py next to the trades file; audit T4).
+step3j_wfo_daily.py next to the trades file; audit T4), checked against the
+run's meta sidecar (audit T10); only the named windows that overlap the
+series' span are reported (none past the run's end).
 
 Run after step3j_wfo_daily.py:
     python stress_crisis_analysis.py \\
@@ -18,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from mtm import LEGACY_LABEL, add_series_args, mtm_pnl
+from mtm import LEGACY_RATIO, add_series_args, check_from, legacy_exit_date_pnl, mtm_pnl, run_meta
 
 # ─────────────────────── Crisis windows (named) ─────────────────────────────
 CRISIS_WINDOWS = [
@@ -41,18 +43,13 @@ CALM_WINDOWS = [
 ]
 
 
-def daily_pnl(trades: pd.DataFrame, oos_days: pd.DatetimeIndex) -> pd.Series:
-    d = trades.set_index("exit")["pnl"].groupby(level=0).sum()
-    return d.reindex(oos_days).fillna(0.0)
-
-
 def slice_metrics(daily: pd.Series, trades: pd.DataFrame,
                    start: str, end: str) -> dict:
     s = pd.Timestamp(start); e = pd.Timestamp(end)
     d  = daily.loc[s:e]
     tr = trades[(trades["exit"] >= s) & (trades["exit"] <= e)]
     if d.std() == 0 or len(d) == 0:
-        return dict(days=len(d), trades=len(tr), pnl=0.0, sharpe=float("nan"),
+        return dict(days=len(d), trades=len(tr), pnl=0.0, sr_window=float("nan"),
                      dd=0.0, win=float("nan"), best=0.0, worst=0.0)
     eq = d.cumsum()
     dd = (eq - eq.cummax()).min()
@@ -61,7 +58,7 @@ def slice_metrics(daily: pd.Series, trades: pd.DataFrame,
         days=len(d),
         trades=len(tr),
         pnl=float(d.sum()),
-        sharpe=float(sh),
+        sr_window=float(sh),      # mean / std · √252 over the window's days only
         dd=float(dd),
         win=float((tr.pnl > 0).mean() * 100) if len(tr) else float("nan"),
         best=float(d.max()),
@@ -79,41 +76,57 @@ def main():
     args = ap.parse_args()
 
     t      = pd.read_csv(args.trades, parse_dates=["entry", "exit"])
-    if args.legacy_exit_date_pnl:
-        print(f"series: {LEGACY_LABEL}")
-        closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
-        oos    = closes.loc[args.split:].index
-        d_all  = daily_pnl(t, oos)
+    legacy = args.legacy_exit_date_pnl
+    if legacy:
+        d_all  = legacy_exit_date_pnl(args, args.closes, start=args.split)
+        oos    = d_all.index
         units  = "log-spread units"
+        sh_name, sh_col = LEGACY_RATIO, "ratio"
+        col_note = "ratio: the LEGACY exit-date ratio over the window's days (not a Sharpe)"
     else:
-        d_all  = mtm_pnl(args).loc[args.split:]
+        d_all  = mtm_pnl(args)
+        check_from(d_all.index, args.split, "--split")   # the whole run, never a sub-span (R46)
         oos    = d_all.index
         units  = "USD per $1 of leg-1 notional"
+        sh_name, sh_col = "Sharpe (daily MTM)", "SR(win)"
+        col_note = ("SR(win): mean / std · √252 of the daily MTM over the window's business days "
+                    "only (a sub-period figure, not the run's Sharpe)")
 
     full_sharpe = d_all.mean() / d_all.std() * np.sqrt(252)
     print(f"{'='*92}")
     print(f"OOS span: {oos.min().date()} → {oos.max().date()}   ({len(oos)} days)")
-    print(f"Full Sharpe: {full_sharpe:+.3f}    Full PnL: {d_all.sum():+.2f}    Daily σ: {d_all.std():.4f}")
+    print(f"Full {sh_name}: {full_sharpe:+.3f}    Full PnL: {d_all.sum():+.2f}    Daily σ: {d_all.std():.4f}")
     print(f"{'='*92}")
+
+    # Audit T10: only the windows that overlap the series (none past the run's end).
+    def inside(windows):
+        return [(n, s, e) for n, s, e in windows
+                if pd.Timestamp(s) <= oos.max() and pd.Timestamp(e) >= oos.min()]
+    crisis_windows, calm_windows = inside(CRISIS_WINDOWS), inside(CALM_WINDOWS)
+    left_out = [n for n, _, _ in CRISIS_WINDOWS + CALM_WINDOWS
+                if n not in {w[0] for w in crisis_windows + calm_windows}]
+    if left_out:
+        print(f"Outside the series' span, not reported: {', '.join(left_out)}")
+    print(col_note)
 
     # ── Crisis periods ─────────────────────────────────────────────────────
     print("\nCRISIS PERIODS:")
-    print(f"  {'window':30s}{'days':>6s}{'trades':>8s}{'PnL':>9s}{'Sharpe':>9s}{'DD':>10s}{'win%':>7s}{'worst':>9s}")
+    print(f"  {'window':30s}{'days':>6s}{'trades':>8s}{'PnL':>9s}{sh_col:>9s}{'DD':>10s}{'win%':>7s}{'worst':>9s}")
     crisis_results = []
-    for name, start, end in CRISIS_WINDOWS:
+    for name, start, end in crisis_windows:
         m = slice_metrics(d_all, t, start, end)
         crisis_results.append({"window": name, "start": start, "end": end, **m})
         print(f"  {name:30s}{m['days']:>6d}{m['trades']:>8d}{m['pnl']:>+9.2f}"
-              f"{m['sharpe']:>+9.2f}{m['dd']:>+10.3f}{m['win']:>6.1f}%{m['worst']:>+9.3f}")
+              f"{m['sr_window']:>+9.2f}{m['dd']:>+10.3f}{m['win']:>6.1f}%{m['worst']:>+9.3f}")
 
     print("\nCALM PERIODS (benchmark):")
-    print(f"  {'window':30s}{'days':>6s}{'trades':>8s}{'PnL':>9s}{'Sharpe':>9s}{'DD':>10s}{'win%':>7s}{'worst':>9s}")
+    print(f"  {'window':30s}{'days':>6s}{'trades':>8s}{'PnL':>9s}{sh_col:>9s}{'DD':>10s}{'win%':>7s}{'worst':>9s}")
     calm_results = []
-    for name, start, end in CALM_WINDOWS:
+    for name, start, end in calm_windows:
         m = slice_metrics(d_all, t, start, end)
         calm_results.append({"window": name, "start": start, "end": end, **m})
         print(f"  {name:30s}{m['days']:>6d}{m['trades']:>8d}{m['pnl']:>+9.2f}"
-              f"{m['sharpe']:>+9.2f}{m['dd']:>+10.3f}{m['win']:>6.1f}%{m['worst']:>+9.3f}")
+              f"{m['sr_window']:>+9.2f}{m['dd']:>+10.3f}{m['win']:>6.1f}%{m['worst']:>+9.3f}")
 
     # ── Tail / VaR analysis ────────────────────────────────────────────────
     print(f"\n{'='*92}")
@@ -199,8 +212,10 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "series": "LEGACY exit-date booking — not a Sharpe" if legacy else "daily mark-to-market",
+        "headline": run_meta(args).get("headline") is True,
         "oos_span": [str(oos.min().date()), str(oos.max().date())],
-        "full_sharpe": float(full_sharpe),
+        ("legacy_exit_date_ratio" if legacy else "full_sharpe"): float(full_sharpe),
         "full_pnl": float(d_all.sum()),
         "daily_mean": float(daily_mean),
         "daily_std": float(daily_std),

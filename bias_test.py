@@ -27,6 +27,7 @@ from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from config import DATA_DIR
 
 SPLIT_DATE = "2014-12-31"          # first 8.5y → select; last 11+y → test
+END_DATE   = "2023-12-31"          # audit T6/T10: the development period ends here (2024+ = holdout)
 CORR_MIN   = 0.30                  # min daily-return correlation (relaxed)
 HL_MAX     = 90                    # max half-life (days)
 JOH_CRIT   = 0.90                  # Johansen crit level (relaxed for half-sample)
@@ -137,11 +138,15 @@ def main():
     p.add_argument("--closes",   type=str, default="closes_daily.csv",
                    help="Closes file in data/ (extended universe support).")
     p.add_argument("--cusum",  type=float, default=None)
+    p.add_argument("--end", type=str, default=END_DATE,
+                   help=f"Last date of the WFO run (default {END_DATE}, the end of the development "
+                        "period; the CLI refuses later dates without --final-holdout, which this "
+                        "script never passes).")
     args = p.parse_args()
 
     print(f"BIAS TEST — split at {args.split}")
     print(f"  selection on:  {{start}} → {args.split}")
-    print(f"  trading on:    {args.split} → {{end}}\n")
+    print(f"  trading on:    {args.split} → {args.end}\n")
 
     closes = (pd.read_csv(DATA_DIR / args.closes,
                           parse_dates=["Date"]).set_index("Date").sort_index())
@@ -169,6 +174,7 @@ def main():
         sys.executable, "step3j_wfo_daily.py",
         "--pairs",  "pairs_bias_test.csv",
         "--start",  args.split,
+        "--end",    args.end,
         "--cost",   str(args.cost),
         "--slip",   str(args.slip),
         "--borrow", str(args.borrow),

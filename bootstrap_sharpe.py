@@ -1,12 +1,16 @@
 """bootstrap_sharpe.py — stationary block-bootstrap CI on portfolio Sharpe.
 
 Method: Politis-Romano (1994) stationary block bootstrap on the run's daily
-mark-to-market PnL (wfo_daily_mtm<tag>.csv, written by step3j_wfo_daily.py
-next to the trades file; audit T4; its Sharpe equals that of the daily
-returns on constant capital).  Block lengths are i.i.d. geometric with mean
+mark-to-market returns (column ret of wfo_daily_mtm<tag>.csv, written by
+step3j_wfo_daily.py next to the trades file; audit T4), checked against the
+run's meta sidecar (audit T10).  Block lengths are i.i.d. geometric with mean
 L, which preserves short-range serial dependence (typical for trade-overlap
-effects) while still resampling.  Run N replicates, compute Sharpe for
-each, report percentiles.
+effects) while still resampling.  Run N replicates, compute the one Sharpe
+(`perf_stats.portfolio_sharpe`) of each, report percentiles.
+
+The intervals measure SAMPLING UNCERTAINTY ONLY: resampling a biased series
+(look-ahead, selection on hindsight, many trials) reproduces its bias, so a
+bootstrap cannot detect it (audit T10; see the DSR of step3j_wfo_daily.py).
 
 Usage:
     python bootstrap_sharpe.py --trades data/wfo_daily_results_bias.csv \\
@@ -17,7 +21,9 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from mtm import LEGACY_LABEL, add_series_args, mtm_pnl
+from mtm import (LEGACY_RATIO, SAMPLING_LABEL, add_series_args, check_from, legacy_exit_date_pnl,
+                 load_mtm)
+from perf_stats import portfolio_sharpe_or_nan as sharpe_or_nan
 
 
 def stationary_block_bootstrap(x: np.ndarray, mean_block_len: float,
@@ -41,14 +47,6 @@ def stationary_block_bootstrap(x: np.ndarray, mean_block_len: float,
     return out
 
 
-def daily_pnl_series(trades_csv: str, split: str, closes_csv: str) -> pd.Series:
-    closes = pd.read_csv(closes_csv, parse_dates=["Date"], usecols=["Date"])
-    oos = pd.DatetimeIndex(closes[closes["Date"] >= split]["Date"]).normalize()
-    tr = pd.read_csv(trades_csv, parse_dates=["entry", "exit"])
-    daily = tr.groupby(tr["exit"].dt.normalize())["pnl"].sum()
-    return daily.reindex(oos, fill_value=0.0)
-
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--trades", type=str, required=True)
@@ -62,15 +60,20 @@ def main():
     args = p.parse_args()
 
     print(f"Bootstrap on {args.trades}")
+    print(f"BOOTSTRAP: {SAMPLING_LABEL}")
     if args.legacy_exit_date_pnl:
-        print(f"series: {LEGACY_LABEL}")
-        series = daily_pnl_series(args.trades, args.split, args.closes)
+        pnl = legacy_exit_date_pnl(args, args.closes, start=args.split)
+        x = pnl.to_numpy()                       # exit-date PnL: no capital, no Sharpe
+        stat = LEGACY_RATIO
     else:
-        series = mtm_pnl(args).loc[args.split:]
-    x = series.values
+        m = load_mtm(args)
+        check_from(m.index, args.split, "--split")   # the whole run, never a sub-span (R46)
+        pnl = m["pnl"]
+        x = m["ret"].to_numpy()                  # daily MTM return on the run's capital
+        stat = "Sharpe"
     n = len(x)
-    print(f"  OOS daily series: {n} days, sum PnL = {x.sum():+.3f}")
-    print(f"  point Sharpe    : {x.mean() / x.std() * np.sqrt(252):+.3f}")
+    print(f"  OOS daily series: {n} days, sum PnL = {pnl.sum():+.3f}")
+    print(f"  point {stat:<10}: {sharpe_or_nan(x):+.3f}")
     print(f"  block bootstrap : reps={args.reps}, mean_block={args.block} days")
     print()
 
@@ -82,27 +85,28 @@ def main():
     for start in range(0, args.reps, batch):
         end = min(start + batch, args.reps)
         sims = stationary_block_bootstrap(x, args.block, end - start, rng)
-        sh = sims.mean(axis=1) / sims.std(axis=1) * np.sqrt(252)
-        sharpes[start:end] = sh
+        sharpes[start:end] = [sharpe_or_nan(s) for s in sims]
 
     sharpes = sharpes[np.isfinite(sharpes)]
     pcts = np.percentile(sharpes, [2.5, 5, 25, 50, 75, 95, 97.5])
-    print(f"  bootstrap Sharpe distribution ({len(sharpes)} reps):")
+    name = "Sharpe" if stat == "Sharpe" else "ratio"
+    print(f"  bootstrap {stat} distribution ({len(sharpes)} reps):")
     print(f"    mean   = {sharpes.mean():+.3f}")
     print(f"    median = {pcts[3]:+.3f}")
     print(f"    std    = {sharpes.std():+.3f}")
     print()
-    print(f"    p(Sharpe < 0) = {(sharpes < 0).mean():.3f}")
-    print(f"    p(Sharpe > 0.5) = {(sharpes > 0.5).mean():.3f}")
-    print(f"    p(Sharpe > 1.0) = {(sharpes > 1.0).mean():.3f}")
+    print(f"    p({name} < 0) = {(sharpes < 0).mean():.3f}")
+    print(f"    p({name} > 0.5) = {(sharpes > 0.5).mean():.3f}")
+    print(f"    p({name} > 1.0) = {(sharpes > 1.0).mean():.3f}")
     print()
-    print(f"    {'percentile':>12}  {'Sharpe':>8}")
+    print(f"    {'percentile':>12}  {name:>8}")
     for q, v in zip([2.5, 5, 25, 50, 75, 95, 97.5], pcts):
         print(f"    {q:>10.1f}%   {v:>+8.3f}")
     print()
     print(f"  95% CI: [{pcts[0]:+.3f}, {pcts[-1]:+.3f}]")
     print(f"  90% CI: [{pcts[1]:+.3f}, {pcts[-2]:+.3f}]")
     print(f"  50% CI: [{pcts[2]:+.3f}, {pcts[-3]:+.3f}]")
+    print(f"  ({SAMPLING_LABEL}: the intervals resample this series, its biases included)")
 
 
 if __name__ == "__main__":

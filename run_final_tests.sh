@@ -6,13 +6,14 @@ mkdir -p output/final
 ALL_DAYS_PY='
 import pandas as pd, numpy as np, sys
 ALL = pd.read_csv("data/closes_daily.csv", parse_dates=["Date"], usecols=["Date"])
-OOS_IDX = pd.DatetimeIndex(ALL[ALL["Date"] >= sys.argv[2]]["Date"]).normalize()
+OOS_IDX = pd.DatetimeIndex(ALL[(ALL["Date"] >= sys.argv[2]) & (ALL["Date"] <= "2023-12-31")]["Date"]).normalize()
 tr = pd.read_csv(sys.argv[1], parse_dates=["entry","exit"])
 pnl = tr["pnl"]; eq = pnl.cumsum(); dd = (eq - eq.cummax()).min()
 daily = tr.groupby(tr["exit"].dt.normalize())["pnl"].sum().reindex(OOS_IDX, fill_value=0.0)
 pf = pnl[pnl>0].sum() / -pnl[pnl<0].sum() if (pnl<0).any() else float("inf")
 fsh = daily.mean()/daily.std()*np.sqrt(252)
-print(f"  trades={len(tr):>5}  win%={(pnl>0).mean()*100:>4.1f}  PnL={pnl.sum():>+7.3f}  DD={dd:>+6.3f}  PF={pf:.2f}  full_Sh={fsh:>+5.3f}  DD/PnL={abs(dd)/pnl.sum()*100:>5.1f}%")
+print(f"  trades={len(tr):>5}  win%={(pnl>0).mean()*100:>4.1f}  PnL={pnl.sum():>+7.3f}  DD(trade order)={dd:>+6.3f}  PF={pf:.2f}  exit_ratio={fsh:>+5.3f}  DD/PnL={abs(dd)/pnl.sum()*100:>5.1f}%")
+print("  (LEGACY exit-date booking — not a Sharpe; the daily MTM Sharpe, PSR and DSR are in the run log)")
 '
 
 run() {
@@ -20,7 +21,7 @@ run() {
   local split="$2"
   shift 2
   echo "=== $name ==="
-  python bias_test.py --split "$split" "$@" > "output/final/$name.log" 2>&1
+  python bias_test.py --split "$split" --end 2023-12-31 "$@" > "output/final/$name.log" 2>&1
   cp data/wfo_daily_results_bias.csv "output/final/$name.csv"
   python -c "$ALL_DAYS_PY" "output/final/$name.csv" "$split"
 }

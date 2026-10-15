@@ -950,6 +950,14 @@ def make_windows(closes: pd.DataFrame,
     return windows
 
 
+def mtm_span(windows: list[tuple], trades: pd.DataFrame) -> pd.DatetimeIndex:
+    """The dates of a run's daily MTM series (audit T4): every business day
+    from the first OOS start to max(the last OOS end, the last exit fill) —
+    holidays as zero days (R2), to the last exit fill (R16).  Also rebuilt
+    by the downstream scripts from a run's meta sidecar (`mtm.run_span`, T10)."""
+    return pd.bdate_range(windows[0][2], max(windows[-1][3], trades["exit"].max()), name="Date")
+
+
 # ── Config / result ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -1113,7 +1121,8 @@ class WfoResult:
     trades:        the trade list the CLI writes to wfo_daily_results*.csv.
     daily_pnl:     portfolio daily mark-to-market PnL (USD per $1 of leg-1
                    notional) on every business day of the OOS span, zeros on
-                   empty days (audit T4, `mtm.daily_mtm`); legacy_exit_date_pnl:
+                   empty days (audit T4: `mtm.portfolio_pnl` of daily_pnl_pairs;
+                   the tests check it against `mtm.daily_mtm`); legacy_exit_date_pnl:
                    trade PnL booked on exit dates over the panel's OOS days.
     stats:         summary metrics, see `run_stats` (legacy: `trade_stats`), and
                    headline = False (audit T5): only step3j_wfo_daily.py marks a
@@ -1243,11 +1252,12 @@ def summarise(tr: pd.DataFrame, label: str, n_windows: int, n_pairs: int,
     else:
         print(f"Max DD:         {st['max_dd']:+.4f}")
         print(f"DD / PnL:       {abs(st['max_dd'])/st['total_pnl']*100:.1f}%")
+        # Audit T10 (R45): exit-date ratios, not the one Sharpe (rule 4).
         if not np.isnan(st["sharpe_full"]):
-            print(f"Sharpe (full):  {st['sharpe_full']:+.3f}   ← correct portfolio Sharpe")
-            print(f"Sharpe (exit):  {st['sharpe_exit']:+.3f}   (inflated; legacy metric)")
+            print(f"LEGACY exit-date ratio (full days) — not a Sharpe:  {st['sharpe_full']:+.3f}")
+            print(f"LEGACY exit-date ratio (exit days) — not a Sharpe:  {st['sharpe_exit']:+.3f}")
         else:
-            print(f"Sharpe (exit):  {st['sharpe_exit']:+.3f}")
+            print(f"LEGACY exit-date ratio (exit days) — not a Sharpe:  {st['sharpe_exit']:+.3f}")
     print(f"Exit reasons:   {st['exit_reasons']}")
 
     by_pair = tr.groupby("pair")["pnl"].agg(["count", "sum", "mean"]).sort_values("sum", ascending=False)
@@ -2203,7 +2213,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         # Daily mark-to-market of the final trades, per pair and in total, over
         # every business day of the OOS span (R2: holidays are zero days), to
         # the last exit fill (R16).
-        span = pd.bdate_range(first_oos, max(windows[-1][3], trades["exit"].max()), name="Date")
+        span = mtm_span(windows, trades)
         by_pair = daily_mtm_pairs(trades, closes, span, pairs)
         daily_pnl = portfolio_pnl(by_pair)
         assert np.isclose(daily_pnl.sum(), trades["pnl"].sum(), rtol=1e-9, atol=1e-9)   # nothing dropped

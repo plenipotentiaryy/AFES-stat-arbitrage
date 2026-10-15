@@ -34,6 +34,7 @@ synthetic data whose true edge is known.
 | `test_entry_guards.py` | the entry window entry_z < \|z\| < stop_z in both engines, the vol-tight stop, `legacy_no_entry_guards`; the T2 structural guards pinned: genuine prints on the signal date, a z window without no-print days (T7) |
 | `test_position_costs.py` | costs per fill per leg on the leg notionals (round trip 2·(c + s)·(1 + \|β\|)), FX on `*_USD` legs, borrow on the short legs' marked notional (US / non-US / tier rate), the MTM schedule, `legacy_flat_cost`, the conservative default model, the run header and the `wfo_daily_meta<tag>.json` sidecar (T8) |
 | `test_remaining_lookahead.py` | remaining look-ahead (T9): per-window training rows strictly before the OOS start, the Kalman prior β and the entry z of the trade's own spread (R28), the causal forward-filtered macro HMM on a US-close proxy, truncation invariance of every optional flag (cut and different future), causal sizing of `--volvol` / `--pairmom` / `--voltarget`, `--metagate` / `--hrp` refused in a headline run, VWAP fills refused on the `--kalman` / `--vwz` paths |
+| `test_validation_outputs.py` | validation outputs that cannot mislead (T10): every downstream script checks a run against its meta sidecar (file names, the date range = the run's span, before the final holdout) and states its span and NON-HEADLINE status; the bootstrap's label and its one-Sharpe replicates; factor attribution on the daily MTM return with its days and dates; FDR on prices up to the as-of date / development cut, its NON-HEADLINE label and its screen-only output; legacy series end at the run's end and are labelled "not a Sharpe"; step4c's per-period PSR; `bias_test.py` / `run_*.sh` pass `--end 2023-12-31`; the SUPERSEDED banners |
 | `conftest.py` | session-wide: points the CLI's `TRIALS_FILE` / `HOLDOUT_USES_FILE` to a temp dir, so no test writes the committed repo-root files (T6) |
 
 ### Variants
@@ -458,6 +459,66 @@ its own close, on the union calendar, NaN on local holidays).
   fill date; `--pairmom` with open trades; CUSUM force-close on any break (caught
   by (b)); inclusive ivol slice; VWAP with Kalman allowed; forbidden flags in a
   headline run allowed; smoothed (`predict_proba`) states.
+- **Validation outputs** (`test_validation_outputs.py`, T10; the CLI once on a
+  3-year 2-pair OU panel with `--end 2007-06-29`, its closes running on to
+  2007-12).  For each of `bootstrap_sharpe`, `stress_crisis_analysis`,
+  `factor_attribution`, `dashboard_daily`, `monte_carlo_robustness`,
+  `edge_monitor`: the output names the run's MTM span and NON-HEADLINE status
+  and no date past the run's end; it stops (`SystemExit`) on an MTM file padded
+  with zero days past the run's span (Σ pnl unchanged), on one with a zero day
+  dropped, on one moved into 2024 under a sidecar without `--start` / `--end`
+  ("final holdout"), without a meta sidecar, and on a sidecar naming another
+  trades file; with `--legacy-exit-date-pnl` it says "LEGACY exit-date booking
+  — not a Sharpe", ends at the run's end and calls no ratio "Sharpe".
+  Bootstrap: the label "sampling uncertainty only — does not detect bias"
+  twice, the point estimate = `perf_stats.portfolio_sharpe(ret)`, the
+  replicates recomputed with the same random stream and the one Sharpe (mean,
+  95% CI).  Factor attribution: y = `ret` on the aligned days, aligned days and
+  their range, the MTM span, the one Sharpe on all business days, no other
+  JSON key with "sharpe" (factor-neutral IR).  FDR: on a builder-shaped
+  `universe_pit_2007-06-29.csv`, the EG p-value = statsmodels `coint` on the log
+  prices up to the as-of date; every price after it changed (and holes) →
+  byte-identical report and pair file, one price before it changed → a
+  different report; another `--split` with a frozen universe and a cut in 2024
+  are refused; a plain list, a builder-shaped file under another name and a PIT
+  name with a hand-appended row are "NON-HEADLINE / hindsight candidate list"
+  (stdout twice, JSON), cut at `--split`; the pair file has `role=screen_only`,
+  and `non_headline_reasons` refuses it under the frozen universe's name and
+  refuses a builder-shaped frozen file with a `role` column (the same file
+  without it is HEADLINE); the default output is under `output/`.  Dashboard:
+  "Non-cross (2)" (the run's count), every legacy title and legend LEGACY.
+  Stress: no named window outside the series' span.  Monte Carlo: the MTM
+  series (days, PnL, the one Sharpe), the label, no Sharpe for the trade
+  permutation.  compare_results: each run's MTM Sharpe; legacy: no "Sharpe"
+  row.  edge_monitor: the MTM dates and PnL.  step4c: `probabilistic_sharpe`
+  = `perf_stats.psr` per period (PSR(1) against 1/√252).  `bias_test.py`
+  passes `--end 2023-12-31` (or its `--end`) to the CLI; every CLI call in
+  `run_*.sh` has `--end`, no date ≥ 2024, no `--final-holdout`, no
+  exit-date "full_Sh".  The SUPERSEDED banner is the first line of
+  `FULL_DAILY_RUN.md` and `PHASE1_QUANT_AUDIT.md`.
+  Review fix round 1 (R44–R46; 7 more tests, 43 in all): the sidecar records the
+  SHA-256 of the trades, MTM, per-pair MTM and closes files; each script stops
+  ("SHA-256") on an MTM file with one day's PnL split over two days (Σ pnl and
+  span unchanged, the Sharpe not) and on a trades file with two trades' PnL
+  swapped; a sidecar without hashes prints "WARNING: no file hashes recorded …
+  contents not verified"; a closes file under another name or edited is
+  refused (factor attribution); each script with `--split` / `--start` stops
+  on a date inside the run's span (also in legacy mode); a second CLI run dated
+  2016-01-04 … 2017-06-30: the stress report keeps exactly "2016 Brexit" and
+  "2017 calm bull" (days = the overlap); the legacy `summarise` prints "LEGACY
+  exit-date ratio (full days|exit days) — not a Sharpe" and no "Sharpe (";
+  `step3j_wfo_daily.py`, `almgren_chriss_repricing.py`, `hmm_modes_proper.py`,
+  `audit_baseline.py`, `unified_timeline_backtest.py` print "Sharpe" only as
+  "not a Sharpe" / the MTM Sharpe; `almgren_chriss_repricing.py` on the
+  synthetic run covers the trades' span (first OOS closes day → last exit, not
+  the closes' end) and refuses exits in 2024; `audit_baseline.py` writes
+  `legacy_exit_date_ratio(_full_days)`, no "sharpe" key; FDR warns for a
+  hindsight list cut after 2014-12-31.  Fix round 2 (R47; 44 tests):
+  `build_production_universe.load_baseline_pairs` reads the old `sharpe` or the
+  new `legacy_exit_date_ratio` column (the new one first) into
+  `baseline_sharpe`; `audit_baseline.py`'s equity curve covers the trades' own
+  span (first OOS start → last exit) and a 2024 exit is refused;
+  `hmm_modes_proper.py` uses the same calendar (`mtm.trades_span_days`).
 
 ### Statistic definitions
 
@@ -548,3 +609,5 @@ extra comparison per flat bar with |z| > entry_z).
 At T8 ≈ 56 s: the T8 tests add ≈ 2 s (47 tests).
 At T9 ≈ 70–80 s: the T9 tests add ≈ 20 s (47 tests; ≈ 60 runs of the golden cases, the
 HMM ones ≈ 1 s each).
+At T10: the T10 tests add ≈ 4 s (44 tests after review fix round 2; two small CLI runs,
+the scripts with 20 replicates); full suite ≈ 80–93 s.

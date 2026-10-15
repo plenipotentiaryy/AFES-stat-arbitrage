@@ -1,14 +1,33 @@
 """fdr_screening.py — Benjamini-Hochberg FDR correction on candidate pair selection.
 
-Runs Engle-Granger ADF + Johansen on each candidate pair using train-only
-data (pre-split), collects p-values, and applies FDR correction.
+Runs Engle-Granger ADF + Johansen on each candidate pair using development
+data only (prices up to the cut), collects p-values, and applies FDR
+correction.
+
+Audit T10:
+- The candidate list is the frozen point-in-time universe of
+  build_universe_pit.py (universe_pit_<asof>.csv, as step3j_wfo_daily
+  certifies it: `frozen_pit_asof`), every row of it — the pre-registered list,
+  not a hand-curated subset.  Its prices are cut at its as-of date; another
+  --split is refused.  Any other list is screened on prices up to --split
+  (the development cut, default 2014-12-31) and every output says
+  "NON-HEADLINE / hindsight candidate list".  A cut inside the final holdout
+  is refused.
+- The output is a screen, never the headline pairs: the pair file carries
+  role=screen_only (step3j_wfo_daily never certifies a pairs file with a
+  role column as HEADLINE) and goes to output/, under a name the frozen
+  universe pattern cannot match.  Never use it to choose the headline set
+  after seeing OOS results.
 
 CLI:
+    python fdr_screening.py --candidates data/universe_pit_2014-12-31.csv \\
+        --closes data/closes_daily_r3k.csv
     python fdr_screening.py --candidates data/pairs_v2_candidates.csv \\
-        --closes data/closes_daily_extended_v2.csv --split 2014-12-31
+        --closes data/closes_daily_extended_v2.csv --split 2014-12-31     # NON-HEADLINE
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -16,6 +35,13 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.stattools import coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
+
+from step3j_wfo_daily import frozen_pit_asof
+from wfo_daily_core import HOLDOUT_START
+
+SCREEN_ONLY = "screen_only"
+HINDSIGHT = "NON-HEADLINE / hindsight candidate list"
+DEV_CUT = "2014-12-31"
 
 
 def benjamini_hochberg(pvals: np.ndarray, q: float) -> np.ndarray:
@@ -62,18 +88,53 @@ def johansen_pvalue(p1: pd.Series, p2: pd.Series) -> float:
         return float("nan")
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--candidates", required=True)
+    ap.add_argument("--candidates", required=True,
+                    help="The candidate list: the frozen point-in-time universe file "
+                         "universe_pit_<asof>.csv (build_universe_pit.py), else NON-HEADLINE.")
     ap.add_argument("--closes",     required=True)
-    ap.add_argument("--split",      default="2014-12-31")
+    ap.add_argument("--split",      default=None,
+                    help=f"Development cut: p-values on prices up to this date (default {DEV_CUT}). "
+                         "A frozen universe is cut at its as-of date; another --split is refused.")
     ap.add_argument("--out",        default="output/fdr_report.json")
-    args = ap.parse_args()
+    ap.add_argument("--pairs-out",  default="output/fdr_screen_bh05.csv",
+                    help="The BH q=0.05 pairs, role=screen_only (never a headline pairs file).")
+    ap.add_argument("--compare",    default=None,
+                    help="Optional pairs file (e.g. data/pairs_bias_test.csv) to compare with.")
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
+
+    cand_df = pd.read_csv(args.candidates)
+    name = Path(args.candidates).name
+    asof = frozen_pit_asof(args.candidates, cand_df)
+    if asof is not None:
+        if args.split is not None and pd.Timestamp(args.split) != pd.Timestamp(asof):
+            raise SystemExit(f"--split {args.split}: {name} is a frozen point-in-time universe, "
+                             f"screened on prices up to its as-of date {asof} only")
+        cut = asof
+        label = (f"point-in-time candidate list {name} (frozen, as of {asof}); "
+                 "screen only — never the headline pairs file")
+    else:
+        cut = args.split or DEV_CUT
+        label = f"{HINDSIGHT}: {name} is not a frozen point-in-time universe; screen only"
+    if pd.Timestamp(cut) >= HOLDOUT_START:
+        raise SystemExit(f"cut {cut} is inside the final holdout (from {HOLDOUT_START.date()}): "
+                         "the FDR p-values use development data only")
+    print(label)
+    if asof is None and pd.Timestamp(cut) > pd.Timestamp(DEV_CUT):
+        print(f"WARNING: cut {cut} is after {DEV_CUT}: the p-values read years that are "
+              "out-of-sample for the WFO runs from --start 2014-12-31 (first OOS 2015-06-30)")
 
     closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
-    train = closes.loc[:args.split]
-    cands = pd.read_csv(args.candidates)["pair"].tolist()
-    print(f"Train slice: {train.index.min().date()} → {train.index.max().date()}  ({len(train)} days)")
+    train = closes.loc[:cut]
+    assert train.index.max() <= pd.Timestamp(cut)        # nothing after the cut
+    cands = cand_df["pair"].tolist()                      # every row: the full list
+    print(f"Train slice: {train.index.min().date()} → {train.index.max().date()}  ({len(train)} days; "
+          f"cut {cut})")
     print(f"Candidates:  {len(cands)} pairs")
 
     rows = []
@@ -120,40 +181,59 @@ def main():
     print(f"  FDR-BH q=0.10:        {bh_10.sum():>3d} pass")
     print(f"  Bonferroni α=0.05:    {bonf.sum():>3d} pass  (very conservative)")
 
-    # ── Compare with bias_test selection ───────────────────────────────────
-    bt = pd.read_csv("data/pairs_bias_test.csv")
-    bt_selected = set(bt.pair.tolist())
-    tested["in_bias_test"] = tested.pair.isin(bt_selected)
-    print(f"\nIntersection of selection methods with 36 bias_test selected:")
-    for col in ("naive_05", "bh_05", "bh_10", "bonf_05"):
-        passed = set(tested[tested[col]].pair)
-        overlap = passed & bt_selected
-        only_method = passed - bt_selected
-        only_bt = bt_selected - passed
-        print(f"  {col:14s}  pass={len(passed):3d}  overlap_with_bt={len(overlap):2d}  "
-              f"only_method={len(only_method):2d}  only_bt={len(only_bt):2d}")
+    # ── Compare with another selection (optional) ──────────────────────────
+    report_compare = {}
+    if args.compare:
+        bt_selected = set(pd.read_csv(args.compare).pair.tolist())
+        tested["in_compare"] = tested.pair.isin(bt_selected)
+        print(f"\nIntersection of selection methods with the {len(bt_selected)} pairs of "
+              f"{Path(args.compare).name}:")
+        for col in ("naive_05", "bh_05", "bh_10", "bonf_05"):
+            passed = set(tested[tested[col]].pair)
+            overlap = passed & bt_selected
+            only_method = passed - bt_selected
+            only_bt = bt_selected - passed
+            print(f"  {col:14s}  pass={len(passed):3d}  overlap={len(overlap):2d}  "
+                  f"only_method={len(only_method):2d}  only_compare={len(only_bt):2d}")
+        report_compare = {"compare_file": Path(args.compare).name, "n_compare": len(bt_selected)}
 
-    # ── Output: FDR-selected pair list ─────────────────────────────────────
-    fdr_pairs = tested[tested.bh_05]["pair"].tolist()
-    pd.DataFrame({"pair": fdr_pairs}).to_csv("data/pairs_fdr_bh05.csv", index=False)
-    print(f"\nSaved FDR (q=0.05) selected → data/pairs_fdr_bh05.csv  ({len(fdr_pairs)} pairs)")
+    # ── Output: the screen's pair list (role=screen_only) ──────────────────
+    screened = tested[tested.bh_05][["pair", "p_eg", "p_joh"]].assign(role=SCREEN_ONLY)
+    pairs_out = Path(args.pairs_out)
+    pairs_out.parent.mkdir(parents=True, exist_ok=True)
+    screened.to_csv(pairs_out, index=False)
+    print(f"\nSaved FDR (q=0.05) screen → {pairs_out}  ({len(screened)} pairs, role={SCREEN_ONLY}: "
+          "never a headline pairs file)")
 
     # Show full table
     print("\nP-value ranking (top 15):")
-    print(tested.sort_values("p_eg").head(15)[["pair","p_eg","p_joh","bh_05","bonf_05","in_bias_test"]].round(5).to_string(index=False))
+    cols = ["pair", "p_eg", "p_joh", "bh_05", "bonf_05"] + (["in_compare"] if args.compare else [])
+    print(tested.sort_values("p_eg").head(15)[cols].round(5).to_string(index=False))
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    train_span = [str(train.index.min().date()), str(train.index.max().date())]
     out.write_text(json.dumps({
+        "label":          label,
+        "pit":            asof is not None,
+        "role":           SCREEN_ONLY,
+        "candidates_file": name,
+        "candidates_sha256": hashlib.sha256(Path(args.candidates).read_bytes()).hexdigest(),
+        "closes_file":    Path(args.closes).name,
+        "cut":            cut,
+        "train_span":     train_span,
+        "train_days":     int(len(train)),
         "n_candidates":   len(cands),
         "n_tested":       int(df.p_eg.notna().sum()),
         "n_naive_05":     int(naive_05.sum()),
         "n_bh_05":        int(bh_05.sum()),
         "n_bh_10":        int(bh_10.sum()),
         "n_bonf_05":      int(bonf.sum()),
-        "n_bias_test":    len(bt_selected),
-    }, indent=2))
+        **report_compare,
+        "pvalues":        df.astype(object).where(df.notna(), None).to_dict(orient="records"),
+    }, indent=2, allow_nan=False))
     print(f"\nSaved → {out}")
+    print(label)
 
 
 if __name__ == "__main__":

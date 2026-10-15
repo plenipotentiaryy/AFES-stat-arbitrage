@@ -11,6 +11,12 @@ Pair tier overrides (see TIER_TABLE below):
 
 Borrow: per-pair annual rate × holding_days / 252.
 
+Audit T10 (R45): its summary ratios are exit-date ratios of the trades
+(each trade's PnL on its exit date, zeros on the other closes days of the
+trades' own span — from max(--split, the first OOS start) to the last exit,
+never into the final holdout), labelled "LEGACY exit-date ratio (full days) —
+not a Sharpe"; the one Sharpe is the daily MTM Sharpe of step3j_wfo_daily.py.
+
 CLI:
     python almgren_chriss_repricing.py --trades data/wfo_daily_results_fullrun.csv \\
         --closes data/closes_daily_extended_v2.csv --notional 100000
@@ -22,6 +28,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from mtm import trades_span_days
 
 
 # ─────────────────────── Per-leg tier table ──────────────────────────────────
@@ -113,10 +121,13 @@ def main():
     args = ap.parse_args()
 
     closes = pd.read_csv(args.closes, parse_dates=["Date"]).set_index("Date").sort_index()
-    oos = closes.loc[args.split:].index
     volumes = pd.read_csv(args.volumes, parse_dates=["Date"]).set_index("Date").sort_index()
 
     t = pd.read_csv(args.trades, parse_dates=["entry", "exit"])
+    # Audit T10 (R45): the series covers the trades' own span only — from the
+    # first OOS start (or entry) to the last exit, no zero-padding to the end
+    # of the closes file — and never reaches the final holdout.
+    oos = trades_span_days(closes.index, t, args.split)
     t["t1"] = t["pair"].str.split("-").str[0]
     t["t2"] = t["pair"].str.split("-").str[1]
 
@@ -202,8 +213,10 @@ def main():
     def stats(d, lbl):
         sh = d.mean()/d.std()*np.sqrt(252) if d.std() else float("nan")
         eq = d.cumsum(); dd = (eq - eq.cummax()).min()
-        return f"  {lbl:30s}  PnL={d.sum():+6.2f}  Sharpe={sh:+.3f}  DD={dd:+.3f}"
+        return (f"  {lbl:30s}  PnL={d.sum():+6.2f}  "
+                f"LEGACY exit-date ratio (full days) — not a Sharpe={sh:+.3f}  DD={dd:+.3f}")
     print()
+    print(f"Exit-date series: {oos.min().date()} → {oos.max().date()} ({len(oos)} closes days)")
     print(stats(d_old, "Original (flat 5bps/80bps)"))
     print(stats(d_new, "Almgren-Chriss tiered"))
 
@@ -219,7 +232,7 @@ def main():
     print(by_pair_tier.round(5).to_string())
 
     # ── Per-pair impact ────────────────────────────────────────────────────
-    print("\nPer-pair Sharpe impact (sub-block view):")
+    print("\nPer-pair PnL impact (sub-block view):")
     by_pair = (t.groupby("pair")
                  .apply(lambda g: pd.Series({
                      "n": len(g),
@@ -237,8 +250,10 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
-        "sharpe_original": float(sh_old),
-        "sharpe_almgren":  float(sh_new),
+        "series": "LEGACY exit-date booking — not a Sharpe",
+        "span": [str(oos.min().date()), str(oos.max().date())],
+        "legacy_exit_date_ratio_full_days_original": float(sh_old),
+        "legacy_exit_date_ratio_full_days_almgren":  float(sh_new),
         "pnl_original":    float(d_old.sum()),
         "pnl_almgren":     float(d_new.sum()),
         "pnl_delta":       float(d_new.sum() - d_old.sum()),

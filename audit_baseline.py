@@ -21,6 +21,14 @@ Output layout (under --out, default output/baseline/):
 CLI:
     python audit_baseline.py --trades data/wfo_daily_results_bias.csv \\
                               --split 2014-12-31 --out output/baseline/
+
+Audit T10 (R45): its ratios are exit-date ratios (each trade's PnL on its
+exit date, zeros on the other OOS closes days), "LEGACY exit-date ratio (full
+days) — not a Sharpe": key legacy_exit_date_ratio_full_days, per-pair column
+legacy_exit_date_ratio.  The one Sharpe is the daily MTM Sharpe of
+step3j_wfo_daily.py.  R47: the OOS calendar is the trades' own span (from
+max(--split, their first OOS start) to their last exit, not to the end of the
+closes file); trades exiting in the final holdout are refused.
 """
 from __future__ import annotations
 import argparse
@@ -29,6 +37,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from mtm import trades_span_days
 
 
 def portfolio_metrics(trades: pd.DataFrame, oos_index: pd.DatetimeIndex) -> dict:
@@ -41,7 +51,7 @@ def portfolio_metrics(trades: pd.DataFrame, oos_index: pd.DatetimeIndex) -> dict
     daily_full = daily.reindex(pd.DatetimeIndex(oos_index).normalize(), fill_value=0.0)
     mu = daily_full.mean()
     sd = daily_full.std()
-    sharpe = float(mu / sd * np.sqrt(252)) if sd > 0 else float("nan")
+    ratio = float(mu / sd * np.sqrt(252)) if sd > 0 else float("nan")     # not a Sharpe (T10)
     # Sortino: only downside std
     downside = daily_full[daily_full < 0]
     sortino = (float(mu / downside.std() * np.sqrt(252))
@@ -57,7 +67,7 @@ def portfolio_metrics(trades: pd.DataFrame, oos_index: pd.DatetimeIndex) -> dict
         "profit_factor":   float(wins / losses) if losses > 0 else float("inf"),
         "max_drawdown":    dd,
         "dd_over_pnl":     float(abs(dd) / pnl.sum()) if pnl.sum() != 0 else float("nan"),
-        "sharpe_full":     sharpe,
+        "legacy_exit_date_ratio_full_days": ratio,
         "sortino":         sortino,
         "calmar":          calmar,
         "avg_holding_bars": float(trades["held"].mean()),
@@ -84,7 +94,7 @@ def per_pair_summary(trades: pd.DataFrame, oos_index: pd.DatetimeIndex) -> pd.Da
             "win_rate":  (pnl > 0).mean(),
             "total_pnl": pnl.sum(),
             "max_dd":    dd,
-            "sharpe":    sr,
+            "legacy_exit_date_ratio": sr,
             "avg_hold":  grp["held"].mean(),
         })
     return pd.DataFrame(rows).sort_values("total_pnl", ascending=False)
@@ -175,8 +185,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     closes = pd.read_csv(args.closes, parse_dates=["Date"], usecols=["Date"])
-    oos_index = pd.DatetimeIndex(closes[closes["Date"] >= args.split]["Date"]).normalize()
     trades = pd.read_csv(args.trades, parse_dates=["entry", "exit"])
+    oos_index = trades_span_days(pd.DatetimeIndex(closes["Date"]).normalize(), trades, args.split)
 
     print(f"Loaded {len(trades)} trades; OOS calendar = {len(oos_index)} days.")
 

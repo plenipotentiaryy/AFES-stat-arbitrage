@@ -97,7 +97,11 @@ def load_baseline_pairs() -> pd.DataFrame:
             f"{BASELINE_PAIR_SUMMARY} not found. Run audit_baseline.py first."
         )
     df = pd.read_csv(BASELINE_PAIR_SUMMARY)
-    required = {"pair", "trades", "win_rate", "total_pnl", "max_dd", "sharpe"}
+    # audit_baseline.py names its exit-date ratio legacy_exit_date_ratio since audit T10
+    # (R45); summaries written before call it `sharpe`.  Either is read, the new name
+    # first (R47).  The output key stays `baseline_sharpe` (the owner's decision).
+    ratio_col = "legacy_exit_date_ratio" if "legacy_exit_date_ratio" in df.columns else "sharpe"
+    required = {"pair", "trades", "win_rate", "total_pnl", "max_dd", ratio_col}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"{BASELINE_PAIR_SUMMARY} missing columns: {sorted(missing)}")
@@ -121,7 +125,7 @@ def load_baseline_pairs() -> pd.DataFrame:
             "baseline_win_rate": float(row.win_rate),
             "baseline_total_pnl": float(row.total_pnl),
             "baseline_max_dd": float(row.max_dd),
-            "baseline_sharpe": float(row.sharpe),
+            "baseline_sharpe": float(getattr(row, ratio_col)),
             "rationale": "Audited baseline same-sector relationship.",
         })
     return pd.DataFrame(rows)

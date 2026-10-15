@@ -7,12 +7,18 @@ This computes:
   2. iid bootstrap CI (resample days with replacement)
   3. Block bootstrap CI (preserve autocorrelation, block_size=5 days)
   4. Probabilistic Sharpe Ratio (PSR) — probability Sharpe > 0
+
+Audit T10: the PSR is `perf_stats.psr` on the per-period (daily) Sharpe; the
+annualised target is converted to a daily one (target / √252).  The script
+body runs only as a script (importing it reads nothing).
 """
+
+import math
 
 import pandas as pd
 import numpy as np
-from scipy import stats
 from config import INITIAL_CAPITAL, DATA_DIR
+from perf_stats import psr as per_period_psr
 
 N_BOOT = 10_000
 BLOCK_SIZE = 5         # trading days per block (captures weekly autocorrelation)
@@ -62,63 +68,61 @@ def block_bootstrap(returns, block_size=BLOCK_SIZE, n_boot=N_BOOT):
 
 
 def probabilistic_sharpe(returns, target=TARGET_SHARPE):
-    """Bailey & López de Prado (2014) — P(Sharpe > target | observed)."""
-    sh = sharpe(returns)
-    n  = len(returns)
-    if n < 3: return 0.5
-    skew = stats.skew(returns)
-    kurt = stats.kurtosis(returns, fisher=False)
-    # Asymptotic distribution of Sharpe under null
-    se = np.sqrt((1 - skew*sh + (kurt-1)/4 * sh**2) / (n - 1))
-    if se == 0: return 1.0 if sh > target else 0.0
-    z = (sh - target) / se
-    return float(stats.norm.cdf(z))
+    """Bailey & López de Prado (2014) — P(annualised Sharpe > target | observed):
+    `perf_stats.psr` on the per-period Sharpe against target / √252 (the
+    formula is per period; before audit T10 the annualised Sharpe went in)."""
+    return per_period_psr(returns, target / math.sqrt(252))
 
 
-for label, path in [("Base (all trades)", DATA_DIR / "trades.csv"),
-                    ("Capped (max-7)",   DATA_DIR / "trades_capped.csv")]:
-    if not path.exists(): continue
-    ret = load_daily_returns(path)
-    sh  = sharpe(ret)
+def main():
+    for label, path in [("Base (all trades)", DATA_DIR / "trades.csv"),
+                        ("Capped (max-7)",   DATA_DIR / "trades_capped.csv")]:
+        if not path.exists(): continue
+        ret = load_daily_returns(path)
+        sh  = sharpe(ret)
 
-    print(f"\n{'='*60}")
-    print(f"{label}  —  {path.name}")
-    print(f"{'='*60}")
-    print(f"Active days:   {len(ret)}")
-    print(f"Sharpe (point):  {sh:.3f}")
+        print(f"\n{'='*60}")
+        print(f"{label}  —  {path.name}")
+        print(f"{'='*60}")
+        print(f"Active days:   {len(ret)}")
+        print(f"Sharpe (point):  {sh:.3f}")
 
-    # iid bootstrap
-    sh_iid = iid_bootstrap(ret)
-    iid_lo, iid_md, iid_hi = np.percentile(sh_iid, [5, 50, 95])
-    print(f"\n  iid bootstrap (n={N_BOOT}):")
-    print(f"    5%   = {iid_lo:+.3f}")
-    print(f"    50%  = {iid_md:+.3f}")
-    print(f"    95%  = {iid_hi:+.3f}")
-    print(f"    P(Sharpe > 0): {(sh_iid > 0).mean()*100:.1f}%")
-    print(f"    P(Sharpe > 1): {(sh_iid > 1).mean()*100:.1f}%")
+        # iid bootstrap
+        sh_iid = iid_bootstrap(ret)
+        iid_lo, iid_md, iid_hi = np.percentile(sh_iid, [5, 50, 95])
+        print(f"\n  iid bootstrap (n={N_BOOT}):")
+        print(f"    5%   = {iid_lo:+.3f}")
+        print(f"    50%  = {iid_md:+.3f}")
+        print(f"    95%  = {iid_hi:+.3f}")
+        print(f"    P(Sharpe > 0): {(sh_iid > 0).mean()*100:.1f}%")
+        print(f"    P(Sharpe > 1): {(sh_iid > 1).mean()*100:.1f}%")
 
-    # Block bootstrap
-    sh_blk = block_bootstrap(ret)
-    blk_lo, blk_md, blk_hi = np.percentile(sh_blk, [5, 50, 95])
-    print(f"\n  block bootstrap (block={BLOCK_SIZE}d):")
-    print(f"    5%   = {blk_lo:+.3f}")
-    print(f"    50%  = {blk_md:+.3f}")
-    print(f"    95%  = {blk_hi:+.3f}")
-    print(f"    P(Sharpe > 0): {(sh_blk > 0).mean()*100:.1f}%")
-    print(f"    P(Sharpe > 1): {(sh_blk > 1).mean()*100:.1f}%")
+        # Block bootstrap
+        sh_blk = block_bootstrap(ret)
+        blk_lo, blk_md, blk_hi = np.percentile(sh_blk, [5, 50, 95])
+        print(f"\n  block bootstrap (block={BLOCK_SIZE}d):")
+        print(f"    5%   = {blk_lo:+.3f}")
+        print(f"    50%  = {blk_md:+.3f}")
+        print(f"    95%  = {blk_hi:+.3f}")
+        print(f"    P(Sharpe > 0): {(sh_blk > 0).mean()*100:.1f}%")
+        print(f"    P(Sharpe > 1): {(sh_blk > 1).mean()*100:.1f}%")
 
-    # Probabilistic Sharpe Ratio
-    psr = probabilistic_sharpe(ret, target=0.0)
-    psr_1 = probabilistic_sharpe(ret, target=1.0)
-    print(f"\n  Probabilistic SR (PSR, López de Prado):")
-    print(f"    PSR(0): {psr*100:.1f}%   ← prob strategy is not a fluke")
-    print(f"    PSR(1): {psr_1*100:.1f}%   ← prob real Sharpe ≥ 1.0")
+        # Probabilistic Sharpe Ratio
+        psr = probabilistic_sharpe(ret, target=0.0)
+        psr_1 = probabilistic_sharpe(ret, target=1.0)
+        print(f"\n  Probabilistic SR (PSR, López de Prado):")
+        print(f"    PSR(0): {psr*100:.1f}%   ← prob strategy is not a fluke")
+        print(f"    PSR(1): {psr_1*100:.1f}%   ← prob real Sharpe ≥ 1.0")
 
-    # Verdict
-    print(f"\n  Verdict:")
-    if blk_lo > 1:
-        print("    ✓ STRONG — even worst case (5% CI) gives Sharpe > 1")
-    elif blk_lo > 0:
-        print("    ~ MODERATE — Sharpe > 0 likely, but margin is thin")
-    else:
-        print("    ✗ WEAK — 5% CI includes negative Sharpe, may be luck")
+        # Verdict
+        print(f"\n  Verdict:")
+        if blk_lo > 1:
+            print("    ✓ STRONG — even worst case (5% CI) gives Sharpe > 1")
+        elif blk_lo > 0:
+            print("    ~ MODERATE — Sharpe > 0 likely, but margin is thin")
+        else:
+            print("    ✗ WEAK — 5% CI includes negative Sharpe, may be luck")
+
+
+if __name__ == "__main__":
+    main()

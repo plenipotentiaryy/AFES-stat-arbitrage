@@ -16,6 +16,15 @@ observed edge under three different uncertainty models:
    avoids Gaussian assumptions and asks how the system behaves if the realised
    future contains more tail days than the historical sample.
 
+Series (audit T10): the run's daily mark-to-market PnL (wfo_daily_mtm<tag>.csv,
+written by step3j_wfo_daily.py; audit T4), checked against the run's meta
+sidecar; --legacy-exit-date-pnl: the pre-audit exit-date booking, labelled
+LEGACY (its ratio is not a Sharpe).  The trade permutation reorders trades,
+not days: it reports drawdowns and PnL of the trade sequence, no Sharpe (a
+per-trade ratio is not one, and a permutation leaves it unchanged).  The
+resampling tests measure sampling uncertainty only — they cannot detect a
+bias of the series they resample.
+
 Outputs:
     output/monte_carlo_robustness_report.json
     data/monte_carlo_robustness_sims.csv
@@ -30,11 +39,9 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-
-def sharpe(x: np.ndarray) -> float:
-    x = np.asarray(x, dtype=float)
-    sd = x.std(ddof=1)
-    return float(x.mean() / sd * np.sqrt(252)) if sd > 0 else float("nan")
+from mtm import (LEGACY_LABEL, LEGACY_RATIO, SAMPLING_LABEL, add_series_args, check_dates, check_from,
+                 check_run, meta_path, mtm_pnl, run_meta, span_line)
+from perf_stats import portfolio_sharpe_or_nan
 
 
 def max_drawdown(x: np.ndarray) -> float:
@@ -83,7 +90,7 @@ def stationary_indices(n: int, mean_block: float, rng: np.random.Generator) -> n
 def summarize_sample(x: np.ndarray) -> dict:
     return {
         "pnl": float(np.sum(x)),
-        "sharpe": sharpe(x),
+        "sharpe": portfolio_sharpe_or_nan(x),      # the one Sharpe; NaN if undefined
         "max_drawdown": max_drawdown(x),
         "profit_factor": profit_factor(x),
         "worst_day": float(np.min(x)) if len(x) else 0.0,
@@ -104,11 +111,13 @@ def mc_stationary_block(daily: np.ndarray, reps: int, block: float,
 
 def mc_trade_permutation(trade_pnls: np.ndarray, reps: int,
                          rng: np.random.Generator) -> pd.DataFrame:
+    """Trade sequences, not days: no Sharpe (rule 4), NaN in its column."""
     rows = []
     n = len(trade_pnls)
     for rep in range(reps):
         sample = trade_pnls[rng.permutation(n)]
-        rows.append({"mc_type": "trade_permutation", "rep": rep, **summarize_sample(sample)})
+        rows.append({"mc_type": "trade_permutation", "rep": rep,
+                     **summarize_sample(sample), "sharpe": float("nan")})
     return pd.DataFrame(rows)
 
 
@@ -196,10 +205,22 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", default="output/monte_carlo_robustness_report.json")
     parser.add_argument("--csv-out", default="data/monte_carlo_robustness_sims.csv")
+    add_series_args(parser)
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    daily = daily_pnl_series(args.trades, args.closes, args.split)
+    legacy = args.legacy_exit_date_pnl
+    if legacy:
+        meta = check_run(args.trades, args.meta, closes=args.closes)
+        daily = daily_pnl_series(args.trades, args.closes, None)   # first → last exit
+        check_from(daily.index, args.split, "--split")              # the whole run (R46)
+        check_dates(daily.index, meta, args.meta or meta_path(args.trades))
+        print(f"series: {LEGACY_LABEL}")
+        print(span_line(daily.index, "closes days" if args.closes else "business days"))
+    else:
+        daily = mtm_pnl(args)
+        check_from(daily.index, args.split, "--split")              # the whole run (R46)
+    sh_name = LEGACY_RATIO if legacy else "Sharpe"
     trades = pd.read_csv(args.trades)
     trade_pnls = pd.to_numeric(trades["pnl"], errors="coerce").dropna().to_numpy(dtype=float)
 
@@ -207,11 +228,11 @@ def main() -> None:
     observed["n_days"] = int(len(daily))
     observed["n_trades"] = int(len(trade_pnls))
 
-    print("AFES MONTE CARLO ROBUSTNESS")
+    print(f"AFES MONTE CARLO ROBUSTNESS — {SAMPLING_LABEL}")
     print(f"  trades:       {args.trades}")
     print(f"  days/trades:  {observed['n_days']} / {observed['n_trades']}")
     print(f"  observed PnL: {observed['pnl']:+.4f}")
-    print(f"  observed Sh:  {observed['sharpe']:+.3f}")
+    print(f"  observed {sh_name}: {observed['sharpe']:+.3f}")
     print(f"  observed DD:  {observed['max_drawdown']:+.4f}")
     print()
 
@@ -228,14 +249,25 @@ def main() -> None:
     )
     sims = pd.concat([block_df, perm_df, evt_df], ignore_index=True)
 
-    summary = {"observed": observed, "evt_fit": evt_fit, "mc": {}}
+    if legacy:            # the exit-date ratio is not a Sharpe (rule 4)
+        observed["legacy_exit_date_ratio"] = observed.pop("sharpe")
+    meta = run_meta(args)
+    summary = {"label": SAMPLING_LABEL,
+               "series": "LEGACY exit-date booking — not a Sharpe" if legacy else "daily mark-to-market",
+               "headline": meta.get("headline") is True,
+               "observed": observed, "evt_fit": evt_fit, "mc": {}}
+    sh_key = "legacy_exit_date_ratio" if legacy else "sharpe"
     for mc_type, grp in sims.groupby("mc_type"):
+        daily_series = mc_type != "trade_permutation"
+        metrics = ["pnl", *(["sharpe"] if daily_series else []), "max_drawdown", "profit_factor",
+                   "worst_day", "cvar_1pct"]
         summary["mc"][mc_type] = {
-            metric: distribution_summary(grp, metric)
-            for metric in ["pnl", "sharpe", "max_drawdown", "profit_factor", "worst_day", "cvar_1pct"]
+            (sh_key if metric == "sharpe" else metric): distribution_summary(grp, metric)
+            for metric in metrics
         }
-        summary["mc"][mc_type]["prob_sharpe_lt_0"] = float((grp["sharpe"] < 0).mean())
-        summary["mc"][mc_type]["prob_sharpe_lt_1"] = float((grp["sharpe"] < 1.0).mean())
+        if daily_series:
+            summary["mc"][mc_type][f"prob_{sh_key}_lt_0"] = float((grp["sharpe"] < 0).mean())
+            summary["mc"][mc_type][f"prob_{sh_key}_lt_1"] = float((grp["sharpe"] < 1.0).mean())
         summary["mc"][mc_type]["prob_pnl_lt_0"] = float((grp["pnl"] < 0).mean())
         summary["mc"][mc_type]["prob_dd_worse_than_observed"] = float(
             (grp["max_drawdown"] < observed["max_drawdown"]).mean()
@@ -244,19 +276,25 @@ def main() -> None:
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.csv_out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(summary, indent=2))
-    sims.to_csv(args.csv_out, index=False)
+    sims.rename(columns={"sharpe": sh_key}).to_csv(args.csv_out, index=False)
 
     for mc_type in ["stationary_block", "trade_permutation", "evt_tail_injection"]:
         grp = sims[sims["mc_type"].eq(mc_type)]
-        sh = distribution_summary(grp, "sharpe")
         dd = distribution_summary(grp, "max_drawdown")
         pnl = distribution_summary(grp, "pnl")
         print(mc_type)
-        print(f"  Sharpe p05/p50/p95: {sh['p05']:+.3f} / {sh['p50']:+.3f} / {sh['p95']:+.3f}")
+        if mc_type == "trade_permutation":
+            print("  ratio: none — trade sequences, not days (a per-trade ratio is not a Sharpe)")
+        else:
+            sh = distribution_summary(grp, "sharpe")
+            print(f"  {sh_name} p05/p50/p95: {sh['p05']:+.3f} / {sh['p50']:+.3f} / {sh['p95']:+.3f}")
         print(f"  PnL    p05/p50/p95: {pnl['p05']:+.3f} / {pnl['p50']:+.3f} / {pnl['p95']:+.3f}")
-        print(f"  DD     p05/p50/p95: {dd['p05']:+.3f} / {dd['p50']:+.3f} / {dd['p95']:+.3f}")
-        print(f"  P(Sh<1): {summary['mc'][mc_type]['prob_sharpe_lt_1']:.1%}  "
-              f"P(PnL<0): {summary['mc'][mc_type]['prob_pnl_lt_0']:.1%}")
+        print(f"  DD     p05/p50/p95: {dd['p05']:+.3f} / {dd['p50']:+.3f} / {dd['p95']:+.3f}"
+              + ("  (trade order)" if mc_type == "trade_permutation" else ""))
+        if mc_type != "trade_permutation":
+            print(f"  P({'ratio' if legacy else 'Sharpe'}<1): "
+                  f"{summary['mc'][mc_type][f'prob_{sh_key}_lt_1']:.1%}", end="  ")
+        print(f"P(PnL<0): {summary['mc'][mc_type]['prob_pnl_lt_0']:.1%}")
         print()
 
     print("EVT fit")

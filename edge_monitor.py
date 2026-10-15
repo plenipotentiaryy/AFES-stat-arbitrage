@@ -14,6 +14,12 @@ Rules (from §9):
     SR_3m < 0     →  leverage  0.50   (deteriorating)
     SR_6m < 0     →  leverage  0.00   (stop new entries until reviewed)
 
+Series (audit T10): a daily WFO run's mark-to-market PnL (wfo_daily_mtm<tag>.csv,
+written by step3j_wfo_daily.py; audit T4), checked against the run's meta
+sidecar, so SR_3m / SR_6m are rolling Sharpe ratios of the daily MTM returns.
+--legacy-exit-date-pnl: the pre-audit exit-date booking up to the run's end,
+labelled LEGACY (its rolling ratios are not Sharpe ratios).
+
 CLI:
     python edge_monitor.py --trades data/wfo_daily_results_bias.csv \\
                             --start 2014-12-31 --out output/edge_monitor.csv
@@ -26,11 +32,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
-def daily_pnl(trades: pd.DataFrame, oos_index: pd.DatetimeIndex) -> pd.Series:
-    """Sum trade PnL by exit-date, reindexed across the full OOS calendar."""
-    daily = trades.groupby(pd.to_datetime(trades["exit"]).dt.normalize())["pnl"].sum()
-    return daily.reindex(pd.DatetimeIndex(oos_index).normalize(), fill_value=0.0)
+from mtm import LEGACY_RATIO, add_series_args, check_from, legacy_exit_date_pnl, mtm_pnl
 
 
 def rolling_sharpe(pnl: pd.Series, days: int) -> pd.Series:
@@ -68,13 +70,17 @@ def main():
     p.add_argument("--start",  default="2014-12-31")
     p.add_argument("--out",    default="output/edge_monitor.csv")
     p.add_argument("--alerts", default="output/edge_monitor_alerts.json")
+    add_series_args(p)
     args = p.parse_args()
 
-    closes = pd.read_csv(args.closes, parse_dates=["Date"], usecols=["Date"])
-    oos = pd.DatetimeIndex(closes[closes["Date"] >= args.start]["Date"]).normalize()
-    trades = pd.read_csv(args.trades, parse_dates=["entry", "exit"])
-
-    pnl_daily = daily_pnl(trades, oos)
+    if args.legacy_exit_date_pnl:
+        pnl_daily = legacy_exit_date_pnl(args, args.closes, start=args.start, option="--start")
+        sr = f"{LEGACY_RATIO}, rolling"
+    else:
+        pnl_daily = mtm_pnl(args)
+        check_from(pnl_daily.index, args.start, "--start")   # the whole run (R46)
+        sr = "rolling Sharpe of the daily MTM"
+    oos = pnl_daily.index
     sr_3m = rolling_sharpe(pnl_daily, 63)    # ~3 months
     sr_6m = rolling_sharpe(pnl_daily, 126)   # ~6 months
     dd_3m = rolling_dd(pnl_daily, 63)
@@ -115,8 +121,8 @@ def main():
 
     # Summary
     print(f"Edge monitor over {len(oos)} OOS days")
-    print(f"  current SR_3m:       {sr_3m.iloc[-1]:+.3f}")
-    print(f"  current SR_6m:       {sr_6m.iloc[-1]:+.3f}")
+    print(f"  current SR_3m:       {sr_3m.iloc[-1]:+.3f}   ({sr}, 63 days)")
+    print(f"  current SR_6m:       {sr_6m.iloc[-1]:+.3f}   ({sr}, 126 days)")
     print(f"  current leverage:    {lev.iloc[-1]:.2f}")
     print(f"  alerts triggered:    {len(alerts)}")
     print(f"  days at full lev:    {(lev == 1.0).sum()}  ({(lev == 1.0).mean()*100:.0f}%)")

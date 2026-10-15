@@ -59,6 +59,15 @@ def portfolio_sharpe(daily_returns) -> float:
     return sharpe_per_period(daily_returns) * math.sqrt(PERIODS_PER_YEAR)
 
 
+def portfolio_sharpe_or_nan(daily_returns) -> float:
+    """`portfolio_sharpe`, or NaN where it is undefined (fewer than 2 returns,
+    NaN, a constant series) — for resampled series (audit T10)."""
+    try:
+        return portfolio_sharpe(daily_returns)
+    except ValueError:
+        return float("nan")
+
+
 def psr(returns, sr_benchmark: float = 0.0) -> float:
     """Probabilistic Sharpe Ratio: P(true per-period SR > sr_benchmark) given the
     observed per-period SR̂, T, skewness γ₃ and raw kurtosis γ₄ of `returns`."""
