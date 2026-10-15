@@ -391,10 +391,13 @@ def check_run(trades_path: str, meta_file: str | None = None, *, mtm_file: str |
     if index is not None:
         check_dates(index, meta, meta_file, run_span(meta, trades_path))
     check_hashes(meta, meta_file, trades=trades_path, mtm=mtm_file, closes=closes)
-    print(f"run: {meta_file} (config {str(meta.get('config_hash'))[:12]}…): "
-          + ("HEADLINE RUN" if meta.get("headline") is True else
-             "NON-HEADLINE RUN (not a frozen point-in-time universe, or legacy options: "
-             "see the run's banner)"))
+    # Final review R49: the headline line names the run's cost model (an
+    # older sidecar without it: the line as before).
+    label = (meta.get("cost_model") or {}).get("label")
+    status = (("HEADLINE RUN" + (f" ({label})" if label else "")) if meta.get("headline") is True
+              else "NON-HEADLINE RUN (not a frozen point-in-time universe, legacy options, costs "
+                   "below the defaults or a comparison cost model: see the run's banner)")
+    print(f"run: {meta_file} (config {str(meta.get('config_hash'))[:12]}…): {status}")
     return meta
 
 

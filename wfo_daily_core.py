@@ -259,8 +259,10 @@ def entry_decision(i: int, zi: float, n: int, entry_z: float,
     function of the bar for the vol-tight stop — so a jump past the stop is no
     entry; legacy_no_entry_guards: any |z| > entry_z); size_gate(i, side)
     (MetaGate size multiplier, ≤ 0: no entry); the fill bar — bar i+1 (legacy
-    same_close: bar i), none past the data; exec_ok[i] False (VWAP mode: no
-    VWAP spread for the fill): not filled.
+    same_close: bar i), none past the data; exec_ok[i] False (legacy
+    same_close VWAP mode only: no VWAP spread for the fill): not filled.
+    Final review R51: otherwise no entry depends on whether bar i+1 has a
+    VWAP — that fill falls back to the close (`leg_fill_prices`).
     """
     if vr is not None:
         vri = vr[i]
@@ -404,11 +406,12 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     Fills (audit T1): an entry or exit decided on bar i (a row of
     spread_full; the decision uses data up to bar i) fills on bar i+1, at
     its close or, with exec_spread, at exec_spread[i] (the VWAP of bar i+1;
-    an exit whose VWAP is NaN fills at the close of bar i+1).  The holding
-    period and borrow start at the entry fill; entry/exit are the fill
-    dates, entry_signal/exit_signal the decision dates.  No bar i+1: an
-    entry is not filled; an exit fills at the close of bar i with reason
-    "end_of_data".
+    an entry or exit whose VWAP is NaN fills at the close of bar i+1 — for
+    the entry since R51; legacy_same_close: an entry without one is not
+    filled).  The holding period and borrow start at the entry fill;
+    entry/exit are the fill dates, entry_signal/exit_signal the decision
+    dates.  No bar i+1: an entry is not filled; an exit fills at the close
+    of bar i with reason "end_of_data".
     decision_end: no entry, exit or CUSUM decision on bars after this date
                   (fill-only bars).
     legacy_same_close: pre-audit fills on the deciding bar itself.
@@ -424,9 +427,9 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
     leg-1 notional) are fixed, and gross = side·(q1·(P1_exit − P1_entry) −
     q2·(P2_exit − P2_entry)) at the exit-fill prices.  exec_leg_prices (with
     exec_spread): each leg's VWAP of bar i+1 on row i; a leg fills at its
-    VWAP, an exit leg without one at its close (an entry without a VWAP
-    spread is not filled, as above).  Without leg_prices (legacy): gross =
-    side·(exit_spread − entry_spread).
+    VWAP, a leg without one at its close (entry and exit, R51;
+    legacy_same_close: an entry without a VWAP spread is not filled).
+    Without leg_prices (legacy): gross = side·(exit_spread − entry_spread).
 
     Costs (audit T8, `trade_charges`): leg_costs — each fill of each leg at
     its rate × the leg's notional at the fill, borrow on the short legs'
@@ -518,7 +521,10 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
 
     # CUSUM on every bar (train+oos) so the test is informed: the break bar.
     cusum_at = cusum_break_row(z_vals, 0, n_decide, cusum_h) if cusum_h is not None else None
-    exec_ok_vals = pd.notna(exec_vals) if exec_vals is not None else None
+    # Final review R51: an entry decided on bar i does not depend on whether
+    # bar i+1 has a VWAP (only the legacy same-close path keeps that gate).
+    exec_ok_vals = (pd.notna(exec_vals) if exec_vals is not None and legacy_same_close
+                    else None)
     mg_gate = None
     if metagate is not None and metagate.usable and hurst_series is not None:
         def mg_gate(i: int, side: int) -> float:
@@ -556,8 +562,9 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             # Gates, z threshold, MetaGate and fill bar (entry_decision).  With
             # exec_spread the fill is the next-day VWAP: exec_spread[i] holds
             # the spread realised by an order entered at the end of bar i (the
-            # VWAP of bar i+1); NaN → not filled.  Otherwise the close of bar
-            # i+1 (audit T1); legacy_same_close: the close of bar i.
+            # VWAP of bar i+1); NaN → the close of bar i+1 (R51; legacy
+            # same-close: not filled).  Otherwise the close of bar i+1 (audit
+            # T1); legacy_same_close: the close of bar i.
             entry = entry_decision(i, zi, n, entry_z, vr_vals, vr_min, panic_vals,
                                    panic_size_mult, blackout_vals, mg_gate, exec_ok_vals,
                                    legacy_same_close, stop_at, legacy_no_entry_guards)
@@ -566,7 +573,8 @@ def backtest_pair(spread_full: pd.Series, oos_start, oos_end,
             side, entry_size, fill_idx = entry
             in_pos = True
             entry_idx = fill_idx
-            entry_spread = exec_vals[i] if exec_spread is not None else sp_vals[fill_idx]
+            entry_spread = (exec_vals[i] if exec_spread is not None and pd.notna(exec_vals[i])
+                            else sp_vals[fill_idx])
             entry_sig = i
             # Audit T2: quantities fixed at the entry fill, with β of this decision bar.
             p1e, p2e = legs_at(fill_idx, i if exec_spread is not None else None)
@@ -625,7 +633,6 @@ class PairWindow:
     vr: np.ndarray | None = None         # --vwz liquidity ratio: no entry below vr_min
     panic: np.ndarray | None = None      # macro-HMM panic flags
     panic_size_mult: float = 0.0         # 0: no entry in panic; > 0: entry size in panic
-    exec_ok: np.ndarray | None = None    # VWAP mode: False = an entry decided on the row is not filled
     spread: pd.Series | None = None      # s_w, for the vol-tight stop (static path)
     cusum_break: int | None = None       # row where the window's CUSUM breaks
 
@@ -656,7 +663,8 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
     starting window whose OOS [oos_s, oos_e) contains the row; none in a gap
     or in a window where the pair is not eligible — decided on w's z and
     gates exactly as in `backtest_pair`, filled on row i+1 (exec_leg_vals: each
-    leg's VWAP of the next row on row i, with pair_windows[w].exec_ok), with
+    leg's VWAP of the next row on row i; a leg without one fills at its close,
+    R51), with
     q1 = 1/P1, q2 = β_e/P2 and β_e = β_w (kalman_beta: β of the decision row).
     Only entry_z < |z| < the trade's stop enters (audit T7, `entry_decision`;
     legacy_no_entry_guards: any |z| > entry_z).
@@ -750,7 +758,7 @@ def backtest_pair_continuous(idx: pd.DatetimeIndex, leg_vals: np.ndarray, n_deci
         if pd.isna(zi):
             continue
         entry = entry_decision(i, zi, n, pw.entry_z, pw.vr, vr_min, pw.panic,
-                               pw.panic_size_mult, pw.blackout, exec_ok=pw.exec_ok,
+                               pw.panic_size_mult, pw.blackout,
                                stop_z=lambda j: stop_at(j, pw.spread),
                                legacy_no_entry_guards=legacy_no_entry_guards)
         if entry is None:
@@ -1276,10 +1284,11 @@ def apply_quarterly_rotation(trades: pd.DataFrame,
     """Per-pair quarterly rescaling and drop policy (§5 of upgrade spec).
 
     For each trade, look at the pair's CLOSED trades that ended strictly
-    before this trade's entry. Compute realised Sharpe over the last 6
+    before this trade's entry. Compute the realised per-trade ratio (mean /
+    std of trade PnL × √252; a sizing input, not a Sharpe) over the last 6
     months of those closed trades, apply Bayesian shrinkage, derive an
-    S_perf size multiplier, and drop the trade entirely if 6m-Sharpe of
-    the pair stays below `drop_sr6m_below`.
+    S_perf size multiplier, and drop the trade entirely if the pair's 6m
+    per-trade ratio stays below `drop_sr6m_below`.
     """
     if trades.empty:
         return trades
@@ -1337,7 +1346,8 @@ def pair_momentum(trades: pd.DataFrame, n_lookback: int = 10,
     PnL of the pair's last n_lookback earlier trades — audit T9: those whose
     exit filled by this trade's entry decision (legacy_open_trades,
     legacy_sizing_lookahead: every earlier-entered one, open or not) — the
-    Sharpe sh = mean / std (≥ 3 trades and std > 0, else multiplier 1) →
+    per-trade ratio sh = mean / std (not a Sharpe; ≥ 3 trades and std > 0,
+    else multiplier 1) →
     clip(1 + sh/4, 0.5, 1.5)."""
     adjusted = []
     for pair, grp in trades.sort_values("entry").groupby("pair"):
@@ -1486,7 +1496,7 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 def exit_z_of(b: float) -> np.ndarray:
                     return rolling_z(log1 - b * log2).to_numpy()
 
-        vw = exec_legs = None
+        exec_legs = None
         if (vwap_daily is not None and not cfg.kalman and not cfg.vwz
                 and t1 in vwap_daily.columns and t2 in vwap_daily.columns):
             vw = vwap_daily.loc[rows.min():rows.max(), [t1, t2]].reindex(rows)
@@ -1526,11 +1536,9 @@ def continuous_trades(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                         bo = np.zeros(len(rows), dtype=bool)
                         bo[:n_w] = aussie_blackout_series(sp.iloc[:n_w]).to_numpy()
                         blackout = bo if no_entry is None else (bo | no_entry)
-                    exec_ok = (None if vw is None else
-                               (np.log(vw[t1]) - beta * np.log(vw[t2])).shift(-1).notna().to_numpy())
                     p = PairWindow(beta=beta, z=rolling_z(sp).to_numpy(), entry_z=entry_z,
                                    cost=cost, borrow=borrow, leg_costs=leg_costs, blackout=blackout,
-                                   panic=panic, panic_size_mult=ctx.panic_size_mult, exec_ok=exec_ok,
+                                   panic=panic, panic_size_mult=ctx.panic_size_mult,
                                    spread=sp)
             if cfg.cusum is not None:
                 # The window's CUSUM on its z over its decision rows [tr_s, oos_e].
@@ -2166,7 +2174,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         n_before = len(trades)
         trades = apply_quarterly_rotation(trades)
         print(f"  → rotation: kept {len(trades)}/{n_before} trades after "
-              "Sharpe-based pair drop + per-trade S_perf rescaling")
+              "per-trade-ratio pair drop + per-trade S_perf rescaling")
 
     # ── Portfolio vol targeting (Option B §7) ─────────────────────────────
     if cfg.voltarget > 0:

@@ -29,7 +29,7 @@ flag. The CLI prints the `NON-HEADLINE RUN` banner and `headline=False`.
 |---|---|
 | command (cwd `output/audit_runs/t11/`, `data/` = symlinks to the owner's `data/`) | `python step3j_wfo_daily.py --pairs pairs_bias_test.csv --closes closes_daily_extended_v2.csv --start 2014-12-31 --end 2023-12-31 --tag t11_default` (the default model is flat) |
 | comparison run | the same + `--execution-model almgren --tag t11_almgren` |
-| git | both runs on `f5af875` (T10), clean tree (sidecar `git_revision` `f5af875f379d…` without `+dirty`). This file is added by the T11 commit on top of `f5af875`; no code changed in T11. |
+| git | both runs on `f5af875` (T10), clean tree (sidecar `git_revision` `f5af875f379d…` without `+dirty`). This file is added by the T11 commit on top of `f5af875`; no code changed in T11. The final-review commit `fix(review): Final whole-branch review fixes` changes code (R49–R52: the HEADLINE marker's cost rule, `--exec vwap` entries, labels, cut tests) but no default output: the default configuration re-run once on it has the same config hash and byte-identical trades, MTM and per-pair MTM files (`output/audit_runs/final/`, one more `TRIALS.csv` row, N unchanged; `AUDIT_FIX_LOG.md`, "Final review fixes"). |
 | universe SHA-256 | **n/a — no PIT universe** |
 | pairs file | `data/pairs_bias_test.csv`, 36 pairs → 26 US-only pairs after the T2 policy; SHA-256 `1790dd9ee45fed48e32385d0e3dc8755c5ba2bb34fcb55d5f34bcbb808ccce91` (equal to the value recorded at T5; a hindsight file, not a frozen universe) |
 | closes / volumes | `closes_daily_extended_v2.csv` SHA-256 `b4a47bc6995c21a9527fcdfc3919d472a8dfc1dbc68f5eab1a3b3186af2a662e` (also in the sidecar); `volumes_daily.csv` SHA-256 `c2b798c60c5eb1693d591f91179567fa5f4065046622930c26b38ea83199bc6a` (stale-print mask; almgren ADV) |
@@ -161,6 +161,12 @@ the statistic is the pre-audit exit-date ratio (PnL booked on exit dates, panel 
 | T9 remaining look-ahead (default trades unchanged), T10 outputs (no engine change) | 26 | 1166 | +0.278 | +0.367 | unchanged | −4.50% |
 | **T11 final runs (this file)** | 26 | 1166 | **+0.278** | +0.367 | daily MTM Sharpe | −4.50% |
 
+The documented 3.73 is `wfo_daily_results_fullrun.csv`: flat costs over the full span, which runs into
+what is now the final holdout; its first 34 windows are the +3.853 above (the pre-audit code's golden
+run; the T8 code with every legacy flag reproduces it cell for cell), and the documented command, which
+then defaulted to almgren, gives +3.392 (`AUDIT_FIX_LOG.md` T8, reproduction note; nothing was run on
+dates from 2024).
+
 Steps that lowered the number:
 - **T1**: the pre-audit code filled at the close that made the signal (3.853 → 0.809 flat).
 - **T3**: positions open at a window end used to be dropped; on these pairs they lost on average
@@ -216,10 +222,20 @@ pre-audit async panel builder; `fixed` = the corrected defaults.
 - Truncation invariance: `test_truncation_invariance` runs both variants on `independent_rw`,
   `async_lag15_hol5` and `ou_positive_control`, cut at the middle date. Every entry and exit decided
   before the cut is identical to the full run's, and all six cases pass. The per-flag tests of T9 (cut and different future)
-  pass for `--ivol --volvol --pairmom --rotation --voltarget --cusum --aussie-filter --kalman --hmm block-panic`.
-  `--metagate` and `--hrp` have no such test and are refused in a headline run.
+  pass for `--ivol --volvol --pairmom --rotation --voltarget --cusum --aussie-filter --kalman --hmm block-panic`,
+  and since the final review (R50) for the six options a headline run may use: `--maxconc`, `--ticker-overlap`,
+  `--per-pair-quarter-cap`, `--vol-tight-stop`, `--vwz` and `--exec vwap` (the cut and the different future
+  apply to the closes, the volumes and the VWAPs alike). `--metagate` and `--hrp` stay without a test and are
+  refused in a headline run.
+- `--exec vwap` (final review R51): an entry decided on a row no longer requires a VWAP on the next row; a
+  leg without one fills at its close, as at the exit. Gross null probe (20 seeds, VWAP = close × 1 bp noise),
+  mean Sharpe ± SE before → after: `independent_rw` +0.005 ± 0.071 → +0.005 ± 0.071, `async_lag15_hol5`
+  +0.033 ± 0.049 → +0.033 ± 0.049 (identical per seed: that VWAP is missing only where the close is); with
+  10% of the VWAP cells also removed: −0.023 ± 0.068 → +0.005 ± 0.071 and +0.056 ± 0.048 → +0.032 ± 0.049
+  (the entries the old rule dropped are back). All inside the bounds, |t| ≤ 1.2.
 - Full suite on the final code: `python -m pytest -q` → **479 passed, 10 xfailed** in 92.1 s (93.0 s
-  wall, load average 5–7); the placebo report took 25.5 s.
+  wall, load average 5–7); the placebo report took 25.5 s. After the final-review commit: **493 passed,
+  10 xfailed** in 95.6 s (96.6 s wall, load average 4–7); the placebo table above is unchanged.
 
 ## 4. Phase 2 (intraday) — out of scope
 
@@ -261,7 +277,15 @@ are **not validated**. Phase 2 waits for the owner's decision: B0 (deprecate) or
     2 bp per FX conversion are assumptions.
 12. **Trials (T6)**: V comes from the pre-audit trial results. Re-running those configurations under the
     corrected engine would give a smaller V; it was out of scope. Add any trials that were never saved
-    to disk to `TRIALS.csv`.
+    to disk to `TRIALS.csv`. The config hash names the closes file, not its content: a regenerated
+    `closes_daily_extended_v2.csv` under the same name counts as the same trial; the meta sidecar's closes
+    SHA-256 makes every run traceable to the exact file. Hashing the content is an owner decision (it
+    would change every future hash).
+13. **Headline cost rule (final review R49)**: a run is HEADLINE only with `--cost`, `--slip`, `--borrow`,
+    `--borrow-nonus` and `--fx-cost` not below their defaults (5 / 5 bp per leg per fill, 80 / 300 bp/yr,
+    2 bp; higher costs are allowed) and the default `--execution-model flat` (almgren is the comparison
+    model, R25). An owner who documents execution costs below 5 / 5 bp, or wants almgren as the headline
+    model, must change this rule in `step3j_wfo_daily.non_headline_reasons` explicitly.
 
 ## 6. Sources
 
@@ -269,7 +293,7 @@ are **not validated**. Phase 2 waits for the owner's decision: B0 (deprecate) or
 |---|---|
 | 1.1 commands, hashes, files | `output/audit_runs/t11/run_all.sh`; CLI logs `run_t11_default.log`, `run_t11_almgren.log`; sidecars `data/wfo_daily_meta_t11_{default,almgren}.json`; `shasum -a 256` of the input files; `cmp` against `output/audit_runs/t9/data/*_t9_flat_r40*` and `output/audit_runs/t8/data/*_t8_almgren_r38*`; `TRIALS.csv` (last 3 rows); `AUDIT_FIX_LOG.md` T5 (pairs SHA-256) |
 | 1.2 Sharpe, return, vol, MaxDD, trades, win, PF, exit reasons, window-19 PnL | CLI logs (summary block, window lines) |
-| 1.2 PSR(0) (4 decimals), DSR at N = 121, skew / kurtosis, turnover, Σ gross / cost / borrow, PnL by window and year | `output/audit_runs/t11/derived_stats.py` → `derived_stats.log` (`perf_stats`, `mtm`, `step3j_wfo_daily.registry_trials` on the run files; reads only, no registry row) |
+| 1.2 PSR(0) (4 decimals), DSR at N = 121, skew / kurtosis, turnover, Σ gross / cost / borrow, PnL by window and year | `tools/results_v2_derived_stats.py` (committed in the final review from `output/audit_runs/t11/derived_stats.py`, logic unchanged; run with cwd `output/audit_runs/t11/`) → `derived_stats.log` there (`perf_stats`, `mtm`, `step3j_wfo_daily.registry_trials` on the run files; reads only, no registry row; re-run on the final-review code before its re-run: identical output) |
 | 1.2 bootstrap, factor, stress, per-pair | `output/audit_runs/t11/run_downstream.sh` → `ds_bootstrap.log`, `ds_factor.log`, `ds_stress.log`, `ds_dashboard.log` (identical to T10's logs of the same series, except for file paths) |
 | 1.3 US block | `derived_stats.log` (per-pair MTM files), CLI logs |
 | 1.3 cross-listed exclusions and reasons | CLI log `run_t11_default.log` (CROSS-LISTED PAIRS table) |

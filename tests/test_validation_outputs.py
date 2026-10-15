@@ -540,12 +540,13 @@ def test_fdr_output_can_never_be_the_headline_pairs_file(fdr_closes, tmp_path):
     screened = pd.read_csv(tmp_path / "fdr_pairs.csv")
     first_oos = pd.Timestamp("2008-01-02")                # after the as-of date
     # The screen's output, renamed to a frozen universe's name: not headline.
-    reasons = cli.non_headline_reasons(name, screened, first_oos, [])
+    reasons = cli.non_headline_reasons(name, screened, first_oos, [], cli.WfoConfig())
     assert any("role=screen_only" in r for r in reasons)
     # Even with every builder column present, a role column is refused.
     frozen = pit_frame(FDR_PAIRS[:3], ASOF)
-    assert cli.non_headline_reasons(name, frozen, first_oos, []) == []          # (power)
-    reasons = cli.non_headline_reasons(name, frozen.assign(role="screen_only"), first_oos, [])
+    assert cli.non_headline_reasons(name, frozen, first_oos, [], cli.WfoConfig()) == []   # (power)
+    reasons = cli.non_headline_reasons(name, frozen.assign(role="screen_only"), first_oos, [],
+                                       cli.WfoConfig())
     assert len(reasons) == 1 and "role=screen_only" in reasons[0]
     # The default output never goes into data/ and never matches the PIT name.
     import fdr_screening

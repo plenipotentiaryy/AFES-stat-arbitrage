@@ -28,12 +28,12 @@ synthetic data whose true edge is known.
 | `test_headline_universe.py` | the CLI's headline-universe filter and cross-listed table (T2) |
 | `test_continuous_positions.py` | one position per pair across windows, β per window for new entries, end-of-run close (T3) |
 | `test_daily_mtm.py` | daily mark-to-market PnL, capital, the one Sharpe, date-ordered MaxDD; the downstream scripts read the MTM file (T4) |
-| `test_universe_pit.py` | the point-in-time universe (`build_universe_pit.py`): as-of members, mechanical pairs, screens on prices up to the as-of date, survivorship gap, truncation acceptance; the CLI's HEADLINE marker; step7's guard (T5) |
+| `test_universe_pit.py` | the point-in-time universe (`build_universe_pit.py`): as-of members, mechanical pairs, screens on prices up to the as-of date, survivorship gap, truncation acceptance; the CLI's HEADLINE marker (T5; final review R49: costs not below the defaults, the default execution model, the cost model on the HEADLINE line and in `mtm.check_run`); step7's guard (T5) |
 | `test_perf_stats.py` | the one Sharpe, PSR and the Deflated Sharpe Ratio (`perf_stats.py`) against hand computations (T6) |
 | `test_holdout_trials.py` | the final-holdout guard (core and CLI), `HOLDOUT_USES.md`, the `TRIALS.csv` registry and the CLI's SR / PSR(0) / DSR / N lines, the back-fill's per-trial Sharpe (T6) |
 | `test_entry_guards.py` | the entry window entry_z < \|z\| < stop_z in both engines, the vol-tight stop, `legacy_no_entry_guards`; the T2 structural guards pinned: genuine prints on the signal date, a z window without no-print days (T7) |
 | `test_position_costs.py` | costs per fill per leg on the leg notionals (round trip 2·(c + s)·(1 + \|β\|)), FX on `*_USD` legs, borrow on the short legs' marked notional (US / non-US / tier rate), the MTM schedule, `legacy_flat_cost`, the conservative default model, the run header and the `wfo_daily_meta<tag>.json` sidecar (T8) |
-| `test_remaining_lookahead.py` | remaining look-ahead (T9): per-window training rows strictly before the OOS start, the Kalman prior β and the entry z of the trade's own spread (R28), the causal forward-filtered macro HMM on a US-close proxy, truncation invariance of every optional flag (cut and different future), causal sizing of `--volvol` / `--pairmom` / `--voltarget`, `--metagate` / `--hrp` refused in a headline run, VWAP fills refused on the `--kalman` / `--vwz` paths |
+| `test_remaining_lookahead.py` | remaining look-ahead (T9): per-window training rows strictly before the OOS start, the Kalman prior β and the entry z of the trade's own spread (R28), the causal forward-filtered macro HMM on a US-close proxy, truncation invariance of every optional flag and of the six options a headline run may use (cut and different future; final review R50), causal sizing of `--volvol` / `--pairmom` / `--voltarget`, `--metagate` / `--hrp` refused in a headline run, VWAP fills refused on the `--kalman` / `--vwz` paths, VWAP entry decisions independent of the next row's VWAP (R51) |
 | `test_validation_outputs.py` | validation outputs that cannot mislead (T10): every downstream script checks a run against its meta sidecar (file names, the date range = the run's span, before the final holdout) and states its span and NON-HEADLINE status; the bootstrap's label and its one-Sharpe replicates; factor attribution on the daily MTM return with its days and dates; FDR on prices up to the as-of date / development cut, its NON-HEADLINE label and its screen-only output; legacy series end at the run's end and are labelled "not a Sharpe"; step4c's per-period PSR; `bias_test.py` / `run_*.sh` pass `--end 2023-12-31`; the SUPERSEDED banners |
 | `conftest.py` | session-wide: points the CLI's `TRIALS_FILE` / `HOLDOUT_USES_FILE` to a temp dir, so no test writes the committed repo-root files (T6) |
 
@@ -116,7 +116,9 @@ its own close, on the union calendar, NaN on local holidays).
   side·(q1·ΔP1 − q2·ΔP2) with q1 = 1/P1 and q2 = β/P2 fixed at the entry
   fill (β = 2 and β = −1.5; a flat spread books nothing by itself), costs and
   size as before, β of the entry decision bar (Kalman), VWAP leg fills with
-  a per-leg fallback to the close at exits, `end_of_data` and CUSUM exits.
+  a per-leg fallback to the close (exits; entries since the final review's
+  R51 — legacy same-close: an entry without a VWAP is not filled),
+  `end_of_data` and CUSUM exits.
   On an OU panel whose leg closes exactly unchanged every 4th day: with
   volume, no entry is decided on those days (the unguarded legacy run does
   enter there); with zero volume, no decision or fill falls on them.
@@ -321,7 +323,14 @@ its own close, on the union calendar, NaN on local holidays).
   date or a legacy option print the NON-HEADLINE banner in the header and the
   summary and `headline=False`; the builder's own output file (built in the
   test) certifies a HEADLINE run from D, and a tampered copy does not;
-  `run_wfo_daily` alone always records `headline = False`.  T2's policy line
+  `run_wfo_daily` alone always records `headline = False`.  Final review R49:
+  on the frozen file, costs below the `WfoConfig` defaults (all five zero; or
+  `--borrow-nonus 299.5` alone) or `--execution-model almgren` print their
+  reason (parameter, value, default / "comparison cost model") in the header
+  and the summary and are NON-HEADLINE; `--cost 15` stays HEADLINE, its
+  HEADLINE line ends with the cost-model label and `--start` / `--end`, and
+  `mtm.check_run` prints `HEADLINE RUN (<label>)` (a sidecar without a cost
+  model: `HEADLINE RUN`, no error).  T2's policy line
   reads `HEADLINE UNIVERSE POLICY: excludes …`.  `step7_curate_universe.py` stops (`SystemExit`)
   without `--legacy-oos-curation` and writes nothing; with it, its output is
   unchanged, under a banner saying it may never be used in a headline run.
@@ -432,7 +441,10 @@ its own close, on the union calendar, NaN on local holidays).
   `*_USD`, `.TO`, `.L` or unknown suffix; legacy: every column).
   *Optional flags* (T9.4), each on the golden case where it binds (`--ivol`,
   `--volvol`, `--pairmom`, `--rotation`, `--voltarget`, `--cusum` (h = 30),
-  `--aussie-filter`, plus `--kalman`, `--hmm block-panic`), D = 2008-02-13 (six
+  `--aussie-filter`, plus `--kalman`, `--hmm block-panic`, and since the final
+  review (R50) `--maxconc 3`, `--ticker-overlap`, `--per-pair-quarter-cap 2`,
+  `--vol-tight-stop`, `--vwz`, `--exec vwap`; the cut and the different future
+  apply to the closes, the volumes and the VWAPs alike), D = 2008-02-13 (six
   weeks into window 11's OOS): (a) the plan's cut test (test_placebo's pattern,
   C = min(D, the cut run's last OOS end)); (b) the run with every log return
   after D × −3 agrees on every entry and exit filled on or before D (sees a
@@ -448,6 +460,9 @@ its own close, on the union calendar, NaN on local holidays).
   `--metagate` / `--hrp` stop a run that would be HEADLINE before anything runs
   or is registered and name themselves in a non-headline run's banner (then R7);
   `exec_mode` vwap with `kalman` / `vwz` → `ValueError` in both engines.
+  R51: on the `vwap_exec` case, removing the VWAP of one entry's fill row, or
+  15% of the VWAP cells at random, changes no decision or fill date; a leg
+  without a VWAP on its fill row fills at its close.
   R40: window eligibility counts only the rows before oos_s (a pair with 65 /
   75 training rows: [no, yes] whether or not its legs are delisted 2 rows into
   the OOS).  R41: `--kalman` with `--hmm` → `ValueError` in the continuous

@@ -132,10 +132,20 @@ def test_vwap_leg_fills_and_the_per_leg_fallback_to_the_close():
     assert (t["p1_exit"], t["p2_exit"]) == (vw1[K + 2], p2[K + 2])
     q1, q2 = 1 / vw1[K + 1], beta / vw2[K + 1]
     assert t["gross"] == pytest.approx(-(q1 * (vw1[K + 2] - vw1[K + 1]) - q2 * (p2[K + 2] - vw2[K + 1])))
-    # No leg-1 VWAP on the entry fill day: the entry is not filled (T1 rule).
+    # No leg-1 VWAP on the entry fill day: the entry decided on day K is filled
+    # all the same (R51: the decision does not read day K+1's VWAP), leg 1 at
+    # its close, leg 2 at its VWAP — the exit's per-leg rule.  The legacy
+    # same-close path keeps T0's rule (no VWAP spread: not filled).
     v1 = vw1.copy()
     v1[K + 1] = np.nan
-    assert run(spread, z_case(), leg_prices=legs(p1, p2), beta=beta, **vwap_args(v1, vw2)).empty
+    t = run(spread, z_case(), leg_prices=legs(p1, p2), beta=beta, **vwap_args(v1, vw2)).iloc[0]
+    assert (t["entry_signal"], t["entry"]) == (DAYS[K], DAYS[K + 1])
+    assert (t["p1_entry"], t["p2_entry"]) == (p1[K + 1], vw2[K + 1])
+    assert (t["p1_exit"], t["p2_exit"]) == (vw1[K + 2], vw2[K + 2])
+    q1, q2 = 1 / p1[K + 1], beta / vw2[K + 1]
+    assert t["gross"] == pytest.approx(-(q1 * (vw1[K + 2] - p1[K + 1]) - q2 * (vw2[K + 2] - vw2[K + 1])))
+    assert run(spread, z_case(), leg_prices=legs(p1, p2), beta=beta, legacy_same_close=True,
+               **vwap_args(v1, vw2)).empty
 
 
 def test_end_of_data_and_cusum_exits_fill_the_legs_at_the_fill_bar_closes():

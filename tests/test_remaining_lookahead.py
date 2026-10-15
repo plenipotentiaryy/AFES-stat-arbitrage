@@ -13,9 +13,12 @@ T9.3  Macro HMM: a causal forward filter (never hmmlearn's predict /
       predict_proba / decode / score_samples, which decode or smooth the whole
       window) on an EW proxy of US closes only; legacy_hmm_viterbi restores
       the Viterbi path.
-T9.4  Every optional flag of the plan's list: its decisions before a cut do
-      not depend on the data after it, on the data cut at D and on the data
-      with a different future after D.  --volvol, --pairmom and --voltarget
+T9.4  Every optional flag of the plan's list (and, final review R50, the six
+      options a headline run may use: --maxconc, --ticker-overlap,
+      --per-pair-quarter-cap, --vol-tight-stop, --vwz, --exec vwap): its
+      decisions before a cut do not depend on the data after it, on the data
+      (closes, volumes, VWAPs) cut at D and on the data with a different
+      future after D.  --volvol, --pairmom and --voltarget
       size from data at the entry decision only (legacy_sizing_lookahead
       restores the pre-T9 sizing); --metagate / --hrp are refused in a
       headline run; VWAP fills on the --kalman / --vwz paths are refused.
@@ -57,13 +60,18 @@ def case_cfg(case: str, **overrides) -> WfoConfig:
     return replace(cli_config(make_golden.case_inputs(case)["args"]), **overrides)
 
 
-def run_inputs(inp: dict, cfg: WfoConfig, closes: pd.DataFrame | None = None) -> core.WfoResult:
+def run_inputs(inp: dict, cfg: WfoConfig, closes: pd.DataFrame | None = None,
+               transform=None) -> core.WfoResult:
     """run_wfo_daily on a golden case's inputs as the CLI reads them (`closes`
-    replaces the panel)."""
-    px = as_cli_reads(inp["closes"]) if closes is None else closes
+    replaces the panel; `transform` — a cut or a different future — is applied
+    to the closes, the volumes and the VWAPs alike)."""
+    frames = [as_cli_reads(inp["closes"]) if closes is None else closes,
+              as_cli_reads(inp["volumes"]), as_cli_reads(inp["vwap"])]
+    if transform is not None:
+        frames = [None if f is None else transform(f) for f in frames]
+    px, volumes, vwap = frames
     with contextlib.redirect_stdout(io.StringIO()):
-        return run_wfo_daily(px, inp["pairs"], cfg, volumes=as_cli_reads(inp["volumes"]),
-                             vwap=as_cli_reads(inp["vwap"]))
+        return run_wfo_daily(px, inp["pairs"], cfg, volumes=volumes, vwap=vwap)
 
 
 def future_changed(closes: pd.DataFrame, d) -> pd.DataFrame:
@@ -93,9 +101,10 @@ def base_run(panel: str) -> pd.DataFrame:
 @functools.lru_cache(maxsize=None)
 def flag_runs(case: str, overrides: tuple = ()) -> dict:
     """A golden case run on its full panel, on the panel cut at D (inclusive)
-    and on the panel with a different future after D, and its panel's run
-    without the case's options; C = min(D, the cut run's last OOS end) as in
-    test_placebo's truncation test."""
+    and on the panel with a different future after D (closes, volumes and
+    VWAPs alike, R50), and its panel's run without the case's options;
+    C = min(D, the cut run's last OOS end) as in test_placebo's truncation
+    test."""
     inp = make_golden.case_inputs(case)
     cfg = case_cfg(case, **dict(overrides))
     closes = as_cli_reads(inp["closes"])
@@ -103,8 +112,8 @@ def flag_runs(case: str, overrides: tuple = ()) -> dict:
     last_oos_e = make_windows(closes.loc[:d], cfg.train, cfg.oos, cfg.step,
                               start=cfg.start, end=cfg.end)[-1][3]
     return {"full": run_inputs(inp, cfg).trades,
-            "cut": run_inputs(inp, cfg, closes.loc[:d]).trades,
-            "future": run_inputs(inp, cfg, future_changed(closes, d)).trades,
+            "cut": run_inputs(inp, cfg, transform=lambda f: f.loc[:d]).trades,
+            "future": run_inputs(inp, cfg, transform=lambda f: future_changed(f, d)).trades,
             "base": base_run(make_golden.CASES[case].get("panel", "base")),
             "d": d, "c": min(d, last_oos_e)}
 
@@ -140,13 +149,17 @@ def same(a: tuple, b: tuple) -> bool:
 
 # ── T9.4: every optional flag, truncation invariance ─────────────────────────
 
-# Flag of the plan's list (+ the T9.2 / T9.3 paths) → the golden case that
-# runs it on a panel where it binds (make_golden: every case changes its
-# panel's default run; here: before the cut).
+# Flag of the plan's list (+ the T9.2 / T9.3 paths, + the six options a
+# headline run may use, final review R50) → the golden case that runs it on a
+# panel where it binds (make_golden: every case changes its panel's default
+# run; here: before the cut).
 FLAG_CASES = {
     "--ivol": "ivol", "--volvol": "volvol", "--pairmom": "pairmom", "--rotation": "rotation",
     "--voltarget": "voltarget", "--cusum": "cusum_30", "--aussie-filter": "aussie_filter",
     "--kalman": "kalman", "--hmm block-panic": "hmm_block_panic",
+    "--maxconc": "maxconc", "--ticker-overlap": "ticker_overlap",
+    "--per-pair-quarter-cap": "per_pair_quarter_cap", "--vol-tight-stop": "vol_tight_stop",
+    "--vwz": "vwz", "--exec vwap": "vwap_exec",
 }
 
 
@@ -256,6 +269,47 @@ def test_vwap_fills_are_refused_on_the_kalman_and_vwz_paths(flags, legacy):
     cfg = replace(case_cfg("vwap_exec"), **flags, legacy_window_reset=legacy)
     with pytest.raises(ValueError, match="vwap"):
         run_inputs(inp, cfg)
+
+
+def test_vwap_entry_decisions_do_not_read_whether_the_next_row_has_a_vwap():
+    # Final review R51: with --exec vwap the entry decided on row i used to
+    # require a VWAP on row i+1 (a next-row read).  Now no decision depends on
+    # the VWAPs: removing VWAP cells — one entry's fill row, or 15% at random —
+    # leaves every decision and fill date unchanged, and a leg without a VWAP
+    # on its fill row fills at its close (an end-of-data exit at the close).
+    inp = make_golden.case_inputs("vwap_exec")
+    cfg = case_cfg("vwap_exec")
+    closes, vwap = as_cli_reads(inp["closes"]), as_cli_reads(inp["vwap"])
+    decisions = ["pair", "window_entered", "entry_signal", "entry", "side", "size", "beta",
+                 "exit_signal", "exit", "reason"]
+
+    def run(vw: pd.DataFrame) -> pd.DataFrame:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return run_wfo_daily(closes, inp["pairs"], cfg, volumes=as_cli_reads(inp["volumes"]),
+                                 vwap=vw).trades
+
+    full = run(vwap)
+    first = full.iloc[0]
+    legs = first["pair"].split("-")
+    one_row = vwap.copy()
+    one_row.loc[first["entry"], legs] = np.nan            # only the fill row of one entry
+    random_holes = vwap.mask(np.random.default_rng(3).random(vwap.shape) < 0.15)
+    for vw in (one_row, random_holes):
+        tr = run(vw)
+        pd.testing.assert_frame_equal(tr[decisions], full[decisions], check_exact=True)
+        no_vwap = 0                                       # fills at the close for lack of a VWAP
+        for _, t in tr.iterrows():
+            for leg, col in zip(t["pair"].split("-"), ("p1", "p2")):
+                for when in ("entry", "exit"):
+                    day, px = t[when], vw.at[t[when], leg]
+                    no_vwap += bool(np.isnan(px))
+                    if np.isnan(px) or (when == "exit" and t["reason"] == "end_of_data"):
+                        px = closes.at[day, leg]
+                    assert t[f"{col}_{when}"] == px
+        assert no_vwap >= (2 if vw is one_row else 50)
+    t = run(one_row).iloc[0]
+    assert (t["entry_signal"], t["p1_entry"], t["p2_entry"]) == (
+        first["entry_signal"], closes.at[first["entry"], legs[0]], closes.at[first["entry"], legs[1]])
 
 
 def test_kalman_with_the_hmm_gate_is_refused_in_the_continuous_engine():

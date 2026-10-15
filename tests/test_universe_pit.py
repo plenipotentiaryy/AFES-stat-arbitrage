@@ -9,6 +9,7 @@ All data are synthetic; nothing reads data/."""
 import contextlib
 import hashlib
 import io
+import json
 import os
 import sys
 
@@ -26,6 +27,7 @@ for _p in (_ROOT, _HERE):
 
 import bias_test  # noqa: E402
 import build_universe_pit as pit  # noqa: E402
+import mtm  # noqa: E402
 import step7_curate_universe  # noqa: E402
 import synthetic  # noqa: E402
 from step3j_wfo_daily import NON_HEADLINE_BANNER, headline_exclusions, main as wfo_main  # noqa: E402
@@ -371,6 +373,61 @@ def test_cli_marks_a_run_headline_only_on_a_frozen_pit_universe(wfo_dir):
     for extra in [("--legacy-cross-listed",), ("--legacy-exit-date-pnl",)]:
         result, out = run("universe_pit_2004-12-31.csv", frozen, *extra)
         assert_non_headline(result, out, extra, legacy=True)
+
+
+def assert_cost_non_headline(result, out, reasons: list[str]):
+    """NON-HEADLINE on a frozen universe for the cost reasons only, each
+    printed in the header and in the summary."""
+    assert result.stats["headline"] is False and "headline=False" in out
+    assert not any(line.startswith("HEADLINE RUN") for line in out.splitlines())
+    assert NON_HEADLINE_BANNER not in out                       # the universe itself is frozen
+    banners = [line for line in out.splitlines() if line.startswith("NON-HEADLINE RUN")]
+    for reason in reasons:
+        assert sum(reason in b for b in banners) == 2, reason
+
+
+def test_cli_headline_needs_the_default_costs_and_execution_model(wfo_dir):
+    # Final review R49: on a frozen PIT universe, costs below the WfoConfig
+    # defaults (e.g. gross) or the comparison cost model (almgren) are not
+    # HEADLINE; higher costs (a stress run) are, and the HEADLINE line names
+    # the cost model and the period; so does mtm.check_run downstream.
+    run, pairs = wfo_dir
+    frozen, pit_file = pit_frame(pairs, "2004-12-31"), "universe_pit_2004-12-31.csv"
+    result, out = run(pit_file, frozen, "--cost", "0", "--slip", "0", "--borrow", "0",
+                      "--borrow-nonus", "0", "--fx-cost", "0")
+    assert_cost_non_headline(result, out, [
+        "cost parameter below its default: --cost 0.0 < 5.0 (WfoConfig default)",
+        "--slip 0.0 < 5.0", "--borrow 0.0 < 80.0", "--borrow-nonus 0.0 < 300.0",
+        "--fx-cost 0.0 < 2.0"])
+    result, out = run(pit_file, frozen, "--borrow-nonus", "299.5")      # one, just below
+    assert_cost_non_headline(result, out, ["--borrow-nonus 299.5 < 300.0"])
+    assert sum("cost parameter below" in line for line in out.splitlines()) == 2
+    result, out = run(pit_file, frozen, "--execution-model", "almgren")
+    assert_cost_non_headline(result, out, [
+        "--execution-model almgren: comparison cost model; the headline uses the default "
+        "(R25: the conservative model on the development data)"])
+
+    result, out = run(pit_file, frozen, "--cost", "15", "--start", "2004-12-31",
+                      "--end", "2007-06-29")
+    label = "NET flat 20.0 bp/leg/fill + FX 2.0 bp"
+    assert result.stats["headline"] is True and "headline=True" in out and "NON-HEADLINE" not in out
+    lines = [line for line in out.splitlines() if line.startswith("HEADLINE RUN")]
+    assert len(lines) == 2 and all(
+        line.endswith(f"; costs {label}; --start 2004-12-31 --end 2007-06-29") for line in lines)
+    meta = json.loads(open("data/wfo_daily_meta_t.json").read())
+    assert meta["headline"] is True and meta["cost_model"]["label"] == label
+
+    def check_run_line() -> str:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mtm.check_run("data/wfo_daily_results_t.csv", mtm_file="data/wfo_daily_mtm_t.csv",
+                          closes="data/closes.csv")
+        return [line for line in buf.getvalue().splitlines() if line.startswith("run: ")][0]
+
+    assert check_run_line().endswith(f"HEADLINE RUN ({label})")
+    del meta["cost_model"]                      # a sidecar written before T8: no label, no error
+    open("data/wfo_daily_meta_t.json", "w").write(json.dumps(meta))
+    assert check_run_line().endswith("): HEADLINE RUN")
 
 
 def test_builder_output_certifies_a_headline_run_and_a_tampered_copy_does_not(

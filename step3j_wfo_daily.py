@@ -22,8 +22,10 @@ read by dashboard_daily), the run's description wfo_daily_meta<tag>.json (the
 cost model, the WfoConfig and its hash, the git revision, the pairs file's
 SHA-256 and the headline flag — audit T8) and the equity chart.  A run is
 HEADLINE only on a frozen point-in-time universe (audit T5,
-`non_headline_reasons`); every other run prints a NON-HEADLINE banner in its
-header and summary, and `WfoResult.stats["headline"]` records the verdict.
+`non_headline_reasons`) with costs not below the defaults and the default
+execution model (final review R49); every other run prints a NON-HEADLINE
+banner in its header and summary, and `WfoResult.stats["headline"]` records
+the verdict.
 Final holdout (audit T6): a run that would use a date on or after
 wfo_daily_core.HOLDOUT_START (2024-01-01) stops unless --final-holdout, and
 every --final-holdout run is
@@ -179,8 +181,16 @@ SCREEN_ONLY_REASON = ("NON-HEADLINE RUN: pairs file carries a role column (role=
                       "output of a screen such as fdr_screening.py), never the headline pairs")
 
 
+# Final review R49: cost parameters a headline run may not lower (higher
+# costs, e.g. a stress run, stay HEADLINE); the headline cost model is the
+# WfoConfig default (flat).
+HEADLINE_COST_FIELDS = ("cost", "slip", "borrow", "borrow_nonus", "fx_cost")
+COMPARISON_MODEL_REASON = ("comparison cost model; the headline uses the default (R25: the "
+                           "conservative model on the development data)")
+
+
 def non_headline_reasons(pairs_file: str, pairs_df: pd.DataFrame, first_oos,
-                         legacy: list[str]) -> list[str]:
+                         legacy: list[str], cfg: WfoConfig) -> list[str]:
     """Why a run is not a headline run; empty = HEADLINE.  A headline run
     reads a frozen point-in-time universe (`frozen_pit_asof`) whose as-of date
     is strictly before the run's first OOS date (`first_oos`, None if the run
@@ -188,7 +198,10 @@ def non_headline_reasons(pairs_file: str, pairs_df: pd.DataFrame, first_oos,
     fdr_screening.py's role=screen_only file, is never the headline pairs),
     and uses no legacy option (`legacy`, the --legacy-* options given; hard
     rule 5).  Manual pair lists, step7's OOS-PnL curation and every other
-    pairs file are not headline."""
+    pairs file are not headline.  Final review R49: the run's costs (`cfg`)
+    are not below the WfoConfig defaults (cost, slip, borrow, borrow_nonus,
+    fx_cost; higher costs are allowed) and it uses the default execution
+    model (flat, R25)."""
     reasons = []
     asof = frozen_pit_asof(pairs_file, pairs_df)
     if asof is None:
@@ -201,16 +214,28 @@ def non_headline_reasons(pairs_file: str, pairs_df: pd.DataFrame, first_oos,
         reasons.append(SCREEN_ONLY_REASON)
     if legacy:
         reasons.append("NON-HEADLINE RUN: legacy options " + ", ".join(legacy))
+    defaults = {f.name: f.default for f in dataclasses.fields(WfoConfig)}
+    for name in HEADLINE_COST_FIELDS:
+        value = getattr(cfg, name)
+        if not value >= defaults[name]:                      # NaN fails too
+            reasons.append(f"NON-HEADLINE RUN: cost parameter below its default: "
+                           f"--{name.replace('_', '-')} {value} < {defaults[name]} "
+                           "(WfoConfig default)")
+    if cfg.execution_model != defaults["execution_model"]:
+        reasons.append(f"NON-HEADLINE RUN: --execution-model {cfg.execution_model}: "
+                       f"{COMPARISON_MODEL_REASON}")
     return reasons
 
 
-def headline_block(reasons: list[str], pairs_file: str, first_oos) -> str:
-    """The banner of a non-headline run, or the headline line."""
+def headline_block(reasons: list[str], pairs_file: str, first_oos, cfg: WfoConfig) -> str:
+    """The banner of a non-headline run, or the headline line (R49: with the
+    cost-model label and the run's --start / --end)."""
     if reasons:
         bar = "!" * 70
         return "\n".join([bar, *reasons, bar])
     return (f"HEADLINE RUN: frozen point-in-time universe {Path(pairs_file).name}, "
-            f"first OOS date {first_oos.date()}")
+            f"first OOS date {first_oos.date()}; costs {cost_model(cfg)['label']}; "
+            f"--start {cfg.start or 'not set'} --end {cfg.end or 'not set'}")
 
 
 # ── Final holdout and trials registry (audit T6) ────────────────────────────
@@ -414,7 +439,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "normalised by the mean of the trades decided up to its entry decision "
                         "(audit T9). Pro-cyclical.")
     p.add_argument("--pairmom", action="store_true",
-                   help="Rolling-Sharpe pair momentum: hot pair → up-weight, cold → down. "
+                   help="Pair momentum from the rolling per-trade ratio (mean / std of the pair's "
+                        "trade PnL, not a Sharpe): hot pair → up-weight, cold → down. "
                         "Causal: only the pair's trades closed by the entry decision (audit T9).")
     p.add_argument("--maxconc", type=int, default=0,
                    help="Hard cap on concurrent open trades across all pairs "
@@ -493,8 +519,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "Comparison only; never for headline results.")
     p.add_argument("--rotation", action="store_true",
                    help="Quarterly per-pair S_perf rescaling (§5): trades sized by "
-                        "rolling pair-Sharpe with Bayesian shrinkage. Drop pairs "
-                        "with SR_6m < 0 for the current quarter.")
+                        "the pair's rolling per-trade ratio (mean / std of trade PnL × √252, not "
+                        "a Sharpe) with Bayesian shrinkage. Drop pairs whose 6-month per-trade "
+                        "ratio < 0 for the current quarter.")
     p.add_argument("--voltarget", type=float, default=0.0,
                    help="Portfolio vol target (annualised, e.g. 0.10 = 10%%). "
                         "Applied as causal leverage scaling (the leverage at the entry "
@@ -588,7 +615,7 @@ def main():
     windows = make_windows(closes, cfg.train, cfg.oos, cfg.step, start=cfg.start, end=cfg.end)
     first_oos = windows[0][2] if windows else None
     legacy = [f"--{k.replace('_', '-')}" for k, v in vars(args).items() if k.startswith("legacy_") and v]
-    reasons = non_headline_reasons(args.pairs, pairs_df, first_oos, legacy)
+    reasons = non_headline_reasons(args.pairs, pairs_df, first_oos, legacy, cfg)
     # Audit T9: refused before anything is recorded (holdout use, trial).
     forbidden = {f"--{k}": why for k, why in HEADLINE_FORBIDDEN.items() if getattr(args, k)}
     if forbidden:
@@ -608,7 +635,7 @@ def main():
                  f"FINAL HOLDOUT RUN: uses dates from {HOLDOUT_START.date()}"))
     digest = hashlib.sha256((DATA_DIR / args.pairs).read_bytes()).hexdigest()
     print(f"UNIVERSE: {DATA_DIR / args.pairs}  SHA-256 {digest}")
-    banner = headline_block(reasons, args.pairs, first_oos)
+    banner = headline_block(reasons, args.pairs, first_oos, cfg)
     print(banner)
 
     result = run_wfo_daily(closes, run_pairs, cfg, volumes=volumes, vwap=vwap_daily)

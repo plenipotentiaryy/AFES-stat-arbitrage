@@ -132,5 +132,10 @@ def test_vwap_fills_at_the_next_day_vwap_and_falls_back_to_the_next_close():
     t = run(spread, z, exec_spread=vwap.where(DAYS != DAYS[K + 1])).iloc[0]
     assert t["exit"] == DAYS[K + 2]
     assert t["pnl"] == pytest.approx(-1 * (spread.iloc[K + 2] - vwap.iloc[K]))
-    # No VWAP for the entry day → the entry is not filled.
-    assert run(spread, z, exec_spread=vwap.where(DAYS != DAYS[K])).empty
+    # No VWAP for the entry fill day → the entry fills at the close of that day
+    # (R51: the decision on day K does not read day K+1's VWAP); legacy
+    # same-close keeps T0's rule: not filled.
+    t = run(spread, z, exec_spread=vwap.where(DAYS != DAYS[K])).iloc[0]
+    assert (t["entry_signal"], t["entry"], t["exit"]) == (DAYS[K], DAYS[K + 1], DAYS[K + 2])
+    assert t["pnl"] == pytest.approx(-1 * (vwap.iloc[K + 1] - spread.iloc[K + 1]))
+    assert run(spread, z, exec_spread=vwap.where(DAYS != DAYS[K]), legacy_same_close=True).empty
