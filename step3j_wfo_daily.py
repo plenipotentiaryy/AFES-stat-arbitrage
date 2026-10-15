@@ -21,7 +21,13 @@ factor_attribution), the per-pair daily MTM PnL (wfo_daily_mtm_pairs<tag>.csv,
 read by dashboard_daily) and the equity chart.  A run is HEADLINE only on a
 frozen point-in-time universe (audit T5, `non_headline_reasons`); every other
 run prints a NON-HEADLINE banner in its header and summary, and
-`WfoResult.stats["headline"]` records the verdict.
+`WfoResult.stats["headline"]` records the verdict.  Final holdout (audit T6):
+a run that would use a date on or after wfo_daily_core.HOLDOUT_START
+(2024-01-01) stops unless --final-holdout, and every --final-holdout run is
+recorded in HOLDOUT_USES.md before it starts; every run whose span lies in the
+development period is appended to the trials registry TRIALS.csv, and the
+summary prints the annualised Sharpe, PSR(0), the Deflated Sharpe Ratio and N
+(the number of distinct configurations in TRIALS.csv).
 
 CLI:
     python step3j_wfo_daily.py --pairs pairs_baseline14.csv
@@ -29,22 +35,32 @@ CLI:
 """
 from __future__ import annotations
 import argparse
+import csv
 import dataclasses
 import hashlib
+import json
+import math
 import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 from config import DATA_DIR, OUTPUT_DIR, BAR_TIMEFRAME
 from build_universe_pit import COLUMNS as PIT_COLUMNS
 from cross_listing import close_time
+from perf_stats import deflated_sharpe, psr, sharpe_per_period, sr0_threshold
 from wfo_daily_core import (
-    TRAIN_INIT_MO, OOS_MO, STEP_MO,
-    WfoConfig, make_windows, run_wfo_daily, summarise, trade_stats,
+    TRAIN_INIT_MO, OOS_MO, STEP_MO, HOLDOUT_START,
+    WfoConfig, holdout_violation, make_windows, run_last_date, run_wfo_daily, summarise,
+    trade_stats,
 )
 
 
@@ -169,6 +185,154 @@ def headline_block(reasons: list[str], pairs_file: str, first_oos) -> str:
             f"first OOS date {first_oos.date()}")
 
 
+# ── Final holdout and trials registry (audit T6) ────────────────────────────
+
+# Repo-root files (the CLI runs with cwd = a run dir; DATA_DIR is cwd-relative).
+REPO_ROOT = Path(__file__).resolve().parent
+TRIALS_FILE = REPO_ROOT / "TRIALS.csv"
+HOLDOUT_USES_FILE = REPO_ROOT / "HOLDOUT_USES.md"
+TRIALS_COLUMNS = ["config_hash", "date", "source", "description", "n_days", "sr_daily", "sr_annual"]
+HOLDOUT_USES_HEADER = """# HOLDOUT_USES
+
+Every run that may use the final holdout (dates from 2024-01-01,
+`wfo_daily_core.HOLDOUT_START`) needs `--final-holdout`; `step3j_wfo_daily.py`
+appends one line here BEFORE such a run starts: UTC time | git revision
+(`+dirty` = uncommitted changes to tracked files other than TRIALS.csv and this
+file) | command line | config hash (as in TRIALS.csv).  Only the CLI records:
+a direct run_wfo_daily(final_holdout=True) call is not recorded here.
+
+"""
+
+
+def config_hash(cfg: WfoConfig, pairs_path: Path, closes_name: str,
+                run_pairs: list[str], volumes_used: bool) -> str:
+    """The identity of a configuration (one trial): SHA-256 of three lines joined
+    by "\\n" — the canonical JSON (sorted keys, no spaces) of {"cfg": asdict(cfg)
+    without final_holdout (it does not change the strategy), "run_pairs": the
+    pairs actually run (after the headline policy, so --legacy-cross-listed
+    counts), "volumes": whether a volumes file was used (stale-print mask, ADV)},
+    the pairs file's SHA-256 and the closes file name.  The code revision is not
+    part of it: the same configuration under another engine version is the
+    same trial."""
+    fields = dataclasses.asdict(cfg)
+    del fields["final_holdout"]
+    canonical = json.dumps({"cfg": fields, "run_pairs": list(run_pairs), "volumes": bool(volumes_used)},
+                           sort_keys=True, separators=(",", ":"))
+    pairs_sha = hashlib.sha256(Path(pairs_path).read_bytes()).hexdigest()
+    return hashlib.sha256("\n".join([canonical, pairs_sha, closes_name]).encode()).hexdigest()
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def git_revision() -> str:
+    """HEAD of the repo holding this file, "+dirty" if tracked files other than
+    the two registries (TRIALS.csv, HOLDOUT_USES.md) changed."""
+    try:
+        def git(*a):
+            return subprocess.run(["git", *a], cwd=REPO_ROOT, capture_output=True,
+                                  text=True, check=True).stdout.strip()
+        head = git("rev-parse", "HEAD")
+        dirty = git("status", "--porcelain", "--untracked-files=no", "--", ".",
+                    f":(exclude){TRIALS_FILE.name}", f":(exclude){HOLDOUT_USES_FILE.name}")
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return head + ("+dirty" if dirty else "")
+
+
+def record_holdout_use(chash: str) -> None:
+    """Append this run's line to HOLDOUT_USES.md (created with its header)."""
+    if not HOLDOUT_USES_FILE.exists():
+        HOLDOUT_USES_FILE.write_text(HOLDOUT_USES_HEADER)
+    with open(HOLDOUT_USES_FILE, "a") as f:
+        f.write(f"- {utc_now()} | git {git_revision()} | {shlex.join(sys.argv)} | config {chash}\n")
+
+
+def sr_daily_or_nan(returns: pd.Series) -> float:
+    """Per-period Sharpe of the run's daily returns; NaN if undefined (no trades)."""
+    try:
+        return sharpe_per_period(returns)
+    except ValueError:
+        return float("nan")
+
+
+def append_trial(chash: str, description: str, n_days: int, sr: float) -> None:
+    """Append one development-period trial to TRIALS.csv (created with its header)."""
+    new = not TRIALS_FILE.exists()
+    num = (lambda x: "" if math.isnan(x) else repr(x))
+    with open(TRIALS_FILE, "a", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        if new:
+            w.writerow(TRIALS_COLUMNS)
+        w.writerow([chash, utc_now(), "cli", description, n_days, num(sr),
+                    num(sr * math.sqrt(252))])
+
+
+def registry_trials() -> dict[str, float]:
+    """One per-period Sharpe per distinct config_hash of TRIALS.csv: that of the
+    latest row of the hash with an sr_daily (NaN if none has one)."""
+    if not TRIALS_FILE.exists():
+        return {}
+    reg = pd.read_csv(TRIALS_FILE, float_precision="round_trip", dtype={"config_hash": str})
+    trials: dict[str, float] = {}
+    for h, sr in zip(reg["config_hash"], reg["sr_daily"].astype(float)):
+        if h not in trials or not math.isnan(sr):
+            trials[h] = sr
+    return trials
+
+
+def deflate(result, chash: str, dev_run: bool, legacy: list[str]) -> str:
+    """Register the run (development runs only) and deflate its Sharpe.
+
+    N = the number of distinct config hashes in TRIALS.csv incl. this run
+    (re-running a configuration does not change it; a holdout run is counted
+    on top of the registry, not added to it); V = sample variance of one
+    sr_daily per hash (`registry_trials`).  A legacy run (`legacy`: its
+    --legacy-* options) is registered without sr_daily (never an exit-date or
+    legacy Sharpe in V) and is not deflated.  Sets stats n_trials, psr0 and
+    dsr (NaN when undefined); returns the summary lines."""
+    ret = result.daily_returns
+    sr_run = sr_daily_or_nan(ret)
+    sr = float("nan") if legacy else sr_run
+    if dev_run:
+        cmd = "step3j_wfo_daily.py " + shlex.join(sys.argv[1:])
+        append_trial(chash, f"LEGACY ({', '.join(legacy)}): {cmd}" if legacy else cmd, len(ret), sr)
+        trials = registry_trials()
+    else:
+        trials = registry_trials()
+        if chash not in trials or not math.isnan(sr):
+            trials[chash] = sr
+    values = list(trials.values())
+    n = len(values)
+    known = [x for x in values if not math.isnan(x)]
+    var = float(np.var(known, ddof=1)) if len(known) >= 2 else float("nan")
+    psr0 = dsr = float("nan")
+    if not math.isnan(sr):
+        psr0 = psr(ret)
+        if n == 1 or len(known) >= 2:
+            dsr = deflated_sharpe(ret, values)
+    result.stats.update({"n_trials": n, "psr0": psr0, "dsr": dsr})
+
+    fmt = (lambda x, spec: "n/a" if math.isnan(x) else format(x, spec))
+    sr0 = 0.0 if n == 1 else (float("nan") if math.isnan(var) else sr0_threshold(n, var))
+    where = (f"config hashes in {TRIALS_FILE.name} incl. this run" if dev_run else
+             f"config hashes in {TRIALS_FILE.name} + this holdout run (not added to it)")
+    lines = [
+        "DEFLATED SHARPE (audit T6; Bailey & López de Prado 2014)",
+        f"  Sharpe (daily MTM, annualised): {fmt(result.stats.get('sharpe', float('nan')), '+.3f')}"
+        f"   (per day {fmt(sr_run, '+.4f')}, T = {len(ret)} days)",
+        f"  PSR(0):  {fmt(psr0, '.3g')}",
+        f"  DSR:     {fmt(dsr, '.3g')}   (SR0 = {fmt(sr0, '+.4f')} per day)",
+        f"  N = {n} distinct configurations ({where}); V = {fmt(var, '.3g')} from {len(known)} "
+        f"recorded Sharpe ratios (one per configuration)",
+        f"  config hash {chash}",
+    ]
+    if legacy:
+        lines.insert(1, "  LEGACY run: registered without a Sharpe (not in V); PSR / DSR not computed")
+    return "\n".join(lines)
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -248,6 +412,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "Sharpe(exit)) and MaxDD over trades in table order, instead of the daily "
                         "mark-to-market on constant capital; no MTM file is written. Needed by "
                         "--legacy-spread-pnl. Comparison only; never for headline results.")
+    p.add_argument("--final-holdout", action="store_true", dest="final_holdout",
+                   help="Allow the run to use the final holdout (dates from "
+                        f"{HOLDOUT_START.date()}). Recorded in HOLDOUT_USES.md before the "
+                        "run starts. Without it, a run whose data reach the holdout "
+                        "stops: pass --end 2023-12-31 for the development period.")
     p.add_argument("--legacy-cross-listed", action="store_true", dest="legacy_cross_listed",
                    help="LEGACY: keep the cross-listed pairs (fx_unaligned, ASX/TSE or "
                         "European legs) in the run; their numbers are NOT VALID. "
@@ -335,6 +504,19 @@ def main():
 
     cfg = WfoConfig(**{f.name: getattr(args, f.name) for f in dataclasses.fields(WfoConfig)})
 
+    # Audit T6: the final holdout.  The use is recorded before anything runs.
+    holdout = holdout_violation(closes, cfg)
+    if holdout:
+        raise SystemExit(holdout)
+    chash = config_hash(cfg, DATA_DIR / args.pairs, args.closes, run_pairs, volumes is not None)
+    dev_run = run_last_date(closes, cfg) < HOLDOUT_START
+    if cfg.final_holdout:
+        record_holdout_use(chash)
+        print(f"--final-holdout: recorded in {HOLDOUT_USES_FILE.name}; "
+              + (f"the run ends on {run_last_date(closes, cfg).date()}, before the holdout"
+                 if dev_run else
+                 f"FINAL HOLDOUT RUN: uses dates from {HOLDOUT_START.date()}"))
+
     # Audit T5: HEADLINE only on a frozen point-in-time universe.
     windows = make_windows(closes, cfg.train, cfg.oos, cfg.step, start=cfg.start, end=cfg.end)
     first_oos = windows[0][2] if windows else None
@@ -348,8 +530,10 @@ def main():
     result = run_wfo_daily(closes, run_pairs, cfg, volumes=volumes, vwap=vwap_daily)
     result.stats["headline"] = not reasons
     verdict = f"{banner}\nheadline={result.stats['headline']}"
+    deflation = deflate(result, chash, dev_run, legacy)
     if result.trades.empty:
         print("\nNo trades.")
+        print("\n" + deflation)
         print("\n" + cross_listed_table(excluded))
         print("\n" + verdict)
         return result
@@ -359,6 +543,8 @@ def main():
     summarise(trades, label=f"NET {args.cost} bps/leg",
               n_windows=result.stats["n_windows"], n_pairs=len(run_pairs),
               oos_index=result.daily_pnl.index, stats=None if legacy_pnl else result.stats)
+    if not legacy_pnl:
+        print("\n" + deflation)
     if args.legacy_cross_listed:
         print("\n" + cross_listed_table(excluded, trades))
         cross = trades[trades["pair"].isin(excluded.index)]

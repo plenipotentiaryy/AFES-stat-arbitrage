@@ -29,6 +29,9 @@ synthetic data whose true edge is known.
 | `test_continuous_positions.py` | one position per pair across windows, β per window for new entries, end-of-run close (T3) |
 | `test_daily_mtm.py` | daily mark-to-market PnL, capital, the one Sharpe, date-ordered MaxDD; the downstream scripts read the MTM file (T4) |
 | `test_universe_pit.py` | the point-in-time universe (`build_universe_pit.py`): as-of members, mechanical pairs, screens on prices up to the as-of date, survivorship gap, truncation acceptance; the CLI's HEADLINE marker; step7's guard (T5) |
+| `test_perf_stats.py` | the one Sharpe, PSR and the Deflated Sharpe Ratio (`perf_stats.py`) against hand computations (T6) |
+| `test_holdout_trials.py` | the final-holdout guard (core and CLI), `HOLDOUT_USES.md`, the `TRIALS.csv` registry and the CLI's SR / PSR(0) / DSR / N lines, the back-fill's per-trial Sharpe (T6) |
+| `conftest.py` | session-wide: points the CLI's `TRIALS_FILE` / `HOLDOUT_USES_FILE` to a temp dir, so no test writes the committed repo-root files (T6) |
 
 ### Variants
 
@@ -268,6 +271,51 @@ its own close, on the union calendar, NaN on local holidays).
   reads `HEADLINE UNIVERSE POLICY: excludes …`.  `step7_curate_universe.py` stops (`SystemExit`)
   without `--legacy-oos-curation` and writes nothing; with it, its output is
   unchanged, under a banner saying it may never be used in a headline run.
+- **Deflated Sharpe Ratio** (`test_perf_stats.py`, T6).  On a 20-day skewed,
+  fat-tailed series the per-period Sharpe (sample std), `portfolio_sharpe`
+  (= `mtm.mtm_stats`'s), PSR(SR*) = Φ((SR̂ − SR*)·√(T − 1) / √(1 − γ₃·SR̂ +
+  ((γ₄ − 1)/4)·SR̂²)) (population skewness and raw kurtosis) and the DSR with
+  N = 4 trials, one without a recorded Sharpe (V from the three others),
+  SR₀ = √V·((1 − γ)·Φ⁻¹(1 − 1/N) + γ·Φ⁻¹(1 − 1/(N·e))), equal hand
+  computations (numpy sums, Φ from `statistics.NormalDist`) and pinned
+  values; DSR(N = 1) = PSR(0) exactly; for trials with sample variance
+  exactly V = 1e-4, SR₀ rises and DSR falls strictly for N = 1 … 59, 100,
+  250, 1000, 10 000 (not saturated); V = 0 gives SR₀ = 0; N = 0, a negative
+  V, N > 1 with fewer than two recorded Sharpe ratios, and constant, empty,
+  one-value or NaN returns raise `ValueError`.
+- **Final holdout and trials registry** (`test_holdout_trials.py`, T6; OU
+  panels moved to 2021–2024 so they straddle `HOLDOUT_START` = 2024-01-01).
+  `run_wfo_daily` raises `ValueError` (message: `--end 2023-12-31` or
+  `--final-holdout`) when the run's last date (cfg.end, else the panel's last
+  date; min of the two) is on or after the holdout start — end None,
+  2024-01-01, 2024-03-28 — and runs with `--end 2023-12-31` (no trade or MTM
+  date in the holdout; equal to the run on the panel (and volumes) cut
+  there — gross, `--hmm block-panic`, Almgren-Chriss on volumes) or with
+  `final_holdout` (which then uses holdout dates); a cfg.end after a panel
+  that stops in 2023 is allowed; the guard reads the one constant
+  (monkeypatched).  The CLI in a temp run dir: without `--end` it stops
+  (`SystemExit`) and writes nothing; with `--end 2023-12-31` it appends one
+  `TRIALS.csv` row (config hash = SHA-256 of the canonical JSON of {the
+  config without `final_holdout`, the pairs run, whether volumes were used},
+  the pairs file's SHA-256 and the closes name, recomputed in the test;
+  `cli`; the command line; T; the per-period and annualised Sharpe, read back
+  exactly) and prints / stores `sharpe`, `psr0`, `dsr` (`.3g`) and
+  `n_trials` = distinct config hashes incl. this run (earlier rows, one
+  without a Sharpe, are kept); another option gives another hash and N + 1;
+  re-running a configuration adds a row but not a trial (N unchanged; V from
+  the latest recorded Sharpe of each hash); legacy runs are registered with
+  an empty Sharpe and a `LEGACY` description and are not deflated; the hash
+  ignores `final_holdout` and changes with the pairs run (as
+  `--legacy-cross-listed` changes them) and the volumes flag; `+dirty`
+  ignores the two registries (temp git repo); a run without trades
+  still counts (empty Sharpe); with `--final-holdout` the `HOLDOUT_USES.md`
+  line (UTC time | git revision | command line | config hash) exists before
+  the core is called, a holdout run is not added to `TRIALS.csv` (N counts it
+  on top of the registry), a `--final-holdout` run ending in 2023 is both a
+  trial and a recorded use.  `backfill_trials.exit_date_sharpe`: exit-date
+  PnL on the business days from the first OOS start (or entry) to
+  2023-12-31 or an earlier end, later exits dropped, a pnl column override;
+  the back-fill on a fake tree writes one distinct config hash per row.
 
 ### Statistic definitions
 
@@ -346,3 +394,4 @@ At T4 ≈ 50 s: the daily mark-to-market adds ≈ 0.02 s per run (`independent_r
 seed 0, best of 5: 0.297 s vs 0.276 s with `legacy_exit_date_pnl`); the T4
 tests add ≈ 3 s.
 At T5 ≈ 52–57 s: the T5 tests add ≈ 3.5 s (15 tests).
+At T6 ≈ 54 s: the T6 tests add ≈ 4 s (25 tests).

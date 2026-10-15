@@ -21,3 +21,6 @@ live/__pycache__/
 
 # committed test fixtures (audit T0 golden trades)
 !tests/fixtures/**/*.csv
+
+# committed trials registry (audit T6)
+!/TRIALS.csv

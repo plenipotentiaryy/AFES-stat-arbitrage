@@ -53,6 +53,12 @@ EXIT_Z    = 0.0
 STOP_Z    = 3.5
 MAX_HOLD  = 30        # days (cap on holding period)
 
+# ── Final holdout (audit T6) ────────────────────────────────────────────────
+# The one place that defines it: development ends on 2023-12-31; a run that
+# would use any later date needs cfg.final_holdout (--final-holdout, recorded
+# in HOLDOUT_USES.md by the CLI).
+HOLDOUT_START = pd.Timestamp("2024-01-01")
+
 
 # ── Engine ──────────────────────────────────────────────────────────────────
 
@@ -785,6 +791,26 @@ class WfoConfig:
     aussie_filter: bool = False
     execution_model: str = "almgren"
     notional: float = 100_000
+    final_holdout: bool = False
+
+
+def run_last_date(closes: pd.DataFrame, cfg: WfoConfig) -> pd.Timestamp:
+    """The last date a run can use: min(cfg.end or the panel's last date, the
+    panel's last date).  Fills (incl. T1's fill-only bar) never go past it."""
+    last = closes.index.max()
+    return min(pd.Timestamp(cfg.end), last) if cfg.end else last
+
+
+def holdout_violation(closes: pd.DataFrame, cfg: WfoConfig) -> str | None:
+    """Why the run may not go ahead (it would use a date on or after
+    HOLDOUT_START without cfg.final_holdout), or None."""
+    last = run_last_date(closes, cfg)
+    if cfg.final_holdout or last < HOLDOUT_START:
+        return None
+    dev_end = (HOLDOUT_START - pd.Timedelta(days=1)).date()
+    return (f"this run would use dates up to {last.date()}, inside the final holdout "
+            f"(from {HOLDOUT_START.date()}). Pass --end {dev_end} (development period) "
+            f"or --final-holdout (the run is then recorded in HOLDOUT_USES.md).")
 
 
 @dataclass
@@ -1206,6 +1232,10 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
     cfg.legacy_exit_date_pnl restores the exit-date booking over the panel's
     OOS trading days and `trade_stats` (needed by legacy_spread_pnl, whose
     spread PnL has no leg quantities to mark).
+
+    Final holdout (audit T6): ValueError if the run would use a date on or
+    after HOLDOUT_START (`run_last_date`: cfg.end, else the panel's last date)
+    unless cfg.final_holdout.
     """
     if cfg.exec_mode not in ("next_close", "vwap"):
         raise ValueError(f"cfg.exec_mode must be 'next_close' or 'vwap', not {cfg.exec_mode!r}")
@@ -1221,6 +1251,9 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
         raise ValueError("cfg.legacy_spread_pnl books the spread change, which has no leg "
                          "quantities to mark to market daily: use it with "
                          "cfg.legacy_exit_date_pnl (--legacy-exit-date-pnl)")
+    holdout = holdout_violation(closes, cfg)      # audit T6: the final holdout
+    if holdout:
+        raise ValueError(holdout)
 
     if not cfg.legacy_stale_prints:
         # Audit T2: an exactly unchanged close with zero or missing volume is
