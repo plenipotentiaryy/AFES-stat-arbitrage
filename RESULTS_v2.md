@@ -317,3 +317,4 @@ are **not validated**. Phase 2 waits for the owner's decision: B0 (deprecate) or
 | 3 placebo table | `output/audit_runs/t11/placebo_report.log` (identical to the T7–T10 tables) |
 | 3 suite result | `output/audit_runs/t11/pytest.log` |
 | 4, 5 | the plan (`AFES_AGENT_TASKS.md`), `AUDIT_FIX_LOG.md` known limitations of T2, T5–T10 |
+| interpretive rulings R1–R57 (with cost if wrong) | `AUDIT_RULINGS.md` |
