@@ -506,8 +506,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="LEGACY: the pre-T9 sizing of --volvol (normalised by the mean over ALL "
                         "trades, later ones too), --pairmom (from same-pair trades not yet closed "
                         "at the entry decision) and --voltarget (leverage at the fill date, from "
-                        "exits filled after the decision). Comparison only; never for headline "
-                        "results.")
+                        "exits filled after the decision), and the tie order of --ticker-overlap / "
+                        "--per-pair-quarter-cap / --maxconc among entries filled on the same day "
+                        "(by their position in the whole trades table). Comparison only; never for "
+                        "headline results.")
     p.add_argument("--final-holdout", action="store_true", dest="final_holdout",
                    help="Allow the run to use the final holdout (dates from "
                         f"{HOLDOUT_START.date()}). Recorded in HOLDOUT_USES.md before the "

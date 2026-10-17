@@ -1340,6 +1340,19 @@ def apply_quarterly_rotation(trades: pd.DataFrame,
     return trades_out
 
 
+def entry_order(trades: pd.DataFrame, legacy: bool = False) -> pd.DataFrame:
+    """`trades` in entry-fill order for the post-hoc filters (--ticker-overlap,
+    --per-pair-quarter-cap, --maxconc).  Final review R56 (found by the R55
+    four-date cut test): entries filled on the same row are taken in
+    pair-name order (a stable sort), so which of them a filter keeps depends
+    on those trades only.  legacy (legacy_sizing_lookahead): pandas' default
+    quicksort on the entry date alone, as before — the order of ties then
+    depends on the whole table, later trades included."""
+    if legacy:
+        return trades.sort_values("entry")
+    return trades.sort_values(["entry", "pair"], kind="stable")
+
+
 def pair_momentum(trades: pd.DataFrame, n_lookback: int = 10,
                   legacy_open_trades: bool = False) -> pd.Series:
     """--pairmom size multiplier of each trade (index of `trades`): from the
@@ -2115,7 +2128,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
 
     # ── ticker-overlap: block entry if either ticker is already exposed
     if cfg.ticker_overlap:
-        ts = trades.sort_values("entry").reset_index(drop=False)
+        ts = entry_order(trades, cfg.legacy_sizing_lookahead).reset_index(drop=False)
         in_use: list[tuple[pd.Timestamp, set]] = []  # (exit_time, {t1,t2})
         keep = []
         for _, row in ts.iterrows():
@@ -2127,12 +2140,12 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             in_use.append((row["exit"], this))
             keep.append(row["index"])
         n_before = len(trades)
-        trades = trades.loc[keep].sort_values("entry").reset_index(drop=True)
+        trades = entry_order(trades.loc[keep], cfg.legacy_sizing_lookahead).reset_index(drop=True)
         print(f"  → ticker-overlap: kept {len(trades)}/{n_before} trades")
 
     # ── per-pair quarter cap
     if cfg.per_pair_quarter_cap > 0:
-        ts = trades.sort_values("entry").reset_index(drop=False)
+        ts = entry_order(trades, cfg.legacy_sizing_lookahead).reset_index(drop=False)
         counts: dict[tuple[str, pd.Period], int] = {}
         keep = []
         for _, row in ts.iterrows():
@@ -2142,12 +2155,12 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
             counts[key] = counts.get(key, 0) + 1
             keep.append(row["index"])
         n_before = len(trades)
-        trades = trades.loc[keep].sort_values("entry").reset_index(drop=True)
+        trades = entry_order(trades.loc[keep], cfg.legacy_sizing_lookahead).reset_index(drop=True)
         print(f"  → per-pair-quarter-cap={cfg.per_pair_quarter_cap}: kept {len(trades)}/{n_before}")
 
     # ── maxconc: drop trades that would exceed the global concurrency cap
     if cfg.maxconc > 0:
-        trades_sorted = trades.sort_values("entry").reset_index(drop=False)
+        trades_sorted = entry_order(trades, cfg.legacy_sizing_lookahead).reset_index(drop=False)
         open_exits = []   # list of exit timestamps currently open
         keep_idx = []
         for _, row in trades_sorted.iterrows():
@@ -2157,7 +2170,7 @@ def run_wfo_daily(closes: pd.DataFrame, pairs: list[str], cfg: WfoConfig,
                 continue
             open_exits.append(row["exit"])
             keep_idx.append(row["index"])
-        trades = trades.loc[keep_idx].sort_values("entry").reset_index(drop=True)
+        trades = entry_order(trades.loc[keep_idx], cfg.legacy_sizing_lookahead).reset_index(drop=True)
         print(f"  → maxconc={cfg.maxconc}: kept {len(trades)}/{len(trades_sorted)} trades")
 
     # Full OOS index = every trading day from the first OOS window start

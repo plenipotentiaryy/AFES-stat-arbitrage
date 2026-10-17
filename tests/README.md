@@ -444,11 +444,14 @@ its own close, on the union calendar, NaN on local holidays).
   `--aussie-filter`, plus `--kalman`, `--hmm block-panic`, and since the final
   review (R50) `--maxconc 3`, `--ticker-overlap`, `--per-pair-quarter-cap 2`,
   `--vol-tight-stop`, `--vwz`, `--exec vwap`; the cut and the different future
-  apply to the closes, the volumes and the VWAPs alike), D = 2008-02-13 (six
-  weeks into window 11's OOS): (a) the plan's cut test (test_placebo's pattern,
-  C = min(D, the cut run's last OOS end)); (b) the run with every log return
-  after D × −3 agrees on every entry and exit filled on or before D (sees a
-  look-ahead inside a window: a full-window fit, decoding or normalisation);
+  apply to the closes, the volumes and the VWAPs alike), at each of four cut
+  dates D = 2005-10-03, 2006-12-25, 2008-07-07, 2009-06-08 (final review R55;
+  before: the one date 2008-02-13): (a) the plan's cut test (test_placebo's
+  pattern, C = min(D, the cut run's last OOS end)) on every entry and exit
+  decided and filled before C; (b) the run with every log return after D × −3
+  agrees on every entry and exit filled on or before D, and on every decision
+  made on or before D (also one filled after D) — sees a look-ahead inside a
+  window: a full-window fit, decoding or normalisation;
   each flag's decisions differ from its panel's run without it in the compared
   region, and the CUSUM case has `cusum_break` exits there (Ruling R29).
   `legacy_sizing_lookahead` (`--volvol` over all trades) fails (a).

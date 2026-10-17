@@ -51,6 +51,8 @@ from wfo_daily_core import ENTRY_Z, STOP_Z, WfoConfig, make_windows, run_wfo_dai
 
 ENTRY_COLS = ["pair", "window_entered", "entry_signal", "entry", "side", "size", "beta",
               "p1_entry", "p2_entry"]
+DECISION_ENTRY_COLS = ENTRY_COLS[:7]
+DECISION_EXIT_COLS = ["pair", "entry_signal", "exit_signal", "exit", "reason"]
 
 
 # ── Runs on the golden cases' inputs ─────────────────────────────────────────
@@ -98,32 +100,46 @@ def base_run(panel: str) -> pd.DataFrame:
     return run_inputs(inp, cli_config(inp["args"])).trades
 
 
+# Cut dates D of the per-flag tests (final review R55; the T9 / R50 tests had
+# the one date cut_date() = 2008-02-13): in the OOS of windows 2, 6, 13 and
+# 16 of the golden panels.  A look-ahead of a few rows only shows in the
+# decisions just before a D, so the dates are spread over the panel; at these
+# four, every look-ahead mutation of the R55 check is caught (AUDIT_FIX_LOG,
+# "Final review fixes").
+CUT_DATES = tuple(pd.Timestamp(d) for d in ("2005-10-03", "2006-12-25", "2008-07-07",
+                                             "2009-06-08"))
+
+
 @functools.lru_cache(maxsize=None)
 def flag_runs(case: str, overrides: tuple = ()) -> dict:
-    """A golden case run on its full panel, on the panel cut at D (inclusive)
-    and on the panel with a different future after D (closes, volumes and
-    VWAPs alike, R50), and its panel's run without the case's options;
-    C = min(D, the cut run's last OOS end) as in test_placebo's truncation
-    test."""
+    """A golden case run on its full panel and, for each D of CUT_DATES, on
+    the panel cut at D (inclusive) and on the panel with a different future
+    after D (closes, volumes and VWAPs alike, R50), with C = min(D, the cut
+    run's last OOS end) as in test_placebo's truncation test; and its panel's
+    run without the case's options."""
     inp = make_golden.case_inputs(case)
     cfg = case_cfg(case, **dict(overrides))
     closes = as_cli_reads(inp["closes"])
-    d = cut_date(closes)
-    last_oos_e = make_windows(closes.loc[:d], cfg.train, cfg.oos, cfg.step,
-                              start=cfg.start, end=cfg.end)[-1][3]
-    return {"full": run_inputs(inp, cfg).trades,
-            "cut": run_inputs(inp, cfg, transform=lambda f: f.loc[:d]).trades,
-            "future": run_inputs(inp, cfg, transform=lambda f: future_changed(f, d)).trades,
-            "base": base_run(make_golden.CASES[case].get("panel", "base")),
-            "d": d, "c": min(d, last_oos_e)}
+    cuts = []
+    for d in CUT_DATES:
+        last_oos_e = make_windows(closes.loc[:d], cfg.train, cfg.oos, cfg.step,
+                                  start=cfg.start, end=cfg.end)[-1][3]
+        cuts.append({"d": d, "c": min(d, last_oos_e),
+                     "cut": run_inputs(inp, cfg, transform=lambda f, d=d: f.loc[:d]).trades,
+                     "future": run_inputs(inp, cfg,
+                                          transform=lambda f, d=d: future_changed(f, d)).trades})
+    return {"full": run_inputs(inp, cfg).trades, "cuts": cuts,
+            "base": base_run(make_golden.CASES[case].get("panel", "base"))}
 
 
-def decided_before(tr: pd.DataFrame, c) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(entries, exits) decided before c, as in test_placebo: an entry's
-    decision, fill, side, size, β and entry prices; an exit in all columns,
-    without the cut run's end_of_data closes."""
-    ent = tr[tr["entry_signal"] < c].sort_values(["pair", "entry_signal"])[ENTRY_COLS]
-    ex = tr[(tr["exit_signal"] < c) & (tr["reason"] != "end_of_data")]
+def filled_before(tr: pd.DataFrame, c) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(entries, exits) decided and filled before c: an entry's decision,
+    fill, side, size, β and entry prices; an exit in all columns.  (R55: a
+    fill on or after c — the cut run's last rows — can meet the cut run's
+    end-of-run closes there, e.g. a --maxconc slot freed by one; the decisions
+    on those rows are compared by the different-future test, `decided_by`.)"""
+    ent = tr[tr["entry"] < c].sort_values(["pair", "entry_signal"])[ENTRY_COLS]
+    ex = tr[(tr["exit"] < c) & (tr["reason"] != "end_of_data")]
     return ent.reset_index(drop=True), ex.sort_values(["pair", "exit_signal"]).reset_index(drop=True)
 
 
@@ -134,9 +150,19 @@ def filled_by(tr: pd.DataFrame, d) -> tuple[pd.DataFrame, pd.DataFrame]:
     return ent.reset_index(drop=True), ex.sort_values(["pair", "exit_signal"]).reset_index(drop=True)
 
 
-def assert_same(a: tuple, b: tuple) -> None:
+def decided_by(tr: pd.DataFrame, d) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(entries, exits) decided on or before d, in their decision columns
+    (R55): an entry's pair, window, decision and fill dates, side, size and
+    β; an exit's pair, entry decision, decision and fill dates and reason —
+    also when the fill is after d (at a changed price)."""
+    ent = tr[tr["entry_signal"] <= d].sort_values(["pair", "entry_signal"])[DECISION_ENTRY_COLS]
+    ex = tr[tr["exit_signal"] <= d].sort_values(["pair", "exit_signal"])[DECISION_EXIT_COLS]
+    return ent.reset_index(drop=True), ex.reset_index(drop=True)
+
+
+def assert_same(a: tuple, b: tuple, what: str = "trades") -> None:
     for x, y in zip(a, b):
-        pd.testing.assert_frame_equal(x, y, check_exact=True)
+        pd.testing.assert_frame_equal(x, y, check_exact=True, obj=what)
 
 
 def same(a: tuple, b: tuple) -> bool:
@@ -165,43 +191,53 @@ FLAG_CASES = {
 
 @pytest.mark.parametrize("flag", list(FLAG_CASES))
 def test_flag_decisions_before_a_cut_are_those_of_the_full_data(flag):
-    # The plan's truncation test (test_placebo's pattern): the run on the
-    # panel cut at a date D and on the full panel agree on every
-    # entry and exit decided before C = min(D, the cut run's last OOS end).
+    # The plan's truncation test (test_placebo's pattern), at every D of
+    # CUT_DATES: the run on the panel cut at D and on the full panel agree on
+    # every entry and exit decided and filled before C = min(D, the cut run's
+    # last OOS end).
     r = flag_runs(FLAG_CASES[flag])
-    full, cut = decided_before(r["full"], r["c"]), decided_before(r["cut"], r["c"])
+    for k in r["cuts"]:
+        assert_same(filled_before(k["cut"], k["c"]), filled_before(r["full"], k["c"]),
+                    f"{flag}, cut at {k['d'].date()}")
+    c = r["cuts"][-1]["c"]                                 # the largest compared region
+    full = filled_before(r["full"], c)
     assert len(full[0]) > 20 and len(full[1]) > 20
-    assert not same(full, decided_before(r["base"], r["c"])), f"{flag} does not bind before the cut"
+    assert not same(full, filled_before(r["base"], c)), f"{flag} does not bind before the cut"
     if flag == "--cusum":
         # Ruling R29 (T3): a CUSUM break closes an open trade only inside its
         # window's OOS; a break on the training rows of a later window would
         # close it in the full run but not in the cut run (no such window).
         assert (full[1]["reason"] == "cusum_break").any()
-    assert_same(cut, full)
 
 
 @pytest.mark.parametrize("flag", list(FLAG_CASES))
 def test_flag_decisions_before_a_date_do_not_depend_on_a_different_future(flag):
     # Stronger than the cut: the windows stay, so a look-ahead inside a window
     # (a fit, a decoding or a normalisation over the whole window or run) is
-    # seen.  Every entry and exit filled on or before D is identical whatever
-    # the prices after D.
+    # seen.  At every D of CUT_DATES, whatever the data after D: every entry
+    # and exit filled on or before D is identical, and every decision made on
+    # or before D (R55: also one filled after D) is the same decision.
     r = flag_runs(FLAG_CASES[flag])
-    full, future = filled_by(r["full"], r["d"]), filled_by(r["future"], r["d"])
+    for k in r["cuts"]:
+        d, what = k["d"], f"{flag}, future changed after {k['d'].date()}"
+        assert_same(filled_by(k["future"], d), filled_by(r["full"], d), what)
+        assert_same(decided_by(k["future"], d), decided_by(r["full"], d), what)
+    d = r["cuts"][-1]["d"]
+    full = filled_by(r["full"], d)
     assert len(full[0]) > 20 and len(full[1]) > 20
-    assert not same(full, filled_by(r["base"], r["d"])), f"{flag} does not bind before D"
+    assert not same(full, filled_by(r["base"], d)), f"{flag} does not bind before D"
     if flag == "--cusum":
         # R29 again: a later window's break on its training rows (before D)
         # comes from a z whose β is fitted on rows after D.
         assert (full[1]["reason"] == "cusum_break").any()
-    assert_same(future, full)
 
 
 def test_legacy_volvol_normalisation_looks_ahead():
     # The pre-T9 --volvol divides by the mean multiplier of ALL trades, later
     # ones included: the cut changes earlier sizes (legacy_sizing_lookahead).
     r = flag_runs("volvol", (("legacy_sizing_lookahead", True),))
-    assert not same(decided_before(r["cut"], r["c"]), decided_before(r["full"], r["c"]))
+    assert not all(same(filled_before(k["cut"], k["c"]), filled_before(r["full"], k["c"]))
+                   for k in r["cuts"])
 
 
 def wfo_dir(tmp_path, monkeypatch) -> list[str]:

@@ -29,7 +29,7 @@ flag. The CLI prints the `NON-HEADLINE RUN` banner and `headline=False`.
 |---|---|
 | command (cwd `output/audit_runs/t11/`, `data/` = symlinks to the owner's `data/`) | `python step3j_wfo_daily.py --pairs pairs_bias_test.csv --closes closes_daily_extended_v2.csv --start 2014-12-31 --end 2023-12-31 --tag t11_default` (the default model is flat) |
 | comparison run | the same + `--execution-model almgren --tag t11_almgren` |
-| git | both runs on `f5af875` (T10), clean tree (sidecar `git_revision` `f5af875f379d…` without `+dirty`). This file is added by the T11 commit on top of `f5af875`; no code changed in T11. The final-review commit `fix(review): Final whole-branch review fixes` changes code (R49–R52: the HEADLINE marker's cost rule, `--exec vwap` entries, labels, cut tests) but no default output: the default configuration re-run once on it has the same config hash and byte-identical trades, MTM and per-pair MTM files (`output/audit_runs/final/`, one more `TRIALS.csv` row, N unchanged; `AUDIT_FIX_LOG.md`, "Final review fixes"). |
+| git | both runs on `f5af875` (T10), clean tree (sidecar `git_revision` `f5af875f379d…` without `+dirty`). This file is added by the T11 commit on top of `f5af875`; no code changed in T11. The final-review commit `fix(review): Final whole-branch review fixes` changes code (R49–R52: the HEADLINE marker's cost rule, `--exec vwap` entries, labels, cut tests) but no default output: the default configuration re-run once on it has the same config hash and byte-identical trades, MTM and per-pair MTM files (`output/audit_runs/final/`, one more `TRIALS.csv` row, N unchanged; `AUDIT_FIX_LOG.md`, "Final review fixes"). The next commit (R55, R56: cut tests at four dates; a stable, causal tie order in three non-default filters, see section 3) changes no code the default run executes; the default configuration is re-run once more on it, recorded by the commit after it. |
 | universe SHA-256 | **n/a — no PIT universe** |
 | pairs file | `data/pairs_bias_test.csv`, 36 pairs → 26 US-only pairs after the T2 policy; SHA-256 `1790dd9ee45fed48e32385d0e3dc8755c5ba2bb34fcb55d5f34bcbb808ccce91` (equal to the value recorded at T5; a hindsight file, not a frozen universe) |
 | closes / volumes | `closes_daily_extended_v2.csv` SHA-256 `b4a47bc6995c21a9527fcdfc3919d472a8dfc1dbc68f5eab1a3b3186af2a662e` (also in the sidecar); `volumes_daily.csv` SHA-256 `c2b798c60c5eb1693d591f91179567fa5f4065046622930c26b38ea83199bc6a` (stale-print mask; almgren ADV) |
@@ -225,8 +225,13 @@ pre-audit async panel builder; `fixed` = the corrected defaults.
   pass for `--ivol --volvol --pairmom --rotation --voltarget --cusum --aussie-filter --kalman --hmm block-panic`,
   and since the final review (R50) for the six options a headline run may use: `--maxconc`, `--ticker-overlap`,
   `--per-pair-quarter-cap`, `--vol-tight-stop`, `--vwz` and `--exec vwap` (the cut and the different future
-  apply to the closes, the volumes and the VWAPs alike). `--metagate` and `--hrp` stay without a test and are
-  refused in a headline run.
+  apply to the closes, the volumes and the VWAPs alike). Since R55 they run at four cut dates (2005-10-03,
+  2006-12-25, 2008-07-07, 2009-06-08) and also compare every decision made before the date; nine look-ahead
+  mutations of these options (a few rows ahead in `--vol-tight-stop` / `--vwz`, a VWAP two rows ahead, outcome-
+  or exit-ordered filters) all fail them. The four-date test found one real look-ahead (R56, non-default only):
+  `--maxconc`, `--ticker-overlap` and `--per-pair-quarter-cap` took same-day entries in an unstable sort order that
+  depended on the whole trades table, later trades included; they now use (fill date, pair name). `--metagate`
+  and `--hrp` stay without a test and are refused in a headline run.
 - `--exec vwap` (final review R51): an entry decided on a row no longer requires a VWAP on the next row; a
   leg without one fills at its close, as at the exit. Gross null probe (20 seeds, VWAP = close × 1 bp noise),
   mean Sharpe ± SE before → after: `independent_rw` +0.005 ± 0.071 → +0.005 ± 0.071, `async_lag15_hol5`
@@ -235,7 +240,8 @@ pre-audit async panel builder; `fixed` = the corrected defaults.
   (the entries the old rule dropped are back). All inside the bounds, |t| ≤ 1.2.
 - Full suite on the final code: `python -m pytest -q` → **479 passed, 10 xfailed** in 92.1 s (93.0 s
   wall, load average 5–7); the placebo report took 25.5 s. After the final-review commit: **493 passed,
-  10 xfailed** in 95.6 s (96.6 s wall, load average 4–7); the placebo table above is unchanged.
+  10 xfailed** in 95.6 s (96.6 s wall, load average 4–7); after R55 / R56: **493 passed, 10 xfailed** in
+  101.1 s (101.9 s wall, load average 2.2–2.4); the placebo table above is unchanged.
 
 ## 4. Phase 2 (intraday) — out of scope
 
