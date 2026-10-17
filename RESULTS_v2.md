@@ -229,9 +229,13 @@ pre-audit async panel builder; `fixed` = the corrected defaults.
   2006-12-25, 2008-07-07, 2009-06-08) and also compare every decision made before the date; nine look-ahead
   mutations of these options (a few rows ahead in `--vol-tight-stop` / `--vwz`, a VWAP two rows ahead, outcome-
   or exit-ordered filters) all fail them. The four-date test found one real look-ahead (R56, non-default only):
-  `--maxconc`, `--ticker-overlap` and `--per-pair-quarter-cap` took same-day entries in an unstable sort order that
-  depended on the whole trades table, later trades included; they now use (fill date, pair name). `--metagate`
-  and `--hrp` stay without a test and are refused in a headline run.
+  `--maxconc` and `--ticker-overlap` could keep a different one of two entries filled on the same day depending on
+  later trades, because the post-hoc filters took same-day entries in an unstable sort order over the whole trades
+  table; the three filters now use (fill date, pair name) (`--per-pair-quarter-cap` was not affected: it counts per
+  pair, and a pair has at most one entry per day). `--metagate` and `--hrp` stay without a test and are refused
+  in a headline run. Also allowed in a headline run without a per-flag cut test (re-review): the window geometry
+  `--train` / `--oos` / `--step` (the final review's 20-seed null probes cover it) and the `--hmm` modes other than
+  `block-panic` (the same forward filter as the tested mode).
 - `--exec vwap` (final review R51): an entry decided on a row no longer requires a VWAP on the next row; a
   leg without one fills at its close, as at the exit. Gross null probe (20 seeds, VWAP = close × 1 bp noise),
   mean Sharpe ± SE before → after: `independent_rw` +0.005 ± 0.071 → +0.005 ± 0.071, `async_lag15_hol5`
@@ -241,7 +245,8 @@ pre-audit async panel builder; `fixed` = the corrected defaults.
 - Full suite on the final code: `python -m pytest -q` → **479 passed, 10 xfailed** in 92.1 s (93.0 s
   wall, load average 5–7); the placebo report took 25.5 s. After the final-review commit: **493 passed,
   10 xfailed** in 95.6 s (96.6 s wall, load average 4–7); after R55 / R56: **493 passed, 10 xfailed** in
-  101.1 s (101.9 s wall, load average 2.2–2.4); the placebo table above is unchanged.
+  101.1 s (101.9 s wall, load average 2.2–2.4); after the re-review follow-ups (one more test): **494 passed,
+  10 xfailed** in 114.7 s (115.6 s wall, load average 4.0–6.7); the placebo table above is unchanged.
 
 ## 4. Phase 2 (intraday) — out of scope
 
@@ -271,7 +276,10 @@ are **not validated**. Phase 2 waits for the owner's decision: B0 (deprecate) or
    using them on a live ledger needs a decision.
 8. **`bias_test.py` / `run_*.sh`** now pass `--end 2023-12-31`. The scripts still `cd` into the owner's
    checkout and were not run.
-9. **Labels off the audited path**: `daily_sanity.py`, `pca_residual_backtest.py`, and the intraday
+9. **Off the audited path**: the same unstable same-day order (R56) is still in the concurrency caps of
+   `pca_residual_backtest.apply_maxconc`, `pca_residual_refined.apply_maxconc` and the intraday
+   `step4b_concurrent_cap.py` / `step4d_backtest_full.py` (Phase 2); none of them writes a headline sidecar.
+   **Labels**: `daily_sanity.py`, `pca_residual_backtest.py`, and the intraday
    `step3j_wfo.py` / `step4c_bootstrap_sharpe.py` (Phase 2) still print exit-date ratios as "Sharpe".
    Runs with `--legacy-*` options that are not exit-date booked still print an MTM Sharpe under the
    LEGACY banner (never in V or a DSR).

@@ -232,6 +232,28 @@ def test_flag_decisions_before_a_date_do_not_depend_on_a_different_future(flag):
         assert (full[1]["reason"] == "cusum_break").any()
 
 
+def test_entry_order_depends_on_the_trades_not_on_the_table_order():
+    # Final review R56: the post-hoc filters (--ticker-overlap,
+    # --per-pair-quarter-cap, --maxconc) walk entries filled on the same row in
+    # pair-name order, whatever the order of the table's rows; the old order
+    # (a quicksort on `entry` alone, kept for legacy_sizing_lookahead) leaves
+    # the order of ties to the rest of the table.
+    entry = pd.to_datetime(["2006-01-03"] * 4 + ["2006-01-04"] * 3 + ["2006-01-05"])
+    t = pd.DataFrame({"pair": ["G-H", "A-B", "E-F", "C-D", "C-D", "A-B", "I-J", "A-B"],
+                      "entry": entry, "pnl": np.arange(8.0)})
+    want = [("A-B", "2006-01-03"), ("C-D", "2006-01-03"), ("E-F", "2006-01-03"),
+            ("G-H", "2006-01-03"), ("A-B", "2006-01-04"), ("C-D", "2006-01-04"),
+            ("I-J", "2006-01-04"), ("A-B", "2006-01-05")]
+    for seed in range(6):
+        got = core.entry_order(t.sample(frac=1, random_state=seed))
+        assert list(zip(got["pair"], got["entry"].dt.strftime("%Y-%m-%d"))) == want
+    # The rows are reordered, not changed.
+    got = core.entry_order(t.sample(frac=1, random_state=0))
+    pd.testing.assert_frame_equal(got.sort_index(), t)
+    legacy = core.entry_order(t.sample(frac=1, random_state=1), legacy=True)
+    assert legacy["entry"].is_monotonic_increasing
+
+
 def test_legacy_volvol_normalisation_looks_ahead():
     # The pre-T9 --volvol divides by the mean multiplier of ALL trades, later
     # ones included: the cut changes earlier sizes (legacy_sizing_lookahead).

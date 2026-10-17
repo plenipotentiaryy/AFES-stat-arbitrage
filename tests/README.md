@@ -455,6 +455,9 @@ its own close, on the union calendar, NaN on local holidays).
   each flag's decisions differ from its panel's run without it in the compared
   region, and the CUSUM case has `cusum_break` exits there (Ruling R29).
   `legacy_sizing_lookahead` (`--volvol` over all trades) fails (a).
+  `entry_order` (R56): entries filled on the same row come out in pair-name
+  order whatever the row order of the input table (six shuffles); the
+  legacy order sorts on the entry date alone.
   `pair_momentum` on hand-made trades: an earlier trade still open at the entry
   decision is not counted (legacy: it is); on the default engine the rule changes
   nothing (identical trades).  `apply_vol_target`: a trade filled three days
